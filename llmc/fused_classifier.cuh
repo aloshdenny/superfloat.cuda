@@ -2,6 +2,7 @@
 Fused Classifier:
 - Forwards the Cross Entropy Loss
 - For Q1.15: Uses scaled softmax cross-entropy with proper temperature scaling
+- For Q1.31: Uses standard FP32 softmax, only input/output conversion to Q1.31
 - The key insight: Q1.15 logits are stored normalized, but we need to scale them
   up before softmax to get proper probability distribution
 - Never materializes the full normalized logits, only at the target label
@@ -12,13 +13,19 @@ Fused Classifier:
 #include "cuda_utils.cuh"
 #if defined(ENABLE_Q115)
 #include "q115_common.cuh"
-// Q1.15 logit scaling: Q1.15 stores values in [-1, 1), but logits need [-16, 16] range
+// Q1.15 logit scaling: Q1.15 stores values in [-1, 1), but logits need [-24, 24] range
 // This scale factor is applied before softmax to expand the effective range
-#define Q115_LOGIT_SCALE Q115_LOGITS_SCALE  // Use the scale from q115_common.cuh (16.0f)
+// INCREASED from 16.0 to 24.0 for better softmax expressivity (lower entropy)
+#define Q115_LOGIT_SCALE Q115_LOGITS_SCALE  // Use the scale from q115_common.cuh (24.0f)
 
 // Temperature for softmax - lower = more confident predictions
 // For Q1.15, we use temperature implicitly via Q115_LOGIT_SCALE
-// A scale of 16 means: Q1.15 value of 0.5 -> actual logit of 8.0
+// A scale of 24 means: Q1.15 value of 0.5 -> actual logit of 12.0
+#elif defined(ENABLE_Q131)
+#include "q131_common.cuh"
+// Q1.31 has much higher precision, so we can use a larger logit range
+// The scale factor converts Q1.31 [-1, 1) to actual logit range
+#define Q131_LOGIT_SCALE 32.0f  // Q1.31 value of 0.5 -> actual logit of 16.0
 #endif
 
 // ----------------------------------------------------------------------------
@@ -147,7 +154,10 @@ __device__ SoftmaxParams prepare_softmax_blockwide3(int64_t idx, const floatX* i
     float thread_sumval = 0.0f;
     int i = (V+x128::size-1)/x128::size + threadIdx.x - blockDim.x;
 
-#ifdef ENABLE_Q115
+#if defined(ENABLE_Q131) && !defined(FIXED_POINT_Q31)
+    // For true Q1.31-logits mode: scale logits to expand dynamic range
+    const float logit_scale = Q131_LOGIT_SCALE;
+#elif defined(ENABLE_Q115)
     // For Q1.15 mode: scale logits to expand dynamic range
     // This is critical to break the ~7.x loss wall
     const float logit_scale = Q115_LOGIT_SCALE;
@@ -206,7 +216,10 @@ __global__ void __launch_bounds__(1024, MAX_1024_THREADS_BLOCKS)
     int64_t idx = gridDim.x - (blockIdx.x+1); // reverse order for cache hits on matmul data
     int ix = targets[idx];
 
-#ifdef ENABLE_Q115
+#if defined(ENABLE_Q131) && !defined(FIXED_POINT_Q31)
+    // For true Q1.31-logits mode: scale logits to expand dynamic range
+    const float logit_scale = Q131_LOGIT_SCALE;
+#elif defined(ENABLE_Q115)
     // For Q1.15 mode: scale logits to expand dynamic range
     const float logit_scale = Q115_LOGIT_SCALE;
 #else
@@ -282,7 +295,11 @@ void fused_classifier(Type* logits, float* losses,
     const int N = B * T;
     const int grid_size = N;
     
-#ifdef ENABLE_Q115
+#if defined(ENABLE_Q131)
+    // For Q1.31: use standard classifier with Q1.31 logit scaling
+    // Softmax/cross-entropy computed in FP32, only I/O uses Q1.31
+    fused_classifier_kernel5<<<grid_size, block_size, 0, stream>>>(logits, losses, (floatX*)NULL, dloss, targets, B, T, V, P, write_dlogits);
+#elif defined(ENABLE_Q115)
     // Use scaled softmax cross-entropy for Q1.15 mode
     // This properly handles the limited range of Q1.15 by scaling logits before softmax
     q115_scaled_softmax_ce_kernel<<<grid_size, block_size, 0, stream>>>(logits, losses, dloss, targets, B, T, V, P, write_dlogits);

@@ -7,6 +7,8 @@ AdamW kernel
 #include "cuda_utils.cuh"
 #if defined(ENABLE_Q115)
 #include "q115_common.cuh"
+#elif defined(ENABLE_Q131)
+#include "q131_common.cuh"
 #endif
 
 // ----------------------------------------------------------------------------
@@ -18,6 +20,10 @@ AdamW kernel
 // Q1.15 weight constraint constants
 #define Q115_WEIGHT_MIN -1.0f
 #define Q115_WEIGHT_MAX 0.999969482421875f  // (32767/32768) - largest Q1.15 value
+
+// Q1.31 weight constraint constants
+#define Q131_WEIGHT_MIN -1.0f
+#define Q131_WEIGHT_MAX 0.9999999995343387f  // (2^31-1)/2^31 - largest Q1.31 value
 
 // Kernel to clamp weights to Q1.15 range
 template <typename Tp>
@@ -87,7 +93,17 @@ __device__ void adamw_update(Tp* params_memory, float* master_params_memory, Tg*
     
     // fetch the old value of this parameter as a float
     float old_param;
-#ifdef ENABLE_Q115
+#if defined(ENABLE_Q131) && !defined(FIXED_POINT_Q31)
+    // In true Q1.31 mode, Tp is int32_t (q131_t)
+    if constexpr (sizeof(Tp) == 4) {
+        old_param = q131_to_float(params_memory[idx]);
+        if (master_params_memory != NULL) {
+            old_param = master_params_memory[idx];
+        }
+    } else {
+        old_param = (master_params_memory != NULL) ? master_params_memory[idx] : (float)params_memory[idx];
+    }
+#elif defined(ENABLE_Q115)
     // In Q1.15 mode, Tp is int16_t (q115_t)
     if constexpr (sizeof(Tp) == 2) {
         // Convert from Q1.15 to float
@@ -107,7 +123,16 @@ __device__ void adamw_update(Tp* params_memory, float* master_params_memory, Tg*
     float param = old_param - (learning_rate * (m / (sqrtf(v) + eps) + weight_decay * old_param));
     
     // Store updated parameter
-#ifdef ENABLE_Q115
+#if defined(ENABLE_Q131)
+    if constexpr (sizeof(Tp) == 4) {
+        // Clamp to Q1.31 range and convert from float to Q1.31
+        param = fmaxf(Q131_WEIGHT_MIN, fminf(Q131_WEIGHT_MAX, param));
+        params_memory[idx] = float_to_q131(param);
+    } else {
+        // use stochastic rounding for non-Q1.31 types
+        stochastic_rounding(param, &params_memory[idx], seed);
+    }
+#elif defined(ENABLE_Q115)
     if constexpr (sizeof(Tp) == 2) {
         // Convert from float to Q1.15
         params_memory[idx] = float_to_q115(param);

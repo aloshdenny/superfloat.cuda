@@ -14,6 +14,8 @@ In the backward pass, the gradients flow to both, handled by different kernels
 #include "cuda_utils.cuh"
 #if defined(ENABLE_Q115)
 #include "q115_common.cuh"
+#elif defined(ENABLE_Q131)
+#include "q131_common.cuh"
 #endif
 
 // ----------------------------------------------------------------------------
@@ -41,7 +43,14 @@ __global__ void encoder_forward_kernel3(floatX* out,
     x128 wte128 = load128cs(wte_ix);
     x128 wpe128 = load128cs(wpe_tc);
     
-#ifdef ENABLE_Q115
+#if defined(ENABLE_Q131)
+    // Q1.31 mode: add using Q1.31 arithmetic (saturating add)
+    for (int k = 0; k < x128::size; k++) {
+        q131_t wte_val = wte128[k];
+        q131_t wpe_val = wpe128[k];
+        packed_out[k] = q131_add(wte_val, wpe_val);
+    }
+#elif defined(ENABLE_Q115)
     // Q1.15 mode: add using Q1.15 arithmetic
     for (int k = 0; k < x128::size; k++) {
         q115_t wte_val = wte128[k];
@@ -122,7 +131,10 @@ __global__ void wte_backward_kernel(floatX* dwte,
 
     // Add the result to dwte and write back to global memory (read-modify-write)
     for (unsigned int k = 0; k < x128::size; k++) {
-#ifdef ENABLE_Q115
+#if defined(ENABLE_Q131)
+        // For Q1.31 mode, use direct fixed-point conversion
+        packed_in_out[k] = float_to_q131(accum[k] + q131_to_float(packed_in_out[k]));
+#elif defined(ENABLE_Q115)
         // For Q1.15 mode, use direct fixed-point conversion
         packed_in_out[k] = float_to_q115(accum[k] + q115_to_float(packed_in_out[k]));
 #else
@@ -162,7 +174,10 @@ __global__ void wpe_backward_kernel(floatX* dwpe,
     floatX* dwpe_tc = dwpe + (t * C) + c;
     x128 packed_dwpe = load128(dwpe_tc);
     for (unsigned int k = 0; k < x128::size; k++) {
-#ifdef ENABLE_Q115
+#if defined(ENABLE_Q131)
+        // For Q1.31 mode, use direct fixed-point conversion
+        packed_dwpe[k] = float_to_q131(accum[k] + q131_to_float(packed_dwpe[k]));
+#elif defined(ENABLE_Q115)
         // For Q1.15 mode, use direct fixed-point conversion
         packed_dwpe[k] = float_to_q115(accum[k] + q115_to_float(packed_dwpe[k]));
 #else

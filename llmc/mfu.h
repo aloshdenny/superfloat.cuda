@@ -15,6 +15,8 @@
 #define MFUH_PRECISION_FP32 0
 #define MFUH_PRECISION_FP16 1
 #define MFUH_PRECISION_BF16 2
+#define MFUH_PRECISION_Q115 3
+#define MFUH_PRECISION_Q131 4
 
 #if USE_NVML
 inline void nvml_check(nvmlReturn_t status, const char *file, int line) {
@@ -116,8 +118,8 @@ float get_flops_promised(const char* device, int precision_mode) {
     https://images.nvidia.com/aem-dam/Solutions/geforce/ada/nvidia-ada-gpu-architecture.pdf
     */
 
-   // validate the precision mode as one of the three possible values
-    if (!(precision_mode == MFUH_PRECISION_FP32 || precision_mode == MFUH_PRECISION_FP16 || precision_mode == MFUH_PRECISION_BF16)) {
+   // validate the precision mode as one of the supported values
+    if (!(precision_mode == MFUH_PRECISION_FP32 || precision_mode == MFUH_PRECISION_FP16 || precision_mode == MFUH_PRECISION_BF16 || precision_mode == MFUH_PRECISION_Q115 || precision_mode == MFUH_PRECISION_Q131)) {
         fprintf(stderr, "Invalid precision mode: %d\n", precision_mode);
         return -1.0f;
     }
@@ -133,6 +135,8 @@ float get_flops_promised(const char* device, int precision_mode) {
             if (precision_mode == MFUH_PRECISION_BF16) { value = perf_data->BF_16_32; }
             if (precision_mode == MFUH_PRECISION_FP32) { value = perf_data->TF_32; }
             if (precision_mode == MFUH_PRECISION_FP16) { value = perf_data->FP_16_32; }
+            if (precision_mode == MFUH_PRECISION_Q115) { value = perf_data->TF_32; }  // Use FP32 rate as reference
+            if (precision_mode == MFUH_PRECISION_Q131) { value = perf_data->TF_32; }  // Use FP32 rate as reference
 
             // we'd get here if we're e.g. trying to use BF16 on Volta GPU or something...
             if (value < 0.0f) {

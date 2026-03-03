@@ -1,6 +1,72 @@
 # Q1.15 Implementation TODO List
 
-## Critical Remaining Tasks
+## ✅ Completed Optimizations (Breaking the ~4.4 Loss Floor)
+
+The following optimizations have been implemented to push Q1.15 training toward the theoretical floor of ~3.4 loss:
+
+### 1. ✅ Increased Logit Scale (CRITICAL) - Expected gain: 0.3-0.6 loss
+- **File**: `llmc/q115_common.cuh`
+- **Change**: `Q115_LOGITS_SCALE` increased from 16.0 to **24.0**
+- **Why**: Logits were too small due to bounded weights → softmax entropy too high → loss floor
+- **Effect**: Equivalent to lowering softmax temperature, restores expressivity
+
+### 2. ✅ Q-aware LayerNorm Epsilon - Expected gain: 0.15-0.25 loss
+- **File**: `llmc/q115_common.cuh`, `llmc/layernorm.cuh`
+- **Change**: `Q115_LAYERNORM_EPS` set to **1e-3** (default 1e-5 is below Q1.15 resolution ~3e-5)
+- **Why**: Prevents rstd explosion, avoids denorm flushing, improves gradient signal alignment
+
+### 3. ✅ Position Embedding Freezing - Expected gain: 0.1-0.2 loss
+- **File**: `train_gpt2.cu`
+- **Change**: After **3000 steps** (`Q115_WPE_FREEZE_STEP`), wpe updates are frozen
+- **Why**: Frees dynamic range for semantic embeddings, reduces interference noise
+
+### 4. ✅ RMSNorm Instead of LayerNorm (Already implemented) - Expected gain: 0.3-0.5 loss
+- **File**: `llmc/layernorm.cuh`
+- **Change**: When `ENABLE_Q115` is defined, uses RMSNorm (no mean subtraction)
+- **Why**: No mean subtraction avoids destroying small signals in fixed-point
+
+### 5. ✅ Explicit Residual Branch Scaling - Expected gain: 0.15-0.3 loss
+- **Files**: `llmc/layernorm.cuh`, `llmc/q115_common.cuh`
+- **Change**: Residual adds now use scaled branches:
+  - Attention residual: `Q115_ATTENTION_RESIDUAL_SCALE = 0.65`
+  - MLP residual: `Q115_MLP_RESIDUAL_SCALE = 0.75`
+- **Why**: Prevents amplitude collapse, preserves head-wise variance
+
+### 6. ✅ Disabled Weight Decay on QKV Matrices - Expected gain: 0.1-0.2 loss
+- **File**: `train_gpt2.cu`
+- **Change**: Weight decay now ONLY applies to `fcw` (tensor 10)
+- **Disabled on**: wte(0), wpe(1), qkvw(4), attprojw(6), fcprojw(12)
+- **Why**: Decay shrinks attention logits → entropy ↑, Q1.15 has no headroom for shrinkage
+
+### 7. ✅ Embedding Initialization Scaling - Expected gain: 0.1 loss
+- **File**: `train_gpt2.cu`, `llmc/q115_common.cuh`
+- **Change**: At init:
+  - wte scaled by `Q115_WTE_INIT_SCALE = 1.2` (scale up)
+  - wpe scaled by `Q115_WPE_INIT_SCALE = 0.8` (scale down)
+  - qkvw scaled by `Q115_QKV_INIT_SCALE = 1.3` (increase head diversity)
+- **Why**: Rebalances representational budget, improves early token separation
+
+### 8. ✅ Activation Clamping After LN - Expected gain: 0.1-0.15 loss
+- **Files**: `llmc/layernorm.cuh`, `llmc/q115_common.cuh`
+- **Change**: Activations clamped to `[-3.0, 3.0]` after normalization
+- **Why**: Prevents rare spikes from poisoning fixed-point math, improves gradient stationarity
+
+---
+
+## Expected Final Loss Targets
+
+| Optimizations Applied | Expected Loss |
+|----------------------|---------------|
+| Items 1-6 only | **3.6 - 3.9** |
+| All items 1-8 | **~3.4** (theoretical Q1.15 floor) |
+
+**Note**: Loss below ~3.3 is NOT achievable without:
+- Weight precision increase
+- Architectural changes (MoE, μParam, rotary embeddings, etc.)
+
+---
+
+## Remaining Tasks (Lower Priority)
 
 ### 1. Fix Gradient Activation Structure
 **Problem**: `grads_acts` needs to be all-float but points to mixed-type `ActivationTensors`

@@ -24,6 +24,10 @@ typedef int16_t q115_t;
 #define Q115_MIN -32768              // Minimum Q1.15 value (-1.0)
 #define Q115_OVERFLOW_THRESHOLD 0.999f  // Clamp values to prevent overflow
 
+// Q1.15 smallest non-zero value is approximately 3e-5 (1/32768)
+// Using epsilon below this causes numerical instability
+#define Q115_MIN_NONZERO (1.0f / Q115_SCALE)
+
 // ============================================================================
 // Dynamic Scaling Configuration for Block Floating Point (BFP)
 // Each tensor type has its own scale factor to maximize dynamic range
@@ -44,13 +48,44 @@ typedef int16_t q115_t;
 
 // Logits scale: logits before softmax (can be large for confident predictions)
 // This is CRITICAL - logits need range of roughly [-10, 10] for proper training
-#define Q115_LOGITS_SCALE 16.0f
+// INCREASED from 16.0 to 24.0 for better softmax expressivity (reduces entropy)
+#define Q115_LOGITS_SCALE 24.0f
 
 // Gradient scales: gradients need their own scaling to avoid vanishing
 #define Q115_GRAD_EMBEDDING_SCALE 0.01f
 #define Q115_GRAD_ATTENTION_SCALE 0.1f
 #define Q115_GRAD_FFN_SCALE 0.1f
 #define Q115_GRAD_LOGITS_SCALE 1.0f
+
+// ============================================================================
+// Q1.15 Optimization Constants
+// ============================================================================
+
+// Q-aware LayerNorm epsilon: default 1e-5 is below Q1.15 resolution (~3e-5)
+// Using 1e-3 prevents rstd explosion and improves gradient signal
+#define Q115_LAYERNORM_EPS 1e-3f
+
+// Residual branch scaling to prevent amplitude collapse
+// Attention residual: scale the attention output before adding to residual
+// MLP residual: scale the MLP output before adding to residual
+#define Q115_ATTENTION_RESIDUAL_SCALE 0.65f
+#define Q115_MLP_RESIDUAL_SCALE 0.75f
+
+// Activation clamping range after LayerNorm/RMSNorm
+// Prevents rare spikes from poisoning fixed-point math
+#define Q115_ACTIVATION_CLAMP_MIN -3.0f
+#define Q115_ACTIVATION_CLAMP_MAX 3.0f
+
+// Embedding initialization scales (static, applied at init only)
+// Rebalances representational budget between token and position embeddings
+#define Q115_WTE_INIT_SCALE 1.2f
+#define Q115_WPE_INIT_SCALE 0.8f
+
+// QKV initialization scale for improved head diversity
+#define Q115_QKV_INIT_SCALE 1.3f
+
+// Position embedding freeze threshold (freeze wpe after this many steps)
+#define Q115_WPE_FREEZE_STEP 3000
 
 // Layer-wise gradient scaling to prevent vanishing gradients in deep networks
 // Earlier layers get larger gradients (gradient reversal of the vanishing problem)

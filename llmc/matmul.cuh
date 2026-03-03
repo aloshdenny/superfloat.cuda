@@ -29,6 +29,8 @@ Matrix Multiplication, with help from cuBLASLt
 #endif
 #if defined(ENABLE_Q115)
 #include "q115_common.cuh"
+#elif defined(ENABLE_Q131)
+#include "q131_common.cuh"
 #endif
 
 // ----------------------------------------------------------------------------

@@ -1,0 +1,16 @@
+diff --git a/Makefile b/Makefile
+index 455e1a1..1ed3dcf 100644
+--- a/Makefile
++++ b/Makefile
+@@ -48,6 +48,8 @@ ifeq ($(OS),Windows_NT)
+   NVCC ?= "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.1\bin\nvcc.exe"
+ else
+   NVCC ?= /usr/local/cuda/bin/nvcc
++  # Try to find nvcc if not at the default location
++  nvcc_path := $(shell which nvcc 2>/dev/null)
++  ifneq ($(nvcc_path),)
++    NVCC = $(nvcc_path)
++  endif
+ endif
+
+ # ===============================

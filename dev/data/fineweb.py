@@ -38,7 +38,7 @@ parser = argparse.ArgumentParser(description="FineWeb and Edu-FineWeb dataset pr
 parser.add_argument("-t", "--type", type=str, default="classic", help="Fineweb type, edu|classic")
 parser.add_argument("-v", "--version", type=str, default="10B", help="Fineweb data sample size, 10B|100B")
 parser.add_argument("-m", "--model_desc", type=str, default="gpt-2", help="Model descriptor, gpt-2|llama-3")
-parser.add_argument("-s", "--shard_size", type=int, default=10**8, help="Size of each data shard in the output .bin files, in tokens")
+parser.add_argument("-s", "--shard_size", type=int, default=10**9, help="Size of each data shard in the output .bin files, in tokens")
 args = parser.parse_args()
 
 # FineWeb has a few possible subsamples available
