@@ -113,10 +113,77 @@ void tokenizer_free(Tokenizer *tokenizer) {
 void tokenizer_init_q15(Tokenizer *tokenizer, const char *filename) {
   FILE *file = fopen(filename, "rb");
   if (file == NULL) {
-    printf("---\n");
-    printf("WARNING: Failed to open the q1.15 tokenizer file %s\n", filename);
-    printf("---\n");
-    tokenizer->init_ok = 0;
+    // If the Q1.15 file is missing, try to reconstruct it from the standard one
+    const char *fallback_filename = "gpt2_tokenizer.bin";
+    FILE *fallback_file = fopen(fallback_filename, "rb");
+    if (fallback_file == NULL) {
+      printf("---\n");
+      printf("WARNING: Failed to open both the q1.15 tokenizer file '%s' and "
+             "the fallback '%s'\n",
+             filename, fallback_filename);
+      printf("---\n");
+      tokenizer->init_ok = 0;
+      return;
+    }
+
+    // Read the standard header
+    uint32_t header[256];
+    freadCheck(header, sizeof(uint32_t), 256, fallback_file);
+    assert(header[0] == 20240328);
+    int version = header[1];
+    tokenizer->vocab_size = header[2];
+    if (version == 1) {
+      assert(tokenizer->vocab_size == 50257);
+      tokenizer->eot_token = 50256;
+    } else if (version == 2) {
+      tokenizer->eot_token = header[3];
+    } else {
+      fprintf(stderr, "Tokenizer fallback model file %s has bad version: %d\n",
+              fallback_filename, version);
+      exit(EXIT_FAILURE);
+    }
+
+    // Read in all the tokens from the fallback
+    unsigned char length;
+    tokenizer->token_table =
+        (char **)mallocCheck(tokenizer->vocab_size * sizeof(char *));
+    for (uint32_t i = 0; i < tokenizer->vocab_size; i++) {
+      freadCheck(&length, sizeof(unsigned char), 1, fallback_file);
+      assert(length > 0);
+      char *token_bytes = (char *)mallocCheck(length + 1);
+      freadCheck(token_bytes, sizeof(char), length, fallback_file);
+      token_bytes[length] = '\0';
+      tokenizer->token_table[i] = token_bytes;
+    }
+    fcloseCheck(fallback_file);
+    tokenizer->init_ok = 1;
+
+    // Now construct and cache the missing q1.15 version
+    printf("Reconstructing %s from %s...\n", filename, fallback_filename);
+    FILE *out_file = fopen(filename, "wb");
+    if (out_file != NULL) {
+      uint16_t header_q15[256] = {0};
+      header_q15[0] = 2024;
+      header_q15[1] = 2;
+      header_q15[2] = (uint16_t)tokenizer->vocab_size;
+      header_q15[3] = (uint16_t)tokenizer->eot_token;
+      fwrite(header_q15, sizeof(uint16_t), 256, out_file);
+
+      for (uint32_t i = 0; i < tokenizer->vocab_size; i++) {
+        char *token_bytes = tokenizer->token_table[i];
+        uint16_t len_q15 = 0;
+        while (token_bytes[len_q15] != '\0') {
+          len_q15++;
+        }
+        fwrite(&len_q15, sizeof(uint16_t), 1, out_file);
+        for (int j = 0; j < (int)len_q15; j++) {
+          uint16_t c = (uint16_t)((unsigned char)token_bytes[j]);
+          fwrite(&c, sizeof(uint16_t), 1, out_file);
+        }
+      }
+      fclose(out_file);
+      printf("Successfully constructed %s\n", filename);
+    }
     return;
   }
   // read in the header
