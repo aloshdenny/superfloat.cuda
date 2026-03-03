@@ -1,4 +1,4 @@
-# llm.c
+# superfloat.cuda
 
 LLMs in simple, pure C/CUDA with no need for 245MB of PyTorch or 107MB of cPython. Current focus is on pretraining, in particular reproducing the [GPT-2](https://github.com/openai/gpt-2) and [GPT-3](https://arxiv.org/abs/2005.14165) miniseries, along with a parallel PyTorch reference implementation in [train_gpt2.py](train_gpt2.py). You'll recognize this file as a slightly tweaked [nanoGPT](https://github.com/karpathy/nanoGPT), an earlier project of mine. Currently, llm.c is a bit faster than PyTorch Nightly (by about 7%). In addition to the bleeding edge mainline code in [train_gpt2.cu](train_gpt2.cu), we have a simple reference CPU fp32 implementation in ~1,000 lines of clean code in one file [train_gpt2.c](train_gpt2.c). I'd like this repo to only maintain C and CUDA code. Ports to other languages or repos are very welcome, but should be done in separate repos, and I am happy to link to them below in the "notable forks" section. Developer coordination happens in the [Discussions](https://github.com/karpathy/llm.c/discussions) and on Discord, either the `#llmc` channel on the [Zero to Hero](https://discord.gg/3zy8kqD9Cp) channel, or on `#llmdotc` on [GPU MODE](https://discord.gg/gpumode) Discord.
 
@@ -78,17 +78,20 @@ Allay
 
 ## datasets
 
-The data files inside `/dev/data/(dataset).py` are responsible for downloading, tokenizing and saving the tokens to .bin files, readable easily from C. So for example when you run:
+The data files inside `/dev/data/(dataset).py` are responsible for downloading, tokenizing and saving the tokens to .bin files, readable easily from C.
+
+For **superfloat** pretraining (as configured by default in `train_gpt2.cu`), we use the 10B subset of the [FineWeb](https://huggingface.co/datasets/HuggingFaceFW/fineweb) dataset. To set this up, run:
 
 ```bash
-python dev/data/tinyshakespeare.py
+python dev/data/fineweb.py
 ```
 
-We download and tokenize the [tinyshakespeare](https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt) dataset. The output of this looks like this:
+This downloads and tokenizes the dataset, outputting chunked shards into the `dev/data/fineweb10B` directory:
 
 ```
-writing 32,768 tokens to ./dev/data/tinyshakespeare/tiny_shakespeare_val.bin
-writing 305,260 tokens to ./dev/data/tinyshakespeare/tiny_shakespeare_train.bin
+writing to ./dev/data/fineweb10B/fineweb_val_000000.bin
+writing to ./dev/data/fineweb10B/fineweb_train_000001.bin
+...
 ```
 
 The .bin files contain a short header (1024 bytes) and then a stream of tokens in uint16, indicating the token ids with the GPT-2 tokenizer. More datasets are available in `/dev/data`.
