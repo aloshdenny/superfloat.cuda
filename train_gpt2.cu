@@ -2872,7 +2872,7 @@ int main(int argc, char *argv[]) {
 
   // set up the Tokenizer
   Tokenizer tokenizer;
-  tokenizer_init(&tokenizer, "gpt2_tokenizer.bin");
+  tokenizer_init_q15(&tokenizer, "gpt2_tokenizer_q15.bin");
 
   // set up learning rate scheduler
   LearningRateScheduler lr_scheduler;
@@ -3026,7 +3026,7 @@ int main(int argc, char *argv[]) {
     //         model.config.vocab_size, coin); gen_tokens[t] = next_token;
     //         // print the generated token, either using the Tokenizer or a
     //         fallback if (tokenizer.init_ok) {
-    //             const char* token_str = tokenizer_decode(&tokenizer,
+    //             const char* token_str = tokenizer_decode_q15(&tokenizer,
     //             next_token); safe_printf(token_str);
     //         } else {
     //             // fall back to printing the token id
