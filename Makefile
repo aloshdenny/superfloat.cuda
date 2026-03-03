@@ -1,7 +1,7 @@
 # ===============================
 # CUDA / NVCC settings (Modal prebuilt image)
 # ===============================
-NVCC ?= /usr/local/cuda/bin/nvcc
+NVCC ?= $(shell which nvcc 2>/dev/null || echo /usr/local/cuda/bin/nvcc)
 NVCC_FLAGS = --threads=0 -t=0 --use_fast_math -std=c++17 -O3 -Wno-deprecated-gpu-targets
 
 # Headers (you already validated these exist)
