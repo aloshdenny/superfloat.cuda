@@ -3135,7 +3135,7 @@ int main(int argc, char *argv[]) {
 #elif defined(ENABLE_Q115)
       // Lower grad clip for Q1.15 to prevent large updates that can destabilize
       // training
-      float grad_clip = 0.5f;
+      float grad_clip = 1.0f;
 #else
       float grad_clip = 1.0f;
 #endif
