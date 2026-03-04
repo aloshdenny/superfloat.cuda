@@ -1451,10 +1451,21 @@ void gpt3_update(GPT3 *model, float learning_rate, float beta1, float beta2,
     // - the position embeddings actively participate at every forward/backward
     // pass
 #if defined(ENABLE_Q115)
-    // For Q1.15 mode: exclude wte(0), attprojw(6), fcprojw(12) from weight
-    // decay This prevents amplitude collapse which contributes to the ~7.x loss
-    // wall Only apply weight decay to: wpe(1), qkvw(4), fcw(10)
-    float wd = (i == 1 || i == 4 || i == 10) ? weight_decay : 0.0f;
+    // For Q1.15 mode: ONLY apply weight decay to fcw(10)
+    // Disable WD on: wte(0), wpe(1), qkvw(4), attprojw(6), fcprojw(12)
+    // This prevents amplitude collapse which is critical for breaking the loss
+    // floor. Weight decay shrinks attention logits -> entropy increases -> loss
+    // floor. Q1.15 has no headroom for weight shrinkage.
+    float wd = (i == 10) ? weight_decay : 0.0f;
+
+    // Position embedding freezing: after Q115_WPE_FREEZE_STEP steps, freeze wpe
+    // This frees dynamic range for semantic embeddings and reduces interference
+    // noise
+    bool freeze_tensor = false;
+    if (i == 1 && t > Q115_WPE_FREEZE_STEP) { // i == 1 is wpe
+      freeze_tensor = true;
+      wd = 0.0f; // Also ensure no weight decay on frozen tensor
+    }
 #else
     float wd = (i == 0 || i == 1 || i == 4 || i == 6 || i == 10 || i == 12)
                    ? weight_decay
@@ -1486,11 +1497,18 @@ void gpt3_update(GPT3 *model, float learning_rate, float beta1, float beta2,
       init_from_master(param_ptr, master_ptr, shard.size, tensor.size,
                        shard.size, num_layers, seed, main_stream);
     } else {
-      // ok finally call the kernel to update the weights with AdamW
-      adamw_update(param_ptr, master_ptr, grad_ptr, m_ptr, v_ptr, shard.size,
-                   tensor.size, tensor.size, shard.size, num_layers,
-                   learning_rate, beta1, beta2, t, eps, wd, grad_scale, seed,
-                   main_stream);
+#if !defined(ENABLE_Q115)
+      bool freeze_tensor = false; // No freezing in non-Q115 mode
+#endif
+      if (!freeze_tensor) {
+        // ok finally call the kernel to update the weights with AdamW
+        // Skip update if tensor is frozen (e.g., wpe after
+        // Q115_WPE_FREEZE_STEP)
+        adamw_update(param_ptr, master_ptr, grad_ptr, m_ptr, v_ptr, shard.size,
+                     tensor.size, tensor.size, shard.size, num_layers,
+                     learning_rate, beta1, beta2, t, eps, wd, grad_scale, seed,
+                     main_stream);
+      }
     }
 
     if (multi_gpu_config->zero_stage == 1) {
@@ -2554,7 +2572,8 @@ int main(int argc, char *argv[]) {
     }
     float mfu = gpt3_estimate_mfu(&model, B * T * grad_accum_steps,
                                   time_elapsed_ms / 1000.0f);
-    // printf0("step %4d/%d | loss %7.6f (%+.2fz)| norm %6.4f (%+.2fz)| lr %.2e | "
+    // printf0("step %4d/%d | loss %7.6f (%+.2fz)| norm %6.4f (%+.2fz)| lr %.2e
+    // | "
     //         "%.2f ms | %.1f%% bf16 MFU | %.0f tok/s\n",
     //         step + 1, train_num_batches, model.mean_loss, zloss, grad_norm,
     //         zgrad, step_learning_rate, time_elapsed_ms, 100 * mfu,
@@ -2572,9 +2591,9 @@ int main(int argc, char *argv[]) {
                      grad_norm);
 
     // disable the profiler after 3 steps of optimization
-  //   if (step == 3) {
-  //     cudaProfilerStop();
-  //   }
+    //   if (step == 3) {
+    //     cudaProfilerStop();
+    //   }
   }
   // add a total average, for optimizations that are only mild improvements
   // (excluding 1st batch as warmup)
