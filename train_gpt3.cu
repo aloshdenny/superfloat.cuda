@@ -2554,11 +2554,11 @@ int main(int argc, char *argv[]) {
     }
     float mfu = gpt3_estimate_mfu(&model, B * T * grad_accum_steps,
                                   time_elapsed_ms / 1000.0f);
-    printf0("step %4d/%d | loss %7.6f (%+.2fz)| norm %6.4f (%+.2fz)| lr %.2e | "
-            "%.2f ms | %.1f%% bf16 MFU | %.0f tok/s\n",
-            step + 1, train_num_batches, model.mean_loss, zloss, grad_norm,
-            zgrad, step_learning_rate, time_elapsed_ms, 100 * mfu,
-            bias_corrected_ema_tokens_per_second);
+    // printf0("step %4d/%d | loss %7.6f (%+.2fz)| norm %6.4f (%+.2fz)| lr %.2e | "
+    //         "%.2f ms | %.1f%% bf16 MFU | %.0f tok/s\n",
+    //         step + 1, train_num_batches, model.mean_loss, zloss, grad_norm,
+    //         zgrad, step_learning_rate, time_elapsed_ms, 100 * mfu,
+    //         bias_corrected_ema_tokens_per_second);
     if (log_gpu_every > 0 && (step + 1) % log_gpu_every == 0) {
       GPUUtilInfo gpu_info = get_gpu_utilization_info();
       printf0("                  compute %2.1f%% | memory: %2.1f%% | fan: "
