@@ -2366,7 +2366,8 @@ int main(int argc, char *argv[]) {
       val_loss /= val_num_batches;
       val_loss = multi_gpu_cpu_float_sum(val_loss, &multi_gpu_config) /
                  multi_gpu_config.num_processes;
-      printf0("val loss %f\n", val_loss);
+      float val_perplexity = expf(val_loss);
+      printf0("val loss %f | val perplexity %f\n", val_loss, val_perplexity);
       logger_log_val(&logger, step, val_loss);
     }
 
@@ -2517,9 +2518,8 @@ int main(int argc, char *argv[]) {
     } else {
       // clip the gradient norm to a maximum value
 #if defined(ENABLE_Q115)
-      // Lower grad clip for Q1.15 to prevent large updates that can destabilize
-      // training
-      float grad_clip = 0.5f;
+      // Q1.15 grad clip: use standard 1.0 since backprop runs in BF16
+      float grad_clip = 1.0f;
 #else
       float grad_clip = 1.0f;
 #endif
