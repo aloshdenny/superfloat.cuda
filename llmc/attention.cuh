@@ -150,7 +150,7 @@ __global__ void softmax_forward_kernel5(floatX *out, float inv_temperature,
   for (int i = lane_id; i < pos_by_4; i += WARP_SIZE) {
     float regarray[4];
     for (int k = 0; k < 4; ++k) {
-      regarray[k] = (float)x_aligned[4 * i + k] * att_scale;
+      regarray[k] = simulate_q115((float)x_aligned[4 * i + k]) * att_scale;
     }
     float old_maxval = maxval;
     for (int k = 0; k < 4; ++k) {
@@ -164,7 +164,7 @@ __global__ void softmax_forward_kernel5(floatX *out, float inv_temperature,
 
   if (4 * pos_by_4 + lane_id <= own_pos) {
     float old_maxval = maxval;
-    float scaled_val = (float)x[4 * pos_by_4 + lane_id] * att_scale;
+    float scaled_val = simulate_q115((float)x[4 * pos_by_4 + lane_id]) * att_scale;
     maxval = fmaxf(maxval, scaled_val);
     sumval *= expf(inv_temperature * (old_maxval - maxval));
     sumval += expf(inv_temperature * (scaled_val - maxval));
@@ -180,7 +180,7 @@ __global__ void softmax_forward_kernel5(floatX *out, float inv_temperature,
   for (int i = lane_id; i <= own_pos; i += WARP_SIZE) {
     // recalculation is faster than doing the round-trip through memory.
     float ev = expf(inv_temperature *
-                    ((float)__ldcs(x + i) * att_scale - global_maxval));
+                    (simulate_q115((float)__ldcs(x + i)) * att_scale - global_maxval));
     __stcs(out + idx * T + i, (floatX)(ev * norm));
   }
 }

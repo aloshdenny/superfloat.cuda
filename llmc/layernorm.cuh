@@ -79,7 +79,7 @@ __global__ void rmsnorm_q_forward_kernel(floatX* __restrict__ out, float* __rest
         result = fmaxf(Q115_ACTIVATION_CLAMP_MIN, fminf(Q115_ACTIVATION_CLAMP_MAX, result));
         // Use scaled conversion to allow larger dynamic range
         // The scale factor allows values > 1.0 in the effective output
-        __stcs(o + c, float_to_q115_scaled(result, Q115_ATTENTION_SCALE));
+        __stcs(o + c, (floatX)result);
     }
 }
 
@@ -122,7 +122,7 @@ __global__ void rmsnorm_q_backward_kernel(floatX* dinp, floatX* dweight,
     // The gradient should flow naturally; scaling is handled by learning rate
 #ifdef ENABLE_Q115
     // Clamp gradient to Q1.15 range but don't artificially reduce magnitude
-    dinp[idx] = float_to_q115(fmaxf(-0.999f, fminf(0.999f, dx)));
+    dinp[idx] = (floatX)dx;
 #else
     dinp[idx] = (floatX)dx;
 #endif
@@ -218,7 +218,7 @@ __global__ void layernorm_forward_kernel3(floatX* __restrict__ out, float* __res
         // Clamp activations to Q1.15-safe range
         result = fmaxf(Q115_ACTIVATION_CLAMP_MIN, fminf(Q115_ACTIVATION_CLAMP_MAX, result));
         // Use scaled conversion to preserve dynamic range
-        __stcs(o + c, float_to_q115_scaled(result, Q115_ATTENTION_SCALE));
+        __stcs(o + c, (floatX)result);
     }
 #else
     // Original LayerNorm for non-Q1.15 modes
@@ -324,7 +324,7 @@ __global__ void layernorm_forward_kernel6(floatX* __restrict__ out, float* __res
             float o = normalized * (float)w[k] + (float)b[k];
             // Clamp activations to Q1.15-safe range
             o = fmaxf(Q115_ACTIVATION_CLAMP_MIN, fminf(Q115_ACTIVATION_CLAMP_MAX, o));
-            out_data[k] = float_to_q115(o);
+            out_data[k] = (floatX)o;
         }
         store128cs(out + c, out_data);
     }
@@ -483,7 +483,7 @@ __global__ void fused_residual_forward_kernel5(floatX* residual, floatX* normed,
             float res_val = (float)in1[k] + Q115_ATTENTION_RESIDUAL_SCALE * (float)in2[k];
             sum_sq += res_val * res_val;
             // Use scaled conversion for residual stream
-            out[k] = float_to_q115_scaled(res_val, Q115_ATTENTION_SCALE);
+            out[k] = (floatX)res_val;
         }
         store128cs(residual + c, out);
         s_res[c / x128::size] = out;
@@ -582,7 +582,7 @@ __global__ void residual_forward_kernel(floatX* out, const floatX* inp1, const f
         float res_val = (float)packed_inp1[k] + Q115_ATTENTION_RESIDUAL_SCALE * (float)packed_inp2[k];
         // Clamp residual to prevent overflow while maintaining larger dynamic range
         res_val = fmaxf(Q115_ACTIVATION_CLAMP_MIN, fminf(Q115_ACTIVATION_CLAMP_MAX, res_val));
-        packed_out[k] = float_to_q115(res_val);
+        packed_out[k] = (floatX)res_val;
 #else
         float res_val = (float)packed_inp1[k] + (float)packed_inp2[k];
         packed_out[k] = (floatX)res_val;

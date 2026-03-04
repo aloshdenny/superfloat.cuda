@@ -60,7 +60,7 @@ __global__ void __launch_bounds__(1024, MAX_1024_THREADS_BLOCKS)
   float thread_max = -INFINITY;
   for (int i = threadIdx.x; i < V; i += blockDim.x) {
     // Scale Q1.15 logits to actual logit range
-    float logit = (float)logits_row[i] * Q115_LOGIT_SCALE;
+    float logit = simulate_q115((float)logits_row[i]) * Q115_LOGIT_SCALE;
     thread_max = fmaxf(thread_max, logit);
   }
 
@@ -95,7 +95,7 @@ __global__ void __launch_bounds__(1024, MAX_1024_THREADS_BLOCKS)
   // Step 2: Compute sum of exp(logit - max)
   float thread_sum = 0.0f;
   for (int i = threadIdx.x; i < V; i += blockDim.x) {
-    float logit = (float)logits_row[i] * Q115_LOGIT_SCALE;
+    float logit = simulate_q115((float)logits_row[i]) * Q115_LOGIT_SCALE;
     thread_sum += expf(logit - max_logit);
   }
 
@@ -110,7 +110,7 @@ __global__ void __launch_bounds__(1024, MAX_1024_THREADS_BLOCKS)
 
   // Step 3: Compute loss (negative log probability of correct class)
   if (threadIdx.x == 0) {
-    float target_logit = (float)logits_row[target_ix] * Q115_LOGIT_SCALE;
+    float target_logit = simulate_q115((float)logits_row[target_ix]) * Q115_LOGIT_SCALE;
     float log_prob = target_logit - max_logit - logf(sum_exp);
     losses[idx] = -log_prob; // Cross-entropy loss
   }
@@ -121,7 +121,7 @@ __global__ void __launch_bounds__(1024, MAX_1024_THREADS_BLOCKS)
     float inv_sum = 1.0f / sum_exp;
 
     for (int i = threadIdx.x; i < V; i += blockDim.x) {
-      float logit = (float)logits_row[i] * Q115_LOGIT_SCALE;
+      float logit = simulate_q115((float)logits_row[i]) * Q115_LOGIT_SCALE;
       float prob = expf(logit - max_logit) * inv_sum;
 
       // Gradient: (prob - indicator) * dloss
@@ -180,7 +180,7 @@ __device__ SoftmaxParams prepare_softmax_blockwide3(int64_t idx,
       if (i * x128::size + k >= V) {
         break; // bounds checking against real V (rather than padded P)
       }
-      float v = (float)x[i * x128::size + k] * logit_scale;
+      float v = simulate_q115((float)x[i * x128::size + k]) * logit_scale;
       float old_maxval = thread_maxval;
       thread_maxval = fmaxf(thread_maxval, v);
       thread_sumval *= expf((old_maxval - thread_maxval));
@@ -195,7 +195,7 @@ __device__ SoftmaxParams prepare_softmax_blockwide3(int64_t idx,
         x +
         i * x128::size); // load and keep in cache until fused_classifier loop
     for (int k = 0; k < x128::size; ++k) {
-      float v = (float)packed_x[k] * logit_scale;
+      float v = simulate_q115((float)packed_x[k]) * logit_scale;
       float old_maxval = thread_maxval;
       thread_maxval = fmaxf(thread_maxval, v);
       thread_sumval *= expf((old_maxval - thread_maxval));
@@ -247,7 +247,7 @@ __global__ void __launch_bounds__(1024, MAX_1024_THREADS_BLOCKS)
   // calculate the probability needed for the loss and update (single-threaded)
   if (threadIdx.x == 0) {
     float prob =
-        expf((float)logits[idx * P + ix] * logit_scale - sp.Offset) * sp.Scale;
+        expf(simulate_q115((float)logits[idx * P + ix]) * logit_scale - sp.Offset) * sp.Scale;
     losses[idx] -= logf(prob);
   }
 
@@ -271,7 +271,7 @@ __global__ void __launch_bounds__(1024, MAX_1024_THREADS_BLOCKS)
     x128 packed_probs;
     for (int k = 0; k < x128::size; ++k) {
       int element = i * x128::size + k;
-      float prob = expf((float)packed_logits_vec[k] * logit_scale - sp.Offset) *
+      float prob = expf(simulate_q115((float)packed_logits_vec[k]) * logit_scale - sp.Offset) *
                    sp.Scale;
       packed_probs[k] = (floatX)prob;
       float indicator = (element == ix) ? 1.0f : 0.0f;
@@ -294,7 +294,7 @@ __global__ void __launch_bounds__(1024, MAX_1024_THREADS_BLOCKS)
       V & ~(x128::size - 1); // round down to multiple of x128::size
   for (int i = threadIdx.x + unaligned_start; i < V; i++) {
     float prob =
-        expf((float)logits_vec[i] * logit_scale - sp.Offset) * sp.Scale;
+        expf(simulate_q115((float)logits_vec[i]) * logit_scale - sp.Offset) * sp.Scale;
     float indicator = (i == ix) ? 1.0f : 0.0f;
     float dlogit = (prob - indicator) * dloss * logit_scale;
     if (WriteDLogits) {
