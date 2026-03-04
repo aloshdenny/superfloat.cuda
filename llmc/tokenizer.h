@@ -147,18 +147,7 @@ void tokenizer_init_q15(Tokenizer *tokenizer, const char *filename) {
     unsigned char length;
     tokenizer->token_table =
         (char **)mallocCheck(tokenizer->vocab_size * sizeof(char *));
-    for (uint32_t i = 0; i < tokenizer->vocab_size; i++) {
-      freadCheck(&length, sizeof(unsigned char), 1, fallback_file);
-      assert(length > 0);
-      char *token_bytes = (char *)mallocCheck(length + 1);
-      freadCheck(token_bytes, sizeof(char), length, fallback_file);
-      token_bytes[length] = '\0';
-      tokenizer->token_table[i] = token_bytes;
-    }
-    fcloseCheck(fallback_file);
-    tokenizer->init_ok = 1;
 
-    // Now construct and cache the missing q1.15 version
     printf("Reconstructing %s from %s...\n", filename, fallback_filename);
     FILE *out_file = fopen(filename, "wb");
     if (out_file != NULL) {
@@ -168,22 +157,31 @@ void tokenizer_init_q15(Tokenizer *tokenizer, const char *filename) {
       header_q15[2] = (uint16_t)tokenizer->vocab_size;
       header_q15[3] = (uint16_t)tokenizer->eot_token;
       fwrite(header_q15, sizeof(uint16_t), 256, out_file);
+    }
 
-      for (uint32_t i = 0; i < tokenizer->vocab_size; i++) {
-        char *token_bytes = tokenizer->token_table[i];
-        uint16_t len_q15 = 0;
-        while (token_bytes[len_q15] != '\0') {
-          len_q15++;
-        }
+    for (uint32_t i = 0; i < tokenizer->vocab_size; i++) {
+      freadCheck(&length, sizeof(unsigned char), 1, fallback_file);
+      assert(length > 0);
+      char *token_bytes = (char *)mallocCheck(length + 1);
+      freadCheck(token_bytes, sizeof(char), length, fallback_file);
+      token_bytes[length] = '\0';
+      tokenizer->token_table[i] = token_bytes;
+
+      if (out_file != NULL) {
+        uint16_t len_q15 = (uint16_t)length;
         fwrite(&len_q15, sizeof(uint16_t), 1, out_file);
-        for (int j = 0; j < (int)len_q15; j++) {
+        for (int j = 0; j < (int)length; j++) {
           uint16_t c = (uint16_t)((unsigned char)token_bytes[j]);
           fwrite(&c, sizeof(uint16_t), 1, out_file);
         }
       }
+    }
+    fcloseCheck(fallback_file);
+    if (out_file != NULL) {
       fclose(out_file);
       printf("Successfully constructed %s\n", filename);
     }
+    tokenizer->init_ok = 1;
     return;
   }
   // read in the header
