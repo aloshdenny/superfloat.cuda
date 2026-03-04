@@ -145,6 +145,11 @@ __device__ void __stcs(__nv_bfloat16 *address, __nv_bfloat16 value) {
 }
 #endif
 
+// Fallback for Q1.15 inference simulator when training natively on BF16
+#ifndef ENABLE_Q115
+#define simulate_q115(x) (x)
+#endif
+
 // Generic fallbacks for __ldcs and __stcs for types where the compiler
 // doesn't provide streaming cache intrinsics. We provide templated
 // wrappers that simply perform a normal load/store. If the compiler or
