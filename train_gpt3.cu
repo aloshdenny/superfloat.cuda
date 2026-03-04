@@ -2572,10 +2572,10 @@ int main(int argc, char *argv[]) {
                      grad_norm);
 
     // disable the profiler after 3 steps of optimization
-    if (step == 3) {
-      cudaProfilerStop();
-    }
-  }
+  //   if (step == 3) {
+  //     cudaProfilerStop();
+  //   }
+  // }
   // add a total average, for optimizations that are only mild improvements
   // (excluding 1st batch as warmup)
   printf0("total average iteration time: %f ms\n",
