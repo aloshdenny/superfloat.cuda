@@ -2345,7 +2345,7 @@ int main(int argc, char *argv[]) {
   cudaEvent_t start, end;
   cudaCheck(cudaEventCreate(&start));
   cudaCheck(cudaEventCreate(&end));
-  cudaCheck(cudaProfilerStart());
+  // cudaCheck(cudaProfilerStart());
   double total_sum_iteration_time_s = 0.0;
   float ema_tokens_per_second = 0.0f;
   for (; step <= train_num_batches; step++) {
