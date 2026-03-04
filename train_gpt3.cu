@@ -2575,7 +2575,7 @@ int main(int argc, char *argv[]) {
   //   if (step == 3) {
   //     cudaProfilerStop();
   //   }
-  // }
+  }
   // add a total average, for optimizations that are only mild improvements
   // (excluding 1st batch as warmup)
   printf0("total average iteration time: %f ms\n",
