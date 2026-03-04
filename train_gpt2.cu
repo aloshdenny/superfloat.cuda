@@ -2950,7 +2950,8 @@ int main(int argc, char *argv[]) {
       val_loss /= val_num_batches;
       val_loss = multi_gpu_cpu_float_sum(val_loss, &multi_gpu_config) /
                  multi_gpu_config.num_processes;
-      printf0("val loss %f\n", val_loss);
+      float val_perplexity = expf(val_loss);
+      printf0("val loss %f | val perplexity %f\n", val_loss, val_perplexity);
       logger_log_val(&logger, step, val_loss);
     }
 
