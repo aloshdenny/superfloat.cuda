@@ -449,7 +449,7 @@ malloc_and_point_activations(TensorSpec (&tensors)[NUM_ACTIVATION_TENSORS]) {
   // allocation here this matters because e.g. non-cuDNN attention assumes the
   // attention buffer is zeroed todo - up to ~100ms on slow GPUs, could
   // theoretically be more selective, but this is safer
-  cudaCheck(cudaMemset(acts_memory, 0, bytes));
+  cudaCheck(cudaMemsetAsync(acts_memory, 0, bytes, main_stream));
 
   char *acts_memory_iterator = (char *)acts_memory;
   for (size_t i = 0; i < NUM_ACTIVATION_TENSORS; i++) {
@@ -1411,9 +1411,9 @@ void gpt2_forward(GPT2 *model, const int *inputs, size_t B, size_t T) {
     exit(EXIT_FAILURE);
   }
 
-  // copy inputs/targets to the model
-  cudaCheck(cudaMemcpy(model->inputs, inputs, B * T * sizeof(int),
-                       cudaMemcpyHostToDevice));
+  // copy inputs to the model (async since host buffers are pinned)
+  cudaCheck(cudaMemcpyAsync(model->inputs, inputs, B * T * sizeof(int),
+                            cudaMemcpyHostToDevice, main_stream));
   // validate inputs, all indices must be in the range [0, V)
   // we can do this while the copies are already underway
   tokenCheck(inputs, B * T, V);
@@ -1481,7 +1481,8 @@ void gpt2_forward(GPT2 *model, const int *inputs, size_t B, size_t T) {
     floatX *l_att = acts.att + l * B * NH * T * T;
     if (T != model->seq_len) { // unused parts of attention buffer must be
                                // zeroed (T-dependent)
-      cudaCheck(cudaMemset(l_att, 0, B * NH * T * T * sizeof(floatX)));
+      cudaCheck(cudaMemsetAsync(l_att, 0, B * NH * T * T * sizeof(floatX),
+                                main_stream));
     }
     // these are only needed as scratchpads for the forward pass, but
     // need not be stored for backward
@@ -1519,7 +1520,8 @@ void gpt2_forward(GPT2 *model, const int *inputs, size_t B, size_t T) {
 
   matmul_forward_cublaslt(acts.output, acts.lnf, params.wte, NULL, B, T, C, Vp,
                           main_stream);
-  cudaCheck(cudaDeviceSynchronize());
+  // Removed full device sync — stream-ordered deps are sufficient for training.
+  // Validation path (gpt2_validate) does its own sync before reading results.
 }
 
 // Forwards both the model and the loss and is used for validation splits and
@@ -1543,20 +1545,23 @@ float gpt2_validate(GPT2 *model, const int *inputs, const int *targets,
   const float dloss =
       1.0f / (B * T); // results in the uniform average loss over all elements
   // note: we don't need to generate dlogits here
-  cudaCheck(cudaMemset(acts.losses, 0, B * T * sizeof(float)));
-  cudaCheck(cudaMemcpy(model->targets, targets, B * T * sizeof(int),
-                       cudaMemcpyHostToDevice));
+  cudaCheck(
+      cudaMemsetAsync(acts.losses, 0, B * T * sizeof(float), main_stream));
+  cudaCheck(cudaMemcpyAsync(model->targets, targets, B * T * sizeof(int),
+                            cudaMemcpyHostToDevice, main_stream));
   tokenCheck(targets, B * T,
              V); // while the memcpy is underway, validate the targets
   fused_classifier(acts.output, acts.losses, dloss, model->targets, B, T, V, Vp,
                    False, main_stream);
-  cudaCheck(cudaMemcpy(model->cpu_losses, acts.losses, B * T * sizeof(float),
-                       cudaMemcpyDeviceToHost));
+  // cpu_losses was allocated with cudaMallocHost, so async memcpy is safe
+  cudaCheck(cudaMemcpyAsync(model->cpu_losses, acts.losses,
+                            B * T * sizeof(float), cudaMemcpyDeviceToHost,
+                            main_stream));
+  cudaCheck(cudaStreamSynchronize(main_stream)); // wait for the async memcpy
   for (int i = 0; i < B * T; i++) {
     mean_loss += model->cpu_losses[i];
   }
   mean_loss /= B * T;
-  cudaCheck(cudaDeviceSynchronize());
   return mean_loss;
 }
 
@@ -1603,8 +1608,8 @@ void gpt2_backward_and_reduce(GPT2 *model, int *inputs, const int *targets,
       1.0f /
       (float)(B * T * grad_accum_steps); // results in the uniform average loss
                                          // over all elements
-  cudaCheck(cudaMemcpy(model->targets, targets, B * T * sizeof(int),
-                       cudaMemcpyHostToDevice));
+  cudaCheck(cudaMemcpyAsync(model->targets, targets, B * T * sizeof(int),
+                            cudaMemcpyHostToDevice, main_stream));
   tokenCheck(targets, B * T, V);
   fused_classifier(acts.output, acts.losses, dloss, model->targets, B, T, V, Vp,
                    True, main_stream);
@@ -1617,7 +1622,8 @@ void gpt2_backward_and_reduce(GPT2 *model, int *inputs, const int *targets,
   floatX *dresidual =
       (floatX *)model->acts.scratch_btc; // the main buffer holding the gradient
                                          // in the backward pass
-  cudaCheck(cudaMemset(dresidual, 0, B * T * C * sizeof(floatX)));
+  cudaCheck(
+      cudaMemsetAsync(dresidual, 0, B * T * C * sizeof(floatX), main_stream));
 
   // re-use the output buffer of the forward pass as a scratchpad during
   // backward pass
@@ -1784,7 +1790,9 @@ void gpt2_backward_and_reduce(GPT2 *model, int *inputs, const int *targets,
                                     main_stream);
   }
 
-  cudaCheck(cudaDeviceSynchronize());
+  // Stream sync is sufficient — all work is on main_stream. Full device
+  // sync was unnecessarily blocking any other concurrent CUDA work.
+  cudaCheck(cudaStreamSynchronize(main_stream));
   if (last_step) {
     model->mean_loss /= B * T * grad_accum_steps;
   } else {
@@ -1887,12 +1895,12 @@ void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2,
   if (init_state) {
     model->init_state = false;
     NvtxRange rng("InitOpt");
-    cudaCheck(
-        cudaMemset(model->m_memory, 0,
-                   multi_gpu_config->shard_num_parameters * sizeof(float)));
-    cudaCheck(
-        cudaMemset(model->v_memory, 0,
-                   multi_gpu_config->shard_num_parameters * sizeof(float)));
+    cudaCheck(cudaMemsetAsync(
+        model->m_memory, 0,
+        multi_gpu_config->shard_num_parameters * sizeof(float), main_stream));
+    cudaCheck(cudaMemsetAsync(
+        model->v_memory, 0,
+        multi_gpu_config->shard_num_parameters * sizeof(float), main_stream));
   }
 
   // save RNG state at this point so we can round from master weights
@@ -2042,7 +2050,8 @@ void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2,
     }
   }
 
-  cudaCheck(cudaDeviceSynchronize());
+  // Stream sync instead of full device sync — avoids blocking unrelated work
+  cudaCheck(cudaStreamSynchronize(main_stream));
 }
 
 float gpt2_estimate_mfu(GPT2 *model, int num_tokens, float dt) {
@@ -2454,8 +2463,9 @@ int main(int argc, char *argv[]) {
   int major_checkpoint_every =
       0; // major checkpoints never get deleted when maintaining history
   int resume =
-      0;     // resume the optimization, if one is found inside output_log_dir?
-  int B = 4; // batch size
+      0;      // resume the optimization, if one is found inside output_log_dir?
+  int B = 16; // batch size (RTX 4090: 24GB VRAM can easily handle B=16 for
+              // GPT-2 124M)
   int T = 1024; // sequence length max
   int total_batch_size =
       -1; // will be calculated down below later, if not provided
@@ -2470,11 +2480,11 @@ int main(int argc, char *argv[]) {
       0.0f; // skip update if loss goes above this in zscore
   float skip_update_gradz =
       0.0f; // skip update if grad_norm goes above this in zscore
-  int val_loss_every = 100; // every how many steps do we eval validation loss?
+  int val_loss_every = 250; // every how many steps do we eval validation loss?
   int val_max_steps =
-      20;                // how many batches max do we eval for validation loss?
-  int sample_every = 20; // every how many steps to do inference?
-  int genT = 64;         // number of steps of inference we will do
+      20; // how many batches max do we eval for validation loss?
+  int sample_every = 100; // every how many steps to do inference?
+  int genT = 64;          // number of steps of inference we will do
   int overfit_single_batch =
       0; // useful for debugging, 1 = only load a single data batch once
   int max_steps = -1;
@@ -2482,8 +2492,8 @@ int main(int argc, char *argv[]) {
   int use_master_weights = 1;
   int gelu_fusion =
       -1; // 0 = none, 1 = forward, 2 = forward+backward (-1 => per-GPU default)
-  int recompute =
-      1; // recompute during backward setting, 0 = none, 1 = recompute gelu
+  int recompute = 0;  // recompute during backward setting, 0 = none (RTX 4090
+                      // has enough VRAM)
   int zero_stage = 0; // Zero Optimization Stage for Multi-GPU training
   int hellaswag_eval = 0;
   int requested_quant_mode = 0; // 0=none specified, 115=Q1.15
@@ -2658,9 +2668,9 @@ int main(int argc, char *argv[]) {
   // in the future, we might want to set gelu fusion to 2 for SM90+ and 0 for
   // other GPUs
   if (gelu_fusion == -1) {
-    gelu_fusion = 0;
-  } // (deviceProp.major >= 9) ? 2 : 0; } // in gpt2_init_common for
-    // test_gpt2cu...
+    // SM >= 80 (Ampere, Ada, Hopper) support cuBLASLt epilogue fusion
+    gelu_fusion = (deviceProp.major >= 8) ? 2 : 0;
+  }
   // calculate the number of gradient accumulation steps from the desired total
   // batch size
   assert(total_batch_size % tokens_per_fwdbwd == 0);

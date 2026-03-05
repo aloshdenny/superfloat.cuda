@@ -42,13 +42,13 @@ endif
 # ===============================
 ifeq ($(OS),Windows_NT)
   NVCC ?= "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.1\bin\nvcc.exe"
-  NVCC_FLAGS = --threads=0 -t=0 --use_fast_math -std=c++17 -O$(FORCE_NVCC_O)
+  NVCC_FLAGS = --threads=0 -t=0 --use_fast_math -std=c++17 -O$(FORCE_NVCC_O) -arch=sm_89
   NVCC_LDFLAGS =
   NVCC_LDLIBS  = -lcublas -lcublasLt -lnvml
   NVCC_INCLUDES =
 else
   NVCC ?= $(shell which nvcc 2>/dev/null || echo /usr/local/cuda/bin/nvcc)
-  NVCC_FLAGS = --threads=0 -t=0 --use_fast_math -std=c++17 -O3 -Wno-deprecated-gpu-targets
+  NVCC_FLAGS = --threads=0 -t=0 --use_fast_math -std=c++17 -O3 -arch=sm_89
   NVCC_INCLUDES = -I/usr/local/lib/python3.12/site-packages/nvidia/cublas/include \
                   -I/usr/local/lib/python3.12/site-packages/nvidia/cudart/include \
                   -I/usr/local/lib/python3.12/site-packages/nvidia/nvtx/include \

@@ -27,8 +27,9 @@ cuBLAS related utils
 // ----------------------------------------------------------------------------
 // cuBLAS globals for workspace, handle, settings
 
-// Hardcoding workspace to 32MiB but only Hopper needs 32 (for others 4 is OK)
-const size_t cublaslt_workspace_size = 32 * 1024 * 1024;
+// 64 MiB workspace — RTX 4090 has ample VRAM and larger workspace lets
+// cuBLASLt pick faster tile-splitting algorithms for big matmuls.
+const size_t cublaslt_workspace_size = 64 * 1024 * 1024;
 void *cublaslt_workspace = NULL;
 cublasComputeType_t cublas_compute = CUBLAS_COMPUTE_32F;
 cublasLtHandle_t cublaslt_handle;
