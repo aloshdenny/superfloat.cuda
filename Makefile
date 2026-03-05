@@ -98,6 +98,12 @@ else  # ===== Linux =====
     CUDNN_INCLUDE_PATH = -I/usr/local/cuda/include
   else ifneq ($(wildcard /usr/local/lib/python3.12/site-packages/nvidia/cudnn/include/cudnn.h),)
     CUDNN_INCLUDE_PATH = -I/usr/local/lib/python3.12/site-packages/nvidia/cudnn/include
+  else ifneq ($(wildcard /usr/local/lib/python3.11/site-packages/nvidia/cudnn/include/cudnn.h),)
+    CUDNN_INCLUDE_PATH = -I/usr/local/lib/python3.11/site-packages/nvidia/cudnn/include
+  else ifneq ($(wildcard /usr/local/lib/python3.10/site-packages/nvidia/cudnn/include/cudnn.h),)
+    CUDNN_INCLUDE_PATH = -I/usr/local/lib/python3.10/site-packages/nvidia/cudnn/include
+  else ifneq ($(wildcard /usr/local/lib/python3.12/site-packages/nvidia/cudnn_cu12/include/cudnn.h),)
+    CUDNN_INCLUDE_PATH = -I/usr/local/lib/python3.12/site-packages/nvidia/cudnn_cu12/include
   else
     # Fallback to general include path; compiler might still find it if in standard paths
     CUDNN_INCLUDE_PATH = -I/usr/local/include
@@ -109,6 +115,8 @@ else  # ===== Linux =====
   else ifneq ($(wildcard /usr/local/cuda/lib64/libcudnn.so),)
     CUDNN_LIB_PATH = -L/usr/local/cuda/lib64
   else ifneq ($(wildcard /usr/local/lib/python3.12/site-packages/nvidia/cudnn/lib/libcudnn.so.9),)
+    CUDNN_LIB_PATH = -L/usr/local/lib/python3.12/site-packages/nvidia/cudnn/lib
+  else ifneq ($(wildcard /usr/local/lib/python3.12/site-packages/nvidia/cudnn/lib/libcudnn.so.8),)
     CUDNN_LIB_PATH = -L/usr/local/lib/python3.12/site-packages/nvidia/cudnn/lib
   endif
 
