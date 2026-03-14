@@ -42,20 +42,24 @@ endif
 # ===============================
 ifeq ($(OS),Windows_NT)
   NVCC ?= "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.1\bin\nvcc.exe"
-  NVCC_FLAGS = --threads=0 -t=0 --use_fast_math -std=c++17 -O$(FORCE_NVCC_O)
+  NVCC_FLAGS = --threads=0 -t=0 --use_fast_math -std=c++17 -O$(FORCE_NVCC_O) -arch=sm_89
   NVCC_LDFLAGS =
   NVCC_LDLIBS  = -lcublas -lcublasLt -lnvml
   NVCC_INCLUDES =
 else
   NVCC ?= $(shell which nvcc 2>/dev/null || echo /usr/local/cuda/bin/nvcc)
-  NVCC_FLAGS = --threads=0 -t=0 --use_fast_math -std=c++17 -O3 -Wno-deprecated-gpu-targets
+  NVCC_FLAGS = --threads=0 -t=0 --use_fast_math -std=c++17 -O3 -arch=sm_89
   NVCC_INCLUDES = -I/usr/local/lib/python3.12/site-packages/nvidia/cublas/include \
                   -I/usr/local/lib/python3.12/site-packages/nvidia/cudart/include \
                   -I/usr/local/lib/python3.12/site-packages/nvidia/nvtx/include \
-                  -I/usr/local/cuda/include
+                  -I/usr/local/lib/python3.12/site-packages/nvidia/cudnn/include \
+                  -I/usr/local/cuda/include \
+                  -I/usr/include
   # Link against local shim directory first.
   # Pass rpath via -Xlinker (NOT -Wl,...) so runtime can find libs next to the binary.
   NVCC_LDFLAGS = -L. -Xlinker -rpath -Xlinker \$$ORIGIN
+  # On Linux architectures like x86_64, common lib paths are needed
+  NVCC_LDFLAGS += -L/usr/local/cuda/lib64 -L/usr/local/lib -L/usr/lib/x86_64-linux-gnu -L/usr/local/lib/python3.12/site-packages/nvidia/cudnn/lib
   NVCC_LDLIBS  = -lcublas -lcublasLt -lnvml
 endif
 
@@ -87,8 +91,34 @@ else  # ===== Linux =====
     $(error [ERROR] cuDNN frontend not found. See README)
   endif
 
-  CUDNN_INCLUDE_PATH = -I/usr/include
-  CUDNN_LIB_PATH     = -L/usr/lib/x86_64-linux-gnu
+  # Check common locations for cuDNN headers
+  ifneq ($(wildcard /usr/include/cudnn.h),)
+    CUDNN_INCLUDE_PATH = -I/usr/include
+  else ifneq ($(wildcard /usr/local/cuda/include/cudnn.h),)
+    CUDNN_INCLUDE_PATH = -I/usr/local/cuda/include
+  else ifneq ($(wildcard /usr/local/lib/python3.12/site-packages/nvidia/cudnn/include/cudnn.h),)
+    CUDNN_INCLUDE_PATH = -I/usr/local/lib/python3.12/site-packages/nvidia/cudnn/include
+  else ifneq ($(wildcard /usr/local/lib/python3.11/site-packages/nvidia/cudnn/include/cudnn.h),)
+    CUDNN_INCLUDE_PATH = -I/usr/local/lib/python3.11/site-packages/nvidia/cudnn/include
+  else ifneq ($(wildcard /usr/local/lib/python3.10/site-packages/nvidia/cudnn/include/cudnn.h),)
+    CUDNN_INCLUDE_PATH = -I/usr/local/lib/python3.10/site-packages/nvidia/cudnn/include
+  else ifneq ($(wildcard /usr/local/lib/python3.12/site-packages/nvidia/cudnn_cu12/include/cudnn.h),)
+    CUDNN_INCLUDE_PATH = -I/usr/local/lib/python3.12/site-packages/nvidia/cudnn_cu12/include
+  else
+    # Fallback to general include path; compiler might still find it if in standard paths
+    CUDNN_INCLUDE_PATH = -I/usr/local/include
+  endif
+
+  # Check common locations for cuDNN libraries
+  ifneq ($(wildcard /usr/lib/x86_64-linux-gnu/libcudnn.so),)
+    CUDNN_LIB_PATH = -L/usr/lib/x86_64-linux-gnu
+  else ifneq ($(wildcard /usr/local/cuda/lib64/libcudnn.so),)
+    CUDNN_LIB_PATH = -L/usr/local/cuda/lib64
+  else ifneq ($(wildcard /usr/local/lib/python3.12/site-packages/nvidia/cudnn/lib/libcudnn.so.9),)
+    CUDNN_LIB_PATH = -L/usr/local/lib/python3.12/site-packages/nvidia/cudnn/lib
+  else ifneq ($(wildcard /usr/local/lib/python3.12/site-packages/nvidia/cudnn/lib/libcudnn.so.8),)
+    CUDNN_LIB_PATH = -L/usr/local/lib/python3.12/site-packages/nvidia/cudnn/lib
+  endif
 
 endif
 

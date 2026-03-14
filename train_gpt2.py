@@ -523,6 +523,26 @@ def write_tokenizer(enc, filename):
             file.write(b)  # Write the actual bytes
     print(f"wrote {filename}")
 
+def write_tokenizer_q15(enc, filename):
+    n = enc.max_token_value + 1
+    # Use 256 16-bit unsigned integers for the header
+    header = np.zeros(256, dtype=np.uint16)
+    header[0] = 2024 # magic (fits in 16-bit)
+    header[1] = 2 # version
+    header[2] = n # number of tokens (50257 fits in uint16)
+    header[3] = enc.eot_token
+    with open(filename, "wb") as file:
+        file.write(header.tobytes())
+        for i in range(n):
+            b = enc.decode_bytes([i])
+            length = len(b)
+            # Write length as a 16-bit unsigned integer
+            file.write(struct.pack("<H", length))
+            # Write each byte as its own 16-bit word
+            for char in b:
+                file.write(struct.pack("<H", char))
+    print(f"wrote {filename}")
+
 # -----------------------------------------------------------------------------
 # int main
 
@@ -647,6 +667,7 @@ if __name__ == "__main__":
     enc = tiktoken.get_encoding("gpt2")
     if master_process and args.write_tensors: # tokenizer is technically not tensors but ok
         write_tokenizer(enc, "gpt2_tokenizer.bin")
+        write_tokenizer_q15(enc, "gpt2_tokenizer_q15.bin")
 
     # init the model, either from scratch or from OpenAI pretrained checkpoint
     if args.model[0] == "d":
