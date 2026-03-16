@@ -18,8 +18,12 @@ loaded
 // 24] range This scale factor is applied before softmax to expand the effective
 // range INCREASED from 16.0 to 24.0 for better softmax expressivity (lower
 // entropy)
+#if defined(SF16_TRUE_FORWARD)
+#define Q115_LOGIT_SCALE 1.0f
+#else
 #define Q115_LOGIT_SCALE                                                       \
   Q115_LOGITS_SCALE // Use the scale from q115_common.cuh (24.0f)
+#endif
 
 // Temperature for softmax - lower = more confident predictions
 // For Q1.15, we use temperature implicitly via Q115_LOGIT_SCALE
@@ -134,7 +138,7 @@ __global__ void __launch_bounds__(1024, MAX_1024_THREADS_BLOCKS)
       float grad_scaled = grad * Q115_LOGIT_SCALE;
 
       // Store gradient back to logits buffer
-      logits[idx * P + i] = float_to_q115_scaled(grad_scaled, 1.0f);
+      logits[idx * P + i] = (floatX)simulate_q115(grad_scaled);
     }
 
     // Zero out padding

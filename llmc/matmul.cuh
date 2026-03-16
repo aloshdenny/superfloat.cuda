@@ -138,6 +138,30 @@ __global__ void q115_simulate_kernel(floatX *d, size_t N) {
     d[idx] = (floatX)simulate_q115((float)d[idx]);
   }
 }
+
+#if defined(SF16_TRUE_FORWARD)
+inline float *get_q115_forward_fp32_workspace(size_t elements) {
+  static float *ptr = NULL;
+  static size_t current_size = 0;
+  size_t bytes = elements * sizeof(float);
+  if (bytes > current_size) {
+    if (ptr != NULL) {
+      cudaCheck(cudaFree(ptr));
+    }
+    cudaCheck(cudaMalloc((void **)&ptr, bytes));
+    current_size = bytes;
+  }
+  return ptr;
+}
+
+__global__ void q115_fp32_to_simulated_kernel(floatX *dst, const float *src,
+                                              size_t N) {
+  size_t idx = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+  if (idx < N) {
+    dst[idx] = (floatX)simulate_q115(src[idx]);
+  }
+}
+#endif
 #endif
 
 // Wrapper around cublasLtMatmul that is meant to support everything we need in
@@ -152,6 +176,19 @@ void matmul_cublaslt(floatX *d, const floatX *a, const floatX *b,
   NVTX_RANGE_FN();
   bool has_bias = (bias != NULL);
   bool has_gelu = (pre_gelu != NULL);
+  size_t size_C = (size_t)batch_count > 0 ? (size_t)batch_count * strideOut
+                                          : (size_t)m * n;
+  if (size_C == 0) {
+    size_C = (size_t)m * n;
+  }
+
+#if defined(ENABLE_Q115) && defined(SF16_TRUE_FORWARD)
+  bool use_sf16_forward_fp32_ephemeral = !backward && !accumulate;
+  float *sf16_fp32_out = nullptr;
+  if (use_sf16_forward_fp32_ephemeral && size_C > 0) {
+    sf16_fp32_out = get_q115_forward_fp32_workspace(size_C);
+  }
+#endif
 
   // check alignment (some modes work unaligned but it always best to be aligned
   // for performance)
@@ -194,10 +231,20 @@ void matmul_cublaslt(floatX *d, const floatX *a, const floatX *b,
   } else {
     cublasCheck(cublasLtMatrixLayoutCreate(&BLayout, CUBLAS_LOWP, k, n, k));
   }
+
+#if defined(ENABLE_Q115) && defined(SF16_TRUE_FORWARD)
+  cublasDataType_t output_layout_type =
+      use_sf16_forward_fp32_ephemeral ? CUDA_R_32F : CUBLAS_LOWP;
+  cublasCheck(
+      cublasLtMatrixLayoutCreate(&CLayout, output_layout_type, m, n, m));
+  cublasCheck(
+      cublasLtMatrixLayoutCreate(&DLayout, output_layout_type, m, n, m));
+#else
   // cuBLASLt requires C in FP8 mode to be BF16 or FP32... (sigh)
   cublasCheck(cublasLtMatrixLayoutCreate(
       &CLayout, (sizeof(floatX) == 1) ? CUDA_R_16BF : CUBLAS_LOWP, m, n, m));
   cublasCheck(cublasLtMatrixLayoutCreate(&DLayout, CUBLAS_LOWP, m, n, m));
+#endif
 
   // Strided Batched GEMM (used for non-flash attention, equivalent to
   // cublasGemmStridedBatchedEx)
@@ -296,25 +343,42 @@ void matmul_cublaslt(floatX *d, const floatX *a, const floatX *b,
   // in algorithm selection (?!)
   const float alpha = 1.0f, beta = accumulate ? 1.0f : 0.0f;
 
+#if defined(ENABLE_Q115) && defined(SF16_TRUE_FORWARD)
+  const void *c_ptr = use_sf16_forward_fp32_ephemeral
+                          ? (const void *)sf16_fp32_out
+                          : (const void *)d;
+  void *d_ptr =
+      use_sf16_forward_fp32_ephemeral ? (void *)sf16_fp32_out : (void *)d;
+#else
+  const void *c_ptr = (const void *)d;
+  void *d_ptr = (void *)d;
+#endif
+
   // call the matmul natively on bfloat16
   cublasCheck(cublasLtMatmul(cublaslt_handle, operationDesc, &alpha, a, ALayout,
-                             b, BLayout, &beta, d, CLayout, d, DLayout,
+                             b, BLayout, &beta, c_ptr, CLayout, d_ptr, DLayout,
                              &heuristic.algo, cublaslt_workspace,
                              cublaslt_workspace_size, stream));
 
 #if defined(ENABLE_Q115)
+#if defined(SF16_TRUE_FORWARD)
+  if (use_sf16_forward_fp32_ephemeral && size_C > 0) {
+    int num_blocks = (size_C + 255) / 256;
+    q115_fp32_to_simulated_kernel<<<num_blocks, 256, 0, stream>>>(d,
+                                                                   sf16_fp32_out,
+                                                                   size_C);
+  } else if (!backward && size_C > 0) {
+    int num_blocks = (size_C + 255) / 256;
+    q115_simulate_kernel<<<num_blocks, 256, 0, stream>>>(d, size_C);
+  }
+#else
   // For Q1.15 inference simulation, restrict forward pass outputs to valid
   // Q1.15 bounds
-  if (!backward) {
-    size_t size_C = (size_t)batch_count > 0 ? (size_t)batch_count * strideOut
-                                            : (size_t)m * n;
-    if (size_C == 0)
-      size_C = m * n;
-    if (size_C > 0) {
-      int num_blocks = (size_C + 255) / 256;
-      q115_simulate_kernel<<<num_blocks, 256, 0, stream>>>(d, size_C);
-    }
+  if (!backward && size_C > 0) {
+    int num_blocks = (size_C + 255) / 256;
+    q115_simulate_kernel<<<num_blocks, 256, 0, stream>>>(d, size_C);
   }
+#endif
 #endif
   // cleanups
   cublasCheck(cublasLtMatmulPreferenceDestroy(preference));
@@ -332,6 +396,12 @@ void matmul_forward_cublaslt(floatX *out, floatX *inp, floatX *weight,
                              floatX *bias, int B, int T, int C, int OC,
                              cudaStream_t stream, floatX *pre_gelu = NULL,
                              int gelu_fusion = 1) {
+#if defined(ENABLE_Q115) && defined(SF16_TRUE_FORWARD)
+  // Keep SF16 forward deterministic by avoiding fused GELU epilogues.
+  if (pre_gelu != NULL) {
+    gelu_fusion = 0;
+  }
+#endif
   // By default only fuse GELU for H100+ as cuBLAS seems to be inefficient for
   // fused GELU on Ada/Ampere (?)
   if (gelu_fusion < 1 && pre_gelu) {

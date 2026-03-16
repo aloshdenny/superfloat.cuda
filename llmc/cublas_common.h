@@ -18,8 +18,9 @@ cuBLAS related utils
 #elif defined(ENABLE_FP16)
 #define CUBLAS_LOWP CUDA_R_16F
 #elif defined(ENABLE_Q115)
-// Q1.15 doesn't map to a hardware cuBLAS int16 format, so we emulate in FP32
-#define CUBLAS_LOWP CUDA_R_32F
+// Q1.15 forward is simulated at tensor boundaries while storage remains BF16.
+// Keep low-precision tensor layout aligned with floatX storage type.
+#define CUBLAS_LOWP CUDA_R_16BF
 #else // default to bfloat16
 #define CUBLAS_LOWP CUDA_R_16BF
 #endif

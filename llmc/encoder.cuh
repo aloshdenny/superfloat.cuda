@@ -51,11 +51,10 @@ __global__ void encoder_forward_kernel3(floatX* out,
         packed_out[k] = q131_add(wte_val, wpe_val);
     }
 #elif defined(ENABLE_Q115)
-    // Q1.15 mode: add using Q1.15 arithmetic
+    // Q1.15 mode: quantize sum back to SF16 boundary after addition.
     for (int k = 0; k < x128::size; k++) {
-        q115_t wte_val = wte128[k];
-        q115_t wpe_val = wpe128[k];
-        packed_out[k] = q115_add(wte_val, wpe_val);
+        float sum = (float)wte128[k] + (float)wpe128[k];
+        packed_out[k] = (floatX)simulate_q115(sum);
     }
 #else
     // Float/BF16 mode: standard floating point addition
@@ -135,8 +134,8 @@ __global__ void wte_backward_kernel(floatX* dwte,
         // For Q1.31 mode, use direct fixed-point conversion
         packed_in_out[k] = float_to_q131(accum[k] + q131_to_float(packed_in_out[k]));
 #elif defined(ENABLE_Q115)
-        // For Q1.15 mode, use direct fixed-point conversion
-        packed_in_out[k] = float_to_q115(accum[k] + q115_to_float(packed_in_out[k]));
+    // Keep gradients in SF16-compatible dynamic range for Q1.15 mode.
+    packed_in_out[k] = (floatX)simulate_q115(accum[k] + (float)packed_in_out[k]);
 #else
         // We use stochastic rounding to go from FP32 to BF16/FP16
         // The seed is deterministic and unique for each parameter to guarantee we have determinism AND
@@ -178,8 +177,8 @@ __global__ void wpe_backward_kernel(floatX* dwpe,
         // For Q1.31 mode, use direct fixed-point conversion
         packed_dwpe[k] = float_to_q131(accum[k] + q131_to_float(packed_dwpe[k]));
 #elif defined(ENABLE_Q115)
-        // For Q1.15 mode, use direct fixed-point conversion
-        packed_dwpe[k] = float_to_q115(accum[k] + q115_to_float(packed_dwpe[k]));
+    // Keep gradients in SF16-compatible dynamic range for Q1.15 mode.
+    packed_dwpe[k] = (floatX)simulate_q115(accum[k] + (float)packed_dwpe[k]);
 #else
         // We use stochastic rounding to go from FP32 to BF16/FP16
         // The seed is deterministic and unique for each parameter to guarantee we have determinism AND

@@ -74,8 +74,8 @@ typedef int16_t q115_t;
 
 // Activation clamping range after LayerNorm/RMSNorm
 // Prevents rare spikes from poisoning fixed-point math
-#define Q115_ACTIVATION_CLAMP_MIN -3.0f
-#define Q115_ACTIVATION_CLAMP_MAX 3.0f
+#define Q115_ACTIVATION_CLAMP_MIN (-Q115_OVERFLOW_THRESHOLD)
+#define Q115_ACTIVATION_CLAMP_MAX (Q115_OVERFLOW_THRESHOLD)
 
 // Embedding initialization scales (static, applied at init only)
 // Rebalances representational budget between token and position embeddings
