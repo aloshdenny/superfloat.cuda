@@ -69,8 +69,14 @@ typedef int16_t q115_t;
 // Residual branch scaling to prevent amplitude collapse
 // Attention residual: scale the attention output before adding to residual
 // MLP residual: scale the MLP output before adding to residual
+#if defined(SF16_TRUE_FORWARD)
+// In true-forward mode, remove residual branch down-scaling.
+#define Q115_ATTENTION_RESIDUAL_SCALE 1.0f
+#define Q115_MLP_RESIDUAL_SCALE 1.0f
+#else
 #define Q115_ATTENTION_RESIDUAL_SCALE 0.65f
 #define Q115_MLP_RESIDUAL_SCALE 0.75f
+#endif
 
 // Activation clamping range after LayerNorm/RMSNorm
 // Prevents rare spikes from poisoning fixed-point math
