@@ -181,7 +181,7 @@ __global__ void softmax_forward_kernel5(floatX *out, float inv_temperature,
     // recalculation is faster than doing the round-trip through memory.
     float ev = expf(inv_temperature *
                     (simulate_q115((float)__ldcs(x + i)) * att_scale - global_maxval));
-    __stcs(out + idx * T + i, (floatX)(ev * norm));
+    __stcs(out + idx * T + i, (floatX)simulate_q115(ev * norm));
   }
 }
 
