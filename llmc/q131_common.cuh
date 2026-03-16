@@ -30,6 +30,11 @@ __device__ __forceinline__ q131_t float_to_q131(float x) {
     return float_to_q131_rne(x);
 }
 
+// Simulate SF32/Q1.31 storage by quantize+dequantize roundtrip.
+__device__ __forceinline__ float simulate_q131(float x) {
+    return q131_to_float(float_to_q131(x));
+}
+
 // Saturating add (Q1.31 + Q1.31 -> Q1.31).
 __device__ __forceinline__ q131_t q131_add(q131_t a, q131_t b) {
     int64_t s = (int64_t)a + (int64_t)b;
