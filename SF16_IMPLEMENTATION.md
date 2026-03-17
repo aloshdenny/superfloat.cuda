@@ -1,92 +1,164 @@
-# SF16 (Super Float 16) Implementation Details
+# SF16 (Q115) Implementation Details
 
-This document outlines the architecture and implementation of **SF16** (Q1.15 Fixed-Point with Block Floating Point scaling) as used in the GPT-2 training pipeline of `superfloat.cuda`.
+This document describes the current SF16/Q115 implementation in this repository.
+It focuses on what is actually compiled and executed in the current codebase,
+especially for the true-forward path enabled by `SF16_TRUE_FORWARD=1`.
 
-## 1. Core Format: Q1.15
-The primary storage format for tensors is **Q1.15**, a signed 16-bit fixed-point format representing values in the range `[-1, 1)`.
+## 1. Scope and Terminology
 
-- **Scaling Factor**: $2^{15} = 32768$
-- **Resolution**: $\approx 3.05 \times 10^{-5}$
-- **Range**: `[-32768, 32767]` (integer) $\rightarrow$ `[-1.0, 0.999969...]` (normalized)
+- SF16 in this repo means Q1.15 boundary simulation (`simulate_q115`) applied to
+	tensors while running on NVIDIA-friendly native kernels.
+- Q115 mode is enabled with `-DENABLE_Q115`.
+- True-forward behavior is enabled with `-DSF16_TRUE_FORWARD=1`.
 
-## 2. Block Floating Point (BFP) Scaling
-To handle the limited dynamic range of Q1.15, each tensor is associated with a 32-bit floating-point **scale factor**.
-$$\text{Actual Value} = \text{Q1.15 Value} \times \text{Scale Factor}$$
+Important: this is not a pure int16 hardware matmul pipeline. In Q115 mode,
+`floatX` is mapped to BF16 (`__nv_bfloat16`) and SF16 boundaries are enforced by
+explicit quantize/dequantize steps at key write boundaries.
 
-### Default Tensor Scales
-| Tensor Type | Scale Factor | Rationale |
-| :--- | :--- | :--- |
-| **Embeddings** | 0.25f | Tokens are typically initialized in a small range. |
-| **Attention** | 1.0f | Standard range for Q, K, V and attention outputs. |
-| **FFN Activations** | 2.0f | Larger range needed after GELU activations. |
-| **Logits** | **24.0f** | **Critical**: Logits require a larger range (approx [-10, 10]) for stable Softmax. |
+## 2. Core Numeric Format (Q1.15)
 
-### Gradient Scales
-| Tensor Type | Grad Scale |
-| :--- | :--- |
-| **Embeddings** | 0.01f |
-| **Attention** | 0.1f |
-| **FFN** | 0.1f |
-| **Logits** | 1.0f |
+Q1.15 represents normalized values in `[-1, 1)` with signed 16-bit fixed-point
+semantics.
 
-## 3. Training Stability Optimizations
-Scaling alone is insufficient for stable training in fixed-point. Several structural optimizations are implemented to prevent **amplitude collapse** and **loss floor** issues.
+- Scale factor: $2^{15} = 32768$
+- Resolution: $1 / 32768 \approx 3.05 \times 10^{-5}$
+- Integer range: `[-32768, 32767]`
+- Float range: `[-1.0, 0.999969...]`
 
-### 3.1. RMSNorm-Q (Wait, where's the Mean?)
-In SF16 mode, standard **LayerNorm** is replaced with **RMSNorm-Q**.
-- **No Mean Subtraction**: $y = \frac{x}{\text{RMS}(x)} \odot \gamma$.
-- **Rationale**: Subtracting the mean in Q1.15 precision often destroys small, high-frequency signals that are critical for learning deep representations. RMS-only normalization preserves these signals while providing the necessary variance stabilization.
-- **Q-Aware Epsilon**: Uses `1e-3` instead of the standard `1e-5`. Since the smallest non-zero Q1.15 value is $\approx 3 \times 10^{-5}$, a $10^{-5}$ epsilon is effectively invisible and can lead to division by zero or numerical instability.
+In code:
 
-### 3.2. Selective Weight Decay
-Weight decay is only applied to the **FCW** (Feed-Forward Weight) tensors (`tensor_id == 10`).
-- **Disabled** on: `wte`, `wpe`, `qkvw`, `attprojw`, `fcprojw`.
-- **Reason**: Standard weight decay shrinks weights toward zero. In Q1.15, this leads to loss of precision and entropy increase in attention logits, causing a training loss floor.
+- Overflow threshold is `Q115_OVERFLOW_THRESHOLD = 0.999f`.
+- `float_to_q115` clamps to `[-Q115_OVERFLOW_THRESHOLD, Q115_OVERFLOW_THRESHOLD]`.
+- `simulate_q115(x)` performs quantize+dequantize roundtrip:
+	`q115_to_float(float_to_q115(x))`.
 
-### 3.3. Residual Branch Scaling
-To prevent amplitude collapse in deep networks, residual branches are scaled before addition:
-- **Attention Residual**: 0.65f
-- **MLP Residual**: 0.75f
-$$\text{Output} = \text{Residual} + (\text{Branch} \times \text{Scale})$$
+## 3. Storage and Compute Model
 
-### 3.4. Layer-Wise Gradient Scaling
-Gradients are scaled inversely with layer depth to combat vanishing gradients:
-- **Range**: [1.0, 1.5]
-- **Earlier Layers** (closer to input) receive larger gradient scales.
+Under `ENABLE_Q115`:
 
-### 3.5. Positional Embedding Freezing
-Position embeddings (`wpe`) are **frozen** after a set number of steps (`Q115_WPE_FREEZE_STEP = 3000`).
-- **Reason**: Stabilizes the base coordinate system of the model, allowing representational budget to focus on semantic content.
+- Tensor storage type (`floatX`) is BF16 (`__nv_bfloat16`).
+- cuBLAS low-precision datatype (`CUBLAS_LOWP`) is BF16.
+- For `ENABLE_Q115 && SF16_TRUE_FORWARD`, compute mode is
+	`CUBLAS_COMPUTE_32F_FAST_16BF` (with compatibility fallback macro).
 
-### 3.6. Numerical Safety & Clamping
-- **Activation Clamping**: All activations are clamped to `[-3.0, 3.0]` after Norm layers. This prevents "spikes" from saturating the fixed-point range.
-- **Weight Clamping**: Weights are clamped to the Q1.15 range `[-1, 1)` after every AdamW update to ensure they remain representable without overflow.
+This design keeps RTX 4090 performance high while enforcing SF16 semantics at
+explicit forward boundaries.
 
-## 4. Arithmetic & Optimization Implementation
-- **Multiplication**: `(int32_t(a) * int32_t(b)) >> 15` with saturation.
-- **Accumulation**: Performed in **FP32** for high-precision dot products before quantizing back to Q1.15 for storage. This ensures that the bulk of the compute (MatMuls) maintains high internal precision.
-- **AdamW Updates**: Performed on **FP32 master weights** using standard AdamW logic, then deterministic quantization back to Q1.15 for the next forward pass.
+## 4. Forward Boundary Enforcement
 
-## 5. Summary Comparison: SF16 vs Standard FP32
-| Feature | Standard FP32 | SF16 (Q1.15) |
-| :--- | :--- | :--- |
-| **Weight Storage** | 32-bit | 16-bit (Fixed) |
-| **Activation Storage** | 32-bit (or BF16) | 16-bit (Fixed) |
-| **Normalization** | LayerNorm | RMSNorm-Q |
-| **Residual Path** | $x + \text{MLP}(x)$ | $x + 0.75 \times \text{MLP}(x)$ |
-| **Weight Decay** | All 2D Weights | **Only** FCW (`fc_proj`) |
-| **Epsilon** | $10^{-5}$ | $10^{-3}$ |
+### 4.1 Matmul Outputs
 
-## 6. How to Run SF16
-To compile and train with SF16 (Q1.15) enabled:
+Forward matmul outputs are boundary-quantized by `q115_simulate_kernel`:
 
-```bash
-# Compile with Q115 enabled (default in mainline superfloat)
-make train_gpt2cu
+- In `SF16_TRUE_FORWARD`, the kernel does:
+	1. `simulate_q131(v)` (SF32 register simulation)
+	2. `simulate_q115(v)` (SF16 storage boundary)
+- The kernel is applied for forward outputs (`!backward`) after cuBLASLt matmul.
 
-# Run training
-./train_gpt2cu -b 16 -t 1024 -x 10000
+### 4.2 Attention
+
+For `ENABLE_Q115`:
+
+- Attention dynamic expansion scale is neutralized: `att_scale = 1.0f`.
+- Softmax computation reads through `simulate_q115(...)`.
+- Softmax writeback is quantized to SF16 boundary:
+	`__stcs(..., (floatX)simulate_q115(ev * norm));`
+
+The standard attention temperature factor $1/\sqrt{HS}$ remains part of normal
+attention math.
+
+### 4.3 Classifier / Logits
+
+In `fused_classifier.cuh`:
+
+- If `SF16_TRUE_FORWARD` is defined, `Q115_LOGIT_SCALE = 1.0f`.
+- Otherwise it falls back to legacy `Q115_LOGITS_SCALE` behavior.
+- Logit reads are through `simulate_q115(...)`.
+
+### 4.4 Norm and Residual Paths
+
+Norm/residual paths clamp and quantize in Q115 mode:
+
+- Activation clamps use:
+	- `Q115_ACTIVATION_CLAMP_MIN = -Q115_OVERFLOW_THRESHOLD`
+	- `Q115_ACTIVATION_CLAMP_MAX = +Q115_OVERFLOW_THRESHOLD`
+- Outputs are written with `simulate_q115(...)` in the key norm/residual forward
+	kernels.
+
+Residual branch scales are mode-dependent:
+
+- `SF16_TRUE_FORWARD`: `Q115_ATTENTION_RESIDUAL_SCALE = 1.0f`,
+	`Q115_MLP_RESIDUAL_SCALE = 1.0f`
+- Legacy mode: `0.65f` and `0.75f`
+
+### 4.5 GELU and Encoder
+
+- GELU forward reads via `simulate_q115` and writes quantized outputs via
+	`simulate_q115`.
+- Encoder forward sum (`wte + wpe`) is quantized with `simulate_q115` before
+	store.
+
+## 5. Legacy BFP Scale Constants (Still Present)
+
+`q115_common.cuh` still defines legacy BFP-oriented constants such as:
+
+- `Q115_EMBEDDING_SCALE`
+- `Q115_ATTENTION_SCALE`
+- `Q115_FFN_SCALE`
+- `Q115_LOGITS_SCALE` (24.0f)
+
+These constants remain available for legacy/non-true-forward experiments and
+helper paths, but true-forward Q115 explicitly neutralizes the major forward
+expansion scales where required.
+
+## 6. cuDNN Interaction
+
+To preserve strict Q115/SF16 boundary semantics in attention, the code now
+rejects Q115+cuDNN builds at compile time:
+
+```c
+#if defined(ENABLE_Q115) && defined(ENABLE_CUDNN)
+#error "ENABLE_CUDNN is not supported with ENABLE_Q115. Disable USE_CUDNN for Q115/SF16 builds."
+#endif
 ```
 
-The training progress will show logs indicating Q1.15 initialization and scaling:
-`Initializing model with random Q1.15 weights`
+Also, Make defaults to:
+
+- `USE_CUDNN ?= 0`
+
+## 7. Current Build and Run Commands
+
+Use Q115-specific targets (not `train_gpt2cu`) for SF16/Q115 mode:
+
+```bash
+# Q115 true-forward
+make train_gpt2q115cu
+
+# Q115 true-forward + weight-constrained mode
+make train_gpt2q115_constrainedcu
+
+# Optional dry-run to inspect compile flags
+make -n train_gpt2q115cu | head -n 40
+```
+
+Expected key compile defines for Q115 true-forward:
+
+- `-DENABLE_Q115`
+- `-DSF16_TRUE_FORWARD=1`
+
+Run example:
+
+```bash
+./train_gpt2q115cu -b 16 -t 1024 -x 10000
+```
+
+## 8. Quick Reality Check
+
+If you need to verify strict forward semantics quickly:
+
+1. Confirm Q115 target includes `-DENABLE_Q115 -DSF16_TRUE_FORWARD=1`.
+2. Confirm attention softmax store uses `simulate_q115(ev * norm)`.
+3. Confirm matmul post-kernel applies `simulate_q131` then `simulate_q115`.
+4. Confirm cuDNN is disabled for Q115 (or compile-time guard is present).
+
+This reflects the current implementation state in this branch.
