@@ -140,7 +140,7 @@ __global__ void softmax_forward_kernel5(floatX *out, float inv_temperature,
   const float att_scale = 8.0f; // Expand Q1.31 attention score range
 #elif defined(ENABLE_Q115)
   // For Q1.15: scale attention scores to expand dynamic range
-  const float att_scale = 4.0f; // Expand Q1.15 attention score range
+  const float att_scale = 1.0f;
 #else
   const float att_scale = 1.0f;
 #endif
@@ -181,7 +181,7 @@ __global__ void softmax_forward_kernel5(floatX *out, float inv_temperature,
     // recalculation is faster than doing the round-trip through memory.
     float ev = expf(inv_temperature *
                     (simulate_q115((float)__ldcs(x + i)) * att_scale - global_maxval));
-    __stcs(out + idx * T + i, (floatX)(ev * norm));
+    __stcs(out + idx * T + i, (floatX)simulate_q115(ev * norm));
   }
 }
 
@@ -312,7 +312,7 @@ void attention_backward(floatX *dinp, floatX *dqkvr, floatX *datt,
 #if defined(ENABLE_Q131)
   const float att_scale = 8.0f;
 #elif defined(ENABLE_Q115)
-  const float att_scale = 4.0f;
+  const float att_scale = 1.0f;
 #else
   const float att_scale = 1.0f;
 #endif

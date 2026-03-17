@@ -29,6 +29,9 @@ Matrix Multiplication, with help from cuBLASLt
 #endif
 #if defined(ENABLE_Q115)
 #include "q115_common.cuh"
+#if defined(SF16_TRUE_FORWARD)
+#include "q131_common.cuh"
+#endif
 #elif defined(ENABLE_Q131)
 #include "q131_common.cuh"
 #endif
@@ -131,11 +134,17 @@ __global__ void reduce_add_sum_kernel(floatX *dst, const float *src, size_t n,
 // kernel launchers
 
 #if defined(ENABLE_Q115)
-// Define a simple simulation kernel
+// Quantize forward outputs to SF16 boundaries.
+// In SF16_TRUE_FORWARD mode, we first simulate an SF32 accumulator register
+// and then quantize to SF16 storage boundaries.
 __global__ void q115_simulate_kernel(floatX *d, size_t N) {
   size_t idx = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
   if (idx < N) {
-    d[idx] = (floatX)simulate_q115((float)d[idx]);
+    float v = (float)d[idx];
+#if defined(SF16_TRUE_FORWARD)
+    v = simulate_q131(v);
+#endif
+    d[idx] = (floatX)simulate_q115(v);
   }
 }
 #endif
@@ -152,6 +161,13 @@ void matmul_cublaslt(floatX *d, const floatX *a, const floatX *b,
   NVTX_RANGE_FN();
   bool has_bias = (bias != NULL);
   bool has_gelu = (pre_gelu != NULL);
+#if defined(ENABLE_Q115)
+  size_t size_C = (size_t)batch_count > 0 ? (size_t)batch_count * strideOut
+                                          : (size_t)m * n;
+  if (size_C == 0) {
+    size_C = (size_t)m * n;
+  }
+#endif
 
   // check alignment (some modes work unaligned but it always best to be aligned
   // for performance)
@@ -303,17 +319,12 @@ void matmul_cublaslt(floatX *d, const floatX *a, const floatX *b,
                              cublaslt_workspace_size, stream));
 
 #if defined(ENABLE_Q115)
-  // For Q1.15 inference simulation, restrict forward pass outputs to valid
-  // Q1.15 bounds
-  if (!backward) {
-    size_t size_C = (size_t)batch_count > 0 ? (size_t)batch_count * strideOut
-                                            : (size_t)m * n;
-    if (size_C == 0)
-      size_C = m * n;
-    if (size_C > 0) {
-      int num_blocks = (size_C + 255) / 256;
-      q115_simulate_kernel<<<num_blocks, 256, 0, stream>>>(d, size_C);
-    }
+  // For Q1.15 forward simulation, restrict outputs to valid SF16 bounds.
+  // In SF16_TRUE_FORWARD mode this also injects an SF32 register simulation
+  // before the SF16 write-back quantization.
+  if (!backward && size_C > 0) {
+    int num_blocks = (size_C + 255) / 256;
+    q115_simulate_kernel<<<num_blocks, 256, 0, stream>>>(d, size_C);
   }
 #endif
   // cleanups

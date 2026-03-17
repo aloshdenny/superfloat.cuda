@@ -93,6 +93,12 @@ enum PrecisionMode {
 #error "Cannot enable both Q1.15 and Q1.31 modes simultaneously. Choose one."
 #endif
 
+// Q1.15/SF16 simulation relies on custom attention kernels with explicit
+// boundary quantization. Prevent accidental cuDNN attention bypass.
+#if defined(ENABLE_Q115) && defined(ENABLE_CUDNN)
+#error "ENABLE_CUDNN is not supported with ENABLE_Q115. Disable USE_CUDNN for Q115/SF16 builds."
+#endif
+
 // Unified fixed-point mode flag - set when any fixed-point format is enabled
 #if defined(ENABLE_Q115) || defined(ENABLE_Q131)
 #define ENABLE_FIXED_POINT 1
