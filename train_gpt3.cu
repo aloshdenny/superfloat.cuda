@@ -895,7 +895,14 @@ void gpt_build_from_descriptor(GPT3 *model, const char *descriptor) {
         float *fp32_buffer = (float *)mallocCheck(n * sizeof(float));
         normal_(fp32_buffer, n, 0.0f, scale, &init_rng);
         for (size_t j = 0; j < n; j++) {
+#if defined(ENABLE_Q115_WEIGHT_CONSTRAINT)
+          // Clamp to Q1.15 range [-1, 1) for weight-constrained training
+          float val = fp32_buffer[j];
+          val = fmaxf(-1.0f, fminf(0.999969482421875f, val));
+          params_memory_cpu[offset + layer_offset + j] = (floatX)val;
+#else
           params_memory_cpu[offset + layer_offset + j] = (floatX)fp32_buffer[j];
+#endif
         }
         free(fp32_buffer);
       }
@@ -1496,6 +1503,11 @@ void gpt3_update(GPT3 *model, float learning_rate, float beta1, float beta2,
       // changing precision)
       init_from_master(param_ptr, master_ptr, shard.size, tensor.size,
                        shard.size, num_layers, seed, main_stream);
+#if defined(ENABLE_Q115_WEIGHT_CONSTRAINT)
+      // Clamp weights to Q1.15 range after initialization
+      clamp_weights_q115(param_ptr, master_ptr, shard.size, tensor.size,
+                         shard.size, num_layers, main_stream);
+#endif
     } else {
 #if !defined(ENABLE_Q115)
       bool freeze_tensor = false; // No freezing in non-Q115 mode
@@ -1508,6 +1520,11 @@ void gpt3_update(GPT3 *model, float learning_rate, float beta1, float beta2,
                      tensor.size, tensor.size, shard.size, num_layers,
                      learning_rate, beta1, beta2, t, eps, wd, grad_scale, seed,
                      main_stream);
+#if defined(ENABLE_Q115_WEIGHT_CONSTRAINT)
+        // Clamp weights to Q1.15 range [-1, 1) after each update
+        clamp_weights_q115(param_ptr, master_ptr, shard.size, tensor.size,
+                           shard.size, num_layers, main_stream);
+#endif
       }
     }
 
@@ -1864,8 +1881,10 @@ void error_usage() {
   fprintf(stderr, "  -l <float>  learning rate (default = 3e-4f)\n");
   fprintf(stderr, "  -u <int>    learning rate warmup iterations (default = 0, "
                   "no warmup)\n");
-  fprintf(stderr, "               When used for quantization, verifies the "
-                  "binary was compiled with that mode.\n");
+  fprintf(stderr, "  -q <float>  final LR fraction at end of schedule "
+                  "(default = 1.0f)\n");
+  fprintf(stderr, "  -Q <int>    verify quant mode matches build "
+                  "(e.g. 115 for Q1.15)\n");
   fprintf(stderr, "  -c <float>  weight decay (default = 0.0f)\n");
   fprintf(stderr, "  -sl <float> outlier stability: skip update if loss goes "
                   "above this in zscore (0.0f=off)\n");
@@ -2009,13 +2028,14 @@ int main(int argc, char *argv[]) {
     } else if (argv[i][1] == 'u') {
       warmup_iterations = atoi(argv[i + 1]);
     } else if (argv[i][1] == 'q') {
-      // -q can be either quantization mode (115) or LR decay fraction (0.0-1.0)
-      int qval = atoi(argv[i + 1]);
-      if (qval == 115) {
-        requested_quant_mode = qval;
+      // Keep backward compatibility for legacy "-q 115" invocations.
+      if (strcmp(argv[i + 1], "115") == 0) {
+        requested_quant_mode = 115;
       } else {
         final_learning_rate_frac = atof(argv[i + 1]);
       }
+    } else if (argv[i][1] == 'Q') {
+      requested_quant_mode = atoi(argv[i + 1]);
     } else if (argv[i][1] == 'c') {
       weight_decay = atof(argv[i + 1]);
     } else if (argv[i][1] == 'x') {
@@ -2069,8 +2089,17 @@ int main(int argc, char *argv[]) {
     }
   }
 
-  // Validate quantization mode if requested via -q 115
+  // Validate quantization mode if requested via -Q 115 (or legacy -q 115)
   if (requested_quant_mode != 0) {
+    if (requested_quant_mode != 115) {
+      fprintf(stderr,
+              "ERROR: Unsupported quantization mode request: Q1.%d in GPT-3 "
+              "path.\n",
+              requested_quant_mode);
+      fprintf(stderr,
+              "       Use -Q 115 with a Q1.15 binary (or omit -Q).\n");
+      exit(EXIT_FAILURE);
+    }
     int compiled_mode = 0;
 #if defined(ENABLE_Q115)
     compiled_mode = 115;
@@ -2078,7 +2107,7 @@ int main(int argc, char *argv[]) {
     if (compiled_mode == 0) {
       fprintf(stderr, "ERROR: Requested quantization mode Q1.15 but binary was "
                       "compiled without quantization.\n");
-      fprintf(stderr, "       Use 'make q115' for Q1.15 build.\n");
+      fprintf(stderr, "       Use 'make q115' for Q1.15 builds.\n");
       exit(EXIT_FAILURE);
     }
     if (compiled_mode != requested_quant_mode) {
@@ -2086,7 +2115,8 @@ int main(int argc, char *argv[]) {
               "ERROR: Requested quantization mode Q1.%d but binary was "
               "compiled with Q1.15.\n",
               requested_quant_mode == 115 ? 15 : 31);
-      fprintf(stderr, "       Use the correct binary: train_gpt3q115cu\n");
+            fprintf(stderr,
+              "       Use the correct binary: train_gpt3q115cu\n");
       exit(EXIT_FAILURE);
     }
     printf("Quantization mode Q1.15 verified.\n");

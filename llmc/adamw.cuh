@@ -94,8 +94,8 @@ __device__ void adamw_update(Tp* params_memory, float* master_params_memory, Tg*
     // fetch the old value of this parameter as a float
     float old_param;
 #if defined(ENABLE_Q131) && !defined(FIXED_POINT_Q31)
-    // In true Q1.31 mode, Tp is int32_t (q131_t)
-    if constexpr (sizeof(Tp) == 4) {
+    // In true Q1.31 mode, only q131_t storage should use q131 conversions.
+    if constexpr (std::is_same_v<Tp, q131_t>) {
         old_param = q131_to_float(params_memory[idx]);
         if (master_params_memory != NULL) {
             old_param = master_params_memory[idx];
@@ -104,8 +104,8 @@ __device__ void adamw_update(Tp* params_memory, float* master_params_memory, Tg*
         old_param = (master_params_memory != NULL) ? master_params_memory[idx] : (float)params_memory[idx];
     }
 #elif defined(ENABLE_Q115)
-    // In Q1.15 mode, Tp is int16_t (q115_t)
-    if constexpr (sizeof(Tp) == 2) {
+    // In Q1.15 mode, only q115_t storage should use q115 conversions.
+    if constexpr (std::is_same_v<Tp, q115_t>) {
         // Convert from Q1.15 to float
         old_param = q115_to_float(params_memory[idx]);
         // Use master weights if available (for higher precision accumulation)
@@ -124,7 +124,7 @@ __device__ void adamw_update(Tp* params_memory, float* master_params_memory, Tg*
     
     // Store updated parameter
 #if defined(ENABLE_Q131)
-    if constexpr (sizeof(Tp) == 4) {
+    if constexpr (std::is_same_v<Tp, q131_t>) {
         // Clamp to Q1.31 range and convert from float to Q1.31
         param = fmaxf(Q131_WEIGHT_MIN, fminf(Q131_WEIGHT_MAX, param));
         params_memory[idx] = float_to_q131(param);
@@ -133,9 +133,13 @@ __device__ void adamw_update(Tp* params_memory, float* master_params_memory, Tg*
         stochastic_rounding(param, &params_memory[idx], seed);
     }
 #elif defined(ENABLE_Q115)
-    if constexpr (sizeof(Tp) == 2) {
+    if constexpr (std::is_same_v<Tp, q115_t>) {
         // Convert from float to Q1.15
         params_memory[idx] = float_to_q115(param);
+    } else if constexpr (std::is_same_v<Tp, __nv_bfloat16>) {
+        // BF16-backed SF16 mode keeps storage in bf16, but enforces Q1.15
+        // boundaries at writeback.
+        params_memory[idx] = (__nv_bfloat16)simulate_q115(param);
     } else {
         // use stochastic rounding for non-Q1.15 types
         stochastic_rounding(param, &params_memory[idx], seed);

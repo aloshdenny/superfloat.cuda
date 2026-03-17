@@ -131,11 +131,14 @@ Also, Make defaults to:
 Use Q115-specific targets (not `train_gpt2cu`) for SF16/Q115 mode:
 
 ```bash
-# Q115 true-forward
+# GPT-2: Q115 true-forward
 make train_gpt2q115cu
 
-# Q115 true-forward + weight-constrained mode
+# GPT-2: Q115 true-forward + weight-constrained mode
 make train_gpt2q115_constrainedcu
+
+# GPT-3 (standalone): pure Q115 true-forward
+make train_gpt3q115cu
 
 # Optional dry-run to inspect compile flags
 make -n train_gpt2q115cu | head -n 40
@@ -150,7 +153,17 @@ Run example:
 
 ```bash
 ./train_gpt2q115cu -b 16 -t 1024 -x 10000
+
+# Standalone GPT-3 pure SF16
+./train_gpt3q115cu -e "gpt3:c768" -Q 115 -b 16 -t 2048 -x 10000
 ```
+
+For the full GPT-3 125M 300B-token run, use:
+
+- `scripts/run_gpt3_125M.sh`
+
+That script now builds and runs `train_gpt3q115cu` by default,
+keeps cuDNN off for Q115, and passes `-Q 115` to verify runtime precision.
 
 ## 8. Quick Reality Check
 

@@ -47,6 +47,46 @@ jobs:
           ./train_gpt2cu -b 1 -t 64 -d 256 -l 0.0001 -v 200 -s 200 -a 1 -x 10 -r 0 -f 0 -e "gpt2_124M.bin" > train_gpt2cu_fp32_precision.txt
           python dev/loss_checker_ci.py -f train_gpt2cu_fp32_precision.txt -s 20 -e 28 -a 5.0
 
+      - name: Build GPT-3 pure Q1.15
+        run: make train_gpt3q115cu
+
+      - name: GPT-3 pure Q1.15 smoke
+        run: |
+          ./train_gpt3q115cu \
+            -i "dev/data/tinyshakespeare/tiny_shakespeare_train.bin" \
+            -j "dev/data/tinyshakespeare/tiny_shakespeare_val.bin" \
+            -e "gpt3:c768" \
+            -o ci_gpt3q115_smoke \
+            -b 1 -t 64 -d 64 -l 0.0001 -v 200 -s 200 -a 1 -x 8 -r 0 -f 0 \
+            -Q 115 -q 0.1 > train_gpt3q115_smoke.txt
+          python - <<'PY'
+          import re
+          import sys
+
+          with open("ci_gpt3q115_smoke/main.log", "r") as f:
+              text = f.read()
+
+          if re.search(r"(?<![a-z])(?:nan|inf)(?![a-z])", text.lower()):
+              print("Found NaN/Inf token in GPT-3 pure Q1.15 smoke log")
+              sys.exit(1)
+
+          losses = []
+          for line in text.splitlines():
+              m = re.search(r"trl:([0-9eE+\-.]+)", line)
+              if m:
+                  losses.append(float(m.group(1)))
+
+          if len(losses) < 3:
+              print("Insufficient loss points found in GPT-3 pure smoke run")
+              sys.exit(1)
+
+          if losses[-1] >= losses[0]:
+              print(f"Loss did not improve: first={losses[0]:.6f}, last={losses[-1]:.6f}")
+              sys.exit(1)
+
+          print(f"GPT-3 pure Q1.15 smoke passed: first={losses[0]:.6f}, last={losses[-1]:.6f}")
+          PY
+
       - name: Build FP32 precision
         run: PRECISION=FP32 make test_gpt2cu profile_gpt2cu
 

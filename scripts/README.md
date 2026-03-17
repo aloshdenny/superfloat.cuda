@@ -2,6 +2,24 @@
 
 These shell scripts hold the exact commands to llm.c that reproduce the GPT-2 and GPT-3 runs.
 
+### gpt-3 sf16 pure default
+
+The GPT-3 125M script is now configured for standalone pure SF16 training:
+
+- script: `scripts/run_gpt3_125M.sh`
+- build target: `train_gpt3q115cu`
+- runtime precision verifier: `-Q 115`
+- model descriptor: `-e "gpt3:c768"`
+- sequence length: `-t 2048`
+
+Notes:
+
+- Q115/SF16 does not support cuDNN attention; this script intentionally avoids
+	`USE_CUDNN=1`.
+- Resume behavior is controlled by environment variable `RESUME` (default: 0).
+- Outlier skip-update z-score gates are off by default; set `SKIP_LOSS_Z` and
+	`SKIP_GRAD_Z` if you want to enable them.
+
 ### pytorch reference runs
 
 For all pyrun scripts, current restrictions:
