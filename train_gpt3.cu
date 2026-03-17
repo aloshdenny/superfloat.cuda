@@ -1849,9 +1849,9 @@ void error_usage() {
   fprintf(stderr, "Options:\n");
   // file system input / output
   fprintf(stderr, "  -i <string> train data filename pattern (default = "
-                  "dev/data/tinyshakespeare/tiny_shakespeare_train.bin)\n");
+                  "dev/data/fineweb100B/fineweb_train_*.bin)\n");
   fprintf(stderr, "  -j <string> val data filename pattern (default = "
-                  "dev/data/tinyshakespeare/tiny_shakespeare_val.bin)\n");
+                  "dev/data/fineweb100B/fineweb_val_*.bin)\n");
   fprintf(stderr, "  -e <string> input .bin filename or descriptor, see code "
                   "comments as docs. (default = gpt3_125M_bf16.bin)\n");
   fprintf(stderr,
@@ -1939,8 +1939,8 @@ void error_usage() {
 // main training loop
 int main(int argc, char *argv[]) {
   // read in the (optional) command line arguments
-  const char *train_data_pattern = "dev/data/fineweb10B/fineweb_train_*.bin";
-  const char *val_data_pattern = "dev/data/fineweb10B/fineweb_val_*.bin";
+  const char *train_data_pattern = "dev/data/fineweb100B/fineweb_train_*.bin";
+  const char *val_data_pattern = "dev/data/fineweb100B/fineweb_val_*.bin";
   const char *load_filename = "gpt3_125M_bf16.bin"; // bf16 weights of the model
   const char *lr_scheduler_type = "cosine";
   const char *output_log_dir = NULL;
