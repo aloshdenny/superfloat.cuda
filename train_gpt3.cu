@@ -516,8 +516,12 @@ void gpt3_allocate_state(GPT3 *model, int B, int T) {
 
 void gpt3_init_random(GPT3 *model, int max_seq_len, int vocab_size,
                       int num_layers, int num_heads, int channels) {
-  // Initialize model with random Q1.15 weights (similar to train_gpt2.c)
+  // Initialize model with random weights
+#if defined(ENABLE_Q115)
   printf0("Initializing model with random Q1.15 weights\n");
+#else
+  printf0("Initializing model with random weights\n");
+#endif
 
   // Set up model configuration
   model->config.max_seq_len = max_seq_len;
@@ -533,15 +537,23 @@ void gpt3_init_random(GPT3 *model, int max_seq_len, int vocab_size,
   // Allocate memory for parameters
   gpt3_allocate_weights(model);
 
-  // Initialize with small random values in Q1.15 format
-  // For Q1.15: scale initialization to prevent overflow, values closer to zero
-  // Using scaled initialization: range approximately [-0.1, 0.1] to be safe
+  // Match GPT-2 random init behavior, including SF16 per-tensor scaling.
   uint64_t seed = 12345;
-  float init_scale = 0.1f; // Conservative scale for Q1.15
+  float init_scale = 0.02f;
+#if defined(ENABLE_Q115)
+  init_scale = 0.1f;
+#endif
 
   // Allocate CPU memory for initialization
   floatX *params_memory_cpu =
       (floatX *)mallocCheck(model->num_parameters_bytes);
+
+  // Track tensor boundaries for per-tensor initialization scaling.
+  size_t param_offsets[NUM_PARAMETER_TENSORS + 1];
+  param_offsets[0] = 0;
+  for (int t = 0; t < NUM_PARAMETER_TENSORS; t++) {
+    param_offsets[t + 1] = param_offsets[t] + model->param_elements[t];
+  }
 
   for (size_t i = 0; i < model->num_parameters; i++) {
     // Simple random number generation (xorshift)
@@ -551,7 +563,41 @@ void gpt3_init_random(GPT3 *model, int max_seq_len, int vocab_size,
     float random_val =
         (((seed * 0x2545F4914F6CDD1Dull) >> 32) / (float)UINT32_MAX) * 2.0f -
         1.0f;
-    random_val *= init_scale; // Scale to [-0.1, 0.1]
+
+    // Determine tensor id for per-tensor SF16 init scaling.
+    int tensor_id = 0;
+    for (int t = 0; t < NUM_PARAMETER_TENSORS; t++) {
+      if (i >= param_offsets[t] && i < param_offsets[t + 1]) {
+        tensor_id = t;
+        break;
+      }
+    }
+    (void)tensor_id;
+
+    float tensor_scale = init_scale;
+#if defined(ENABLE_Q115)
+    switch (tensor_id) {
+    case 0:                                            // wte - token embeddings
+      tensor_scale = init_scale * Q115_WTE_INIT_SCALE; // Scale up wte
+      break;
+    case 1: // wpe - position embeddings
+      tensor_scale = init_scale * Q115_WPE_INIT_SCALE; // Scale down wpe
+      break;
+    case 4:                                            // qkvw - QKV weights
+      tensor_scale = init_scale * Q115_QKV_INIT_SCALE; // Increase QKV variance
+      break;
+    default:
+      tensor_scale = init_scale;
+      break;
+    }
+#endif
+
+    random_val *= tensor_scale;
+
+#if defined(ENABLE_Q115_WEIGHT_CONSTRAINT)
+    // Clamp to Q1.15 range [-1, 1) for weight-constrained training.
+    random_val = fmaxf(-1.0f, fminf(0.999969482421875f, random_val));
+#endif
 
 #if PRECISION_MODE == PRECISION_FP32
     params_memory_cpu[i] = random_val;
