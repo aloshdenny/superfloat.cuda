@@ -8,6 +8,9 @@ Attention, as a fallback when we do not use the Flash Attention from cuDNN
 #include "cuda_utils.cuh"
 #if defined(ENABLE_Q115)
 #include "q115_common.cuh"
+#if defined(SF16_TRUE_FORWARD)
+#include "q131_common.cuh"
+#endif
 #elif defined(ENABLE_Q131)
 #include "q131_common.cuh"
 #endif
@@ -202,7 +205,9 @@ __global__ void flash_attention_tiled_forward_kernel(
         for (int i = 0; i < D_VECS; i++) {
           int d = lane_id + i * WARP_SIZE;
           if (d < HS) {
-            dot += q_reg[i] * (float)__ldcs(&k_s[t_j * MAX_HEAD_DIM + d]);
+            // k_s is shared memory; use a regular load, not global-cache
+            // intrinsics.
+            dot += q_reg[i] * (float)k_s[t_j * MAX_HEAD_DIM + d];
           }
         }
         dot = warpReduceSum(dot);
@@ -251,7 +256,9 @@ __global__ void flash_attention_tiled_forward_kernel(
         for (int i = 0; i < D_VECS; i++) {
           int d = lane_id + i * WARP_SIZE;
           if (d < HS) {
-            o_reg[i] += p * (float)__ldcs(&v_s[t_j * MAX_HEAD_DIM + d]);
+            // v_s is shared memory; use a regular load, not global-cache
+            // intrinsics.
+            o_reg[i] += p * (float)v_s[t_j * MAX_HEAD_DIM + d];
           }
         }
       }
