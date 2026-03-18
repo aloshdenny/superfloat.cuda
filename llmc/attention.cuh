@@ -8,9 +8,39 @@ Attention, as a fallback when we do not use the Flash Attention from cuDNN
 #include "cuda_utils.cuh"
 #if defined(ENABLE_Q115)
 #include "q115_common.cuh"
+#if defined(SF16_TRUE_FORWARD)
+#include "q131_common.cuh"
+#endif
 #elif defined(ENABLE_Q131)
 #include "q131_common.cuh"
 #endif
+
+constexpr int FLASH_WARPS_PER_BLOCK = 4;
+constexpr int FLASH_K_TILE = 32;
+constexpr int FLASH_MAX_HEAD_DIM = 128;
+
+__device__ __forceinline__ float quantize_attention_score(float x) {
+#if defined(ENABLE_Q131)
+  return simulate_q131(x * 8.0f);
+#elif defined(ENABLE_Q115)
+  return simulate_q115(x);
+#else
+  return x;
+#endif
+}
+
+__device__ __forceinline__ float quantize_attention_output(float x) {
+#if defined(ENABLE_Q131)
+  return simulate_q131(x);
+#elif defined(ENABLE_Q115)
+#if defined(SF16_TRUE_FORWARD)
+  x = simulate_q131(x);
+#endif
+  return simulate_q115(x);
+#else
+  return x;
+#endif
+}
 
 // ----------------------------------------------------------------------------
 // CUDA kernels
@@ -99,6 +129,156 @@ __global__ void unpermute_kernel_backward(floatX *dinp, const floatX *dout,
   dinp[idx] = (floatX)dout[other_idx];
 }
 
+template <int WARPS_PER_BLOCK, int K_TILE, int MAX_HEAD_DIM>
+__global__ void flash_attention_tiled_forward_kernel(
+  floatX *out, floatX *qkvr, const floatX *inp, int B, int T, int C, int NH,
+  int HS) {
+  static_assert(MAX_HEAD_DIM % WARP_SIZE == 0,
+                "MAX_HEAD_DIM must be a multiple of warp size");
+  constexpr int D_VECS = MAX_HEAD_DIM / WARP_SIZE;
+
+  int lane_id = threadIdx.x % WARP_SIZE;
+  int warp_id = threadIdx.x / WARP_SIZE;
+  int q_row = blockIdx.x * WARPS_PER_BLOCK + warp_id;
+  int bh = blockIdx.y;
+  bool active_row = (q_row < T) && (bh < B * NH);
+
+  int b = bh / NH;
+  int h = bh % NH;
+  floatX *q = qkvr + 0 * B * T * C;
+  floatX *k = qkvr + 1 * B * T * C;
+  floatX *v = qkvr + 2 * B * T * C;
+
+  extern __shared__ char smem_raw[];
+  floatX *k_s = reinterpret_cast<floatX *>(smem_raw);
+  floatX *v_s = k_s + K_TILE * MAX_HEAD_DIM;
+  float *p_s = reinterpret_cast<float *>(v_s + K_TILE * MAX_HEAD_DIM);
+  float *warp_probs = p_s + warp_id * (K_TILE + 1);
+
+  float q_reg[D_VECS];
+  float o_reg[D_VECS];
+  for (int i = 0; i < D_VECS; i++) {
+    q_reg[i] = 0.0f;
+    o_reg[i] = 0.0f;
+  }
+
+  const float flt_max =
+      340282346638528859811704183484516925440.0f; // avoid float.h include
+  float m = -flt_max;
+  float l = 0.0f;
+  float inv_sqrt_hs = rsqrtf((float)HS);
+
+  if (active_row) {
+    size_t q_base = ((size_t)bh * T + q_row) * HS;
+    size_t inp_token_base = ((size_t)b * T + q_row) * 3 * C;
+    for (int i = 0; i < D_VECS; i++) {
+      int d = lane_id + i * WARP_SIZE;
+      if (d < HS) {
+        size_t h_offset = (size_t)h * HS + d;
+        q_reg[i] = (float)__ldcs(inp + inp_token_base + h_offset);
+        q[q_base + d] = (floatX)q_reg[i];
+        k[q_base + d] = __ldcs(inp + inp_token_base + C + h_offset);
+        v[q_base + d] = __ldcs(inp + inp_token_base + 2 * C + h_offset);
+      }
+    }
+  }
+
+  for (int k0 = 0; k0 < T; k0 += K_TILE) {
+    int tile_count = min(K_TILE, T - k0);
+
+    for (int idx = threadIdx.x; idx < tile_count * HS; idx += blockDim.x) {
+      int t_j = idx / HS;
+      int d = idx % HS;
+      size_t token_base = ((size_t)b * T + (k0 + t_j)) * 3 * C;
+      size_t h_offset = (size_t)h * HS + d;
+      k_s[t_j * MAX_HEAD_DIM + d] = __ldcs(inp + token_base + C + h_offset);
+      v_s[t_j * MAX_HEAD_DIM + d] =
+          __ldcs(inp + token_base + 2 * C + h_offset);
+    }
+    __syncthreads();
+
+    if (active_row && k0 <= q_row) {
+      int valid = min(tile_count, q_row - k0 + 1);
+
+      for (int t_j = 0; t_j < valid; t_j++) {
+        float dot = 0.0f;
+        for (int i = 0; i < D_VECS; i++) {
+          int d = lane_id + i * WARP_SIZE;
+          if (d < HS) {
+            // k_s is shared memory; use a regular load, not global-cache
+            // intrinsics.
+            dot += q_reg[i] * (float)k_s[t_j * MAX_HEAD_DIM + d];
+          }
+        }
+        dot = warpReduceSum(dot);
+        if (lane_id == 0) {
+          float score = quantize_attention_score(dot * inv_sqrt_hs);
+          warp_probs[t_j] = score;
+        }
+      }
+      __syncwarp();
+
+      if (lane_id == 0) {
+        float tile_max = -flt_max;
+        for (int t_j = 0; t_j < valid; t_j++) {
+          tile_max = fmaxf(tile_max, warp_probs[t_j]);
+        }
+
+        float m_new = fmaxf(m, tile_max);
+        float alpha = expf(m - m_new);
+        float l_new = l * alpha;
+
+        for (int t_j = 0; t_j < valid; t_j++) {
+          float p = expf(warp_probs[t_j] - m_new);
+          warp_probs[t_j] = p;
+          l_new += p;
+        }
+
+        float inv_l_new = 1.0f / fmaxf(l_new, 1e-20f);
+        float old_scale = (l * alpha) * inv_l_new;
+        for (int t_j = 0; t_j < valid; t_j++) {
+          warp_probs[t_j] *= inv_l_new;
+        }
+        warp_probs[K_TILE] = old_scale;
+
+        m = m_new;
+        l = l_new;
+      }
+      __syncwarp();
+
+      float old_scale = warp_probs[K_TILE];
+      for (int i = 0; i < D_VECS; i++) {
+        o_reg[i] *= old_scale;
+      }
+
+      for (int t_j = 0; t_j < valid; t_j++) {
+        float p = warp_probs[t_j];
+        for (int i = 0; i < D_VECS; i++) {
+          int d = lane_id + i * WARP_SIZE;
+          if (d < HS) {
+            // v_s is shared memory; use a regular load, not global-cache
+            // intrinsics.
+            o_reg[i] += p * (float)v_s[t_j * MAX_HEAD_DIM + d];
+          }
+        }
+      }
+    }
+
+    __syncthreads();
+  }
+
+  if (active_row) {
+    size_t out_base = ((size_t)b * T + q_row) * C + h * HS;
+    for (int i = 0; i < D_VECS; i++) {
+      int d = lane_id + i * WARP_SIZE;
+      if (d < HS) {
+        float out_val = quantize_attention_output(o_reg[i]);
+        __stcs(out + out_base + d, (floatX)out_val);
+      }
+    }
+  }
+}
+
 __global__ void softmax_forward_kernel5(floatX *out, float inv_temperature,
                                         const floatX *inp, int N, int T) {
   // inp, out shape: (N, T, T), where N = B * NH
@@ -135,22 +315,12 @@ __global__ void softmax_forward_kernel5(floatX *out, float inv_temperature,
   float maxval = -flt_max;
   float sumval = 0.0f;
 
-#if defined(ENABLE_Q131)
-  // For Q1.31: scale attention scores to expand dynamic range
-  const float att_scale = 8.0f; // Expand Q1.31 attention score range
-#elif defined(ENABLE_Q115)
-  // For Q1.15: scale attention scores to expand dynamic range
-  const float att_scale = 1.0f;
-#else
-  const float att_scale = 1.0f;
-#endif
-
   const floatX *x_aligned =
       reinterpret_cast<const floatX *>(__builtin_assume_aligned(x, 16));
   for (int i = lane_id; i < pos_by_4; i += WARP_SIZE) {
     float regarray[4];
     for (int k = 0; k < 4; ++k) {
-      regarray[k] = simulate_q115((float)x_aligned[4 * i + k]) * att_scale;
+      regarray[k] = quantize_attention_score((float)x_aligned[4 * i + k]);
     }
     float old_maxval = maxval;
     for (int k = 0; k < 4; ++k) {
@@ -164,7 +334,7 @@ __global__ void softmax_forward_kernel5(floatX *out, float inv_temperature,
 
   if (4 * pos_by_4 + lane_id <= own_pos) {
     float old_maxval = maxval;
-    float scaled_val = simulate_q115((float)x[4 * pos_by_4 + lane_id]) * att_scale;
+    float scaled_val = quantize_attention_score((float)x[4 * pos_by_4 + lane_id]);
     maxval = fmaxf(maxval, scaled_val);
     sumval *= expf(inv_temperature * (old_maxval - maxval));
     sumval += expf(inv_temperature * (scaled_val - maxval));
@@ -180,8 +350,9 @@ __global__ void softmax_forward_kernel5(floatX *out, float inv_temperature,
   for (int i = lane_id; i <= own_pos; i += WARP_SIZE) {
     // recalculation is faster than doing the round-trip through memory.
     float ev = expf(inv_temperature *
-                    (simulate_q115((float)__ldcs(x + i)) * att_scale - global_maxval));
-    __stcs(out + idx * T + i, (floatX)simulate_q115(ev * norm));
+                    (quantize_attention_score((float)__ldcs(x + i)) -
+                     global_maxval));
+    __stcs(out + idx * T + i, (floatX)quantize_attention_output(ev * norm));
   }
 }
 
@@ -233,6 +404,7 @@ __global__ void softmax_autoregressive_backward_inplace_kernel(
 void attention_forward(floatX *out, floatX *qkvr, floatX *att, floatX *inp,
                        int B, int T, int C, int NH, cudaStream_t stream) {
   NVTX_RANGE_FN();
+  (void)att; // Forward path no longer materializes T x T attention matrix.
   // Note: `inp` is not needed for backward pass, so we re-use it as a scratch
   // buffer. Its contents will be overwritten by this function.
   const int block_size = 256;
@@ -242,6 +414,24 @@ void attention_forward(floatX *out, floatX *qkvr, floatX *att, floatX *inp,
   // output is (B, T, C)
   const int HS = C / NH; // head size
 
+  // FlashAttention-style forward pass: tiled QK^T + online softmax + V
+  // accumulation in shared memory, no T x T materialization.
+  // The kernel reads packed QKV projection output directly from `inp`, writes
+  // qkvr (for backward), and writes final attention output.
+  if (HS <= FLASH_MAX_HEAD_DIM && HS % 8 == 0) {
+    dim3 grid(CEIL_DIV(T, FLASH_WARPS_PER_BLOCK), B * NH);
+    dim3 block(FLASH_WARPS_PER_BLOCK * WARP_SIZE);
+    int shmem_size =
+        2 * FLASH_K_TILE * FLASH_MAX_HEAD_DIM * sizeof(floatX) +
+        FLASH_WARPS_PER_BLOCK * (FLASH_K_TILE + 1) * sizeof(float);
+    flash_attention_tiled_forward_kernel<FLASH_WARPS_PER_BLOCK, FLASH_K_TILE,
+                                         FLASH_MAX_HEAD_DIM>
+        <<<grid, block, shmem_size, stream>>>(out, qkvr, inp, B, T, C, NH, HS);
+    cudaCheck(cudaGetLastError());
+    return;
+  }
+
+  // Fallback path for uncommon head sizes.
   // permute and separate inp from (B, T, 3, NH, HS) to 3X (B, NH, T, HS)
   floatX *q, *k, *v;
   q = qkvr + 0 * B * T * C;
@@ -282,7 +472,7 @@ void attention_forward(floatX *out, floatX *qkvr, floatX *att, floatX *inp,
 // vaccum (B,T,C) -> out (B,T,C)
 void attention_backward(floatX *dinp, floatX *dqkvr, floatX *datt,
                         floatX *scratch, const floatX *dout, const floatX *qkvr,
-                        const floatX *att, int B, int T, int C, int NH,
+                        floatX *att, int B, int T, int C, int NH,
                         cudaStream_t stream) {
   NVTX_RANGE_FN();
   const int block_size = 256;
@@ -297,6 +487,18 @@ void attention_backward(floatX *dinp, floatX *dqkvr, floatX *datt,
   dq = dqkvr + 0 * B * T * C;
   dk = dqkvr + 1 * B * T * C;
   dv = dqkvr + 2 * B * T * C;
+
+  // Recompute attention probabilities from Q,K for backward.
+  // Forward uses a tiled FlashAttention-style kernel and avoids T x T
+  // materialization, so we regenerate probabilities here when gradients are
+  // needed.
+  floatX *preatt = datt;
+  matmul_cublaslt(preatt, k, q, nullptr, T, T, HS, stream, true, false, B * NH,
+                  T * HS, T * HS, T * T);
+  float scale_fwd = 1.f / sqrtf((float)HS);
+  int softmax_grid = CEIL_DIV(B * NH * T * WARP_SIZE, block_size);
+  softmax_forward_kernel5<<<softmax_grid, block_size, 0, stream>>>(
+      att, scale_fwd, preatt, B * NH, T);
 
   // backward through the unpermute operation
   int num_blocks = CEIL_DIV(B * T * C, block_size);

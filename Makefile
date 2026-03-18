@@ -157,7 +157,7 @@ TARGETS = train_gpt2 test_gpt2 train_gpt2cu train_gpt2rawcu train_gpt3cu test_gp
 
 TARGETS_Q131 = train_gpt2q131cu train_gpt3q131cu
 TARGETS_Q115 = train_gpt2q115cu train_gpt3q115cu
-TARGETS_Q115_CONSTRAINED = train_gpt2q115_constrainedcu train_gpt3q115_constrainedcu
+TARGETS_Q115_CONSTRAINED = train_gpt2q115_constrainedcu
 
 .PHONY: all clean libsyms run q131 q115 q115_constrained
 all: $(TARGETS)
@@ -239,9 +239,6 @@ train_gpt3q115cu: train_gpt3.cu libsyms $(NVCC_CUDNN)
 # Q1.15 Weight-Constrained CUDA
 # ===============================
 train_gpt2q115_constrainedcu: train_gpt2.cu libsyms $(NVCC_CUDNN)
-	$(NVCC) $(NVCC_FLAGS) $(PFLAGS) -DENABLE_Q115 -DENABLE_Q115_WEIGHT_CONSTRAINT -DSF16_TRUE_FORWARD=1 $(NVCC_INCLUDES) $< $(NVCC_CUDNN) $(NVCC_LDFLAGS) $(NVCC_LDLIBS) $(CUDA_OUTPUT_FILE)
-
-train_gpt3q115_constrainedcu: train_gpt3.cu libsyms $(NVCC_CUDNN)
 	$(NVCC) $(NVCC_FLAGS) $(PFLAGS) -DENABLE_Q115 -DENABLE_Q115_WEIGHT_CONSTRAINT -DSF16_TRUE_FORWARD=1 $(NVCC_INCLUDES) $< $(NVCC_CUDNN) $(NVCC_LDFLAGS) $(NVCC_LDLIBS) $(CUDA_OUTPUT_FILE)
 
 # ===============================

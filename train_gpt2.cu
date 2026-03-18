@@ -2369,7 +2369,7 @@ void error_usage() {
   fprintf(stderr, "  -e <string> input .bin filename or descriptor, see code "
                   "comments as docs. (default = gpt2_124M_bf16.bin)\n");
   fprintf(stderr,
-          "  -o <string> output log dir (default = NULL, no logging)\n");
+      "  -o <string> output log dir (default = log_gpt2)\n");
   fprintf(
       stderr,
       "  -lg <int>   log gpu info every x steps (default = -1; disabled)\n");
@@ -2456,7 +2456,7 @@ int main(int argc, char *argv[]) {
   const char *val_data_pattern = "dev/data/fineweb10B/fineweb_val_*.bin";
   const char *load_filename = "gpt2_124M_bf16.bin"; // bf16 weights of the model
   const char *lr_scheduler_type = "cosine";
-  const char *output_log_dir = NULL;
+  const char *output_log_dir = "log_gpt2";
   int checkpoint_every = 0; // write checkpoints every how many steps?
   int checkpoints_keep =
       0; // how long checkpoint history do we keep? (in units of checkpoints)
@@ -2963,6 +2963,8 @@ int main(int argc, char *argv[]) {
       float val_perplexity = expf(val_loss);
       printf0("val loss %f | val perplexity %f\n", val_loss, val_perplexity);
       logger_log_val(&logger, step, val_loss);
+      logger_log_val_metrics_txt(&logger, "gpt2", step, val_loss,
+                                 val_perplexity);
     }
 
     // once in a while estimate HellaSwag accuracy (all processes collaborate)

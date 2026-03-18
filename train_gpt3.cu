@@ -516,8 +516,12 @@ void gpt3_allocate_state(GPT3 *model, int B, int T) {
 
 void gpt3_init_random(GPT3 *model, int max_seq_len, int vocab_size,
                       int num_layers, int num_heads, int channels) {
-  // Initialize model with random Q1.15 weights (similar to train_gpt2.c)
+  // Initialize model with random weights
+#if defined(ENABLE_Q115)
   printf0("Initializing model with random Q1.15 weights\n");
+#else
+  printf0("Initializing model with random weights\n");
+#endif
 
   // Set up model configuration
   model->config.max_seq_len = max_seq_len;
@@ -533,15 +537,23 @@ void gpt3_init_random(GPT3 *model, int max_seq_len, int vocab_size,
   // Allocate memory for parameters
   gpt3_allocate_weights(model);
 
-  // Initialize with small random values in Q1.15 format
-  // For Q1.15: scale initialization to prevent overflow, values closer to zero
-  // Using scaled initialization: range approximately [-0.1, 0.1] to be safe
+  // Match GPT-2 random init behavior, including SF16 per-tensor scaling.
   uint64_t seed = 12345;
-  float init_scale = 0.1f; // Conservative scale for Q1.15
+  float init_scale = 0.02f;
+#if defined(ENABLE_Q115)
+  init_scale = 0.1f;
+#endif
 
   // Allocate CPU memory for initialization
   floatX *params_memory_cpu =
       (floatX *)mallocCheck(model->num_parameters_bytes);
+
+  // Track tensor boundaries for per-tensor initialization scaling.
+  size_t param_offsets[NUM_PARAMETER_TENSORS + 1];
+  param_offsets[0] = 0;
+  for (int t = 0; t < NUM_PARAMETER_TENSORS; t++) {
+    param_offsets[t + 1] = param_offsets[t] + model->param_elements[t];
+  }
 
   for (size_t i = 0; i < model->num_parameters; i++) {
     // Simple random number generation (xorshift)
@@ -551,7 +563,41 @@ void gpt3_init_random(GPT3 *model, int max_seq_len, int vocab_size,
     float random_val =
         (((seed * 0x2545F4914F6CDD1Dull) >> 32) / (float)UINT32_MAX) * 2.0f -
         1.0f;
-    random_val *= init_scale; // Scale to [-0.1, 0.1]
+
+    // Determine tensor id for per-tensor SF16 init scaling.
+    int tensor_id = 0;
+    for (int t = 0; t < NUM_PARAMETER_TENSORS; t++) {
+      if (i >= param_offsets[t] && i < param_offsets[t + 1]) {
+        tensor_id = t;
+        break;
+      }
+    }
+    (void)tensor_id;
+
+    float tensor_scale = init_scale;
+#if defined(ENABLE_Q115)
+    switch (tensor_id) {
+    case 0:                                            // wte - token embeddings
+      tensor_scale = init_scale * Q115_WTE_INIT_SCALE; // Scale up wte
+      break;
+    case 1: // wpe - position embeddings
+      tensor_scale = init_scale * Q115_WPE_INIT_SCALE; // Scale down wpe
+      break;
+    case 4:                                            // qkvw - QKV weights
+      tensor_scale = init_scale * Q115_QKV_INIT_SCALE; // Increase QKV variance
+      break;
+    default:
+      tensor_scale = init_scale;
+      break;
+    }
+#endif
+
+    random_val *= tensor_scale;
+
+#if defined(ENABLE_Q115_WEIGHT_CONSTRAINT)
+    // Clamp to Q1.15 range [-1, 1) for weight-constrained training.
+    random_val = fmaxf(-1.0f, fminf(0.999969482421875f, random_val));
+#endif
 
 #if PRECISION_MODE == PRECISION_FP32
     params_memory_cpu[i] = random_val;
@@ -895,7 +941,14 @@ void gpt_build_from_descriptor(GPT3 *model, const char *descriptor) {
         float *fp32_buffer = (float *)mallocCheck(n * sizeof(float));
         normal_(fp32_buffer, n, 0.0f, scale, &init_rng);
         for (size_t j = 0; j < n; j++) {
+#if defined(ENABLE_Q115_WEIGHT_CONSTRAINT)
+          // Clamp to Q1.15 range [-1, 1) for weight-constrained training
+          float val = fp32_buffer[j];
+          val = fmaxf(-1.0f, fminf(0.999969482421875f, val));
+          params_memory_cpu[offset + layer_offset + j] = (floatX)val;
+#else
           params_memory_cpu[offset + layer_offset + j] = (floatX)fp32_buffer[j];
+#endif
         }
         free(fp32_buffer);
       }
@@ -1496,6 +1549,11 @@ void gpt3_update(GPT3 *model, float learning_rate, float beta1, float beta2,
       // changing precision)
       init_from_master(param_ptr, master_ptr, shard.size, tensor.size,
                        shard.size, num_layers, seed, main_stream);
+#if defined(ENABLE_Q115_WEIGHT_CONSTRAINT)
+      // Clamp weights to Q1.15 range after initialization
+      clamp_weights_q115(param_ptr, master_ptr, shard.size, tensor.size,
+                         shard.size, num_layers, main_stream);
+#endif
     } else {
 #if !defined(ENABLE_Q115)
       bool freeze_tensor = false; // No freezing in non-Q115 mode
@@ -1508,6 +1566,11 @@ void gpt3_update(GPT3 *model, float learning_rate, float beta1, float beta2,
                      tensor.size, tensor.size, shard.size, num_layers,
                      learning_rate, beta1, beta2, t, eps, wd, grad_scale, seed,
                      main_stream);
+#if defined(ENABLE_Q115_WEIGHT_CONSTRAINT)
+        // Clamp weights to Q1.15 range [-1, 1) after each update
+        clamp_weights_q115(param_ptr, master_ptr, shard.size, tensor.size,
+                           shard.size, num_layers, main_stream);
+#endif
       }
     }
 
@@ -1832,13 +1895,13 @@ void error_usage() {
   fprintf(stderr, "Options:\n");
   // file system input / output
   fprintf(stderr, "  -i <string> train data filename pattern (default = "
-                  "dev/data/tinyshakespeare/tiny_shakespeare_train.bin)\n");
+                  "dev/data/fineweb10B/fineweb_train_*.bin)\n");
   fprintf(stderr, "  -j <string> val data filename pattern (default = "
-                  "dev/data/tinyshakespeare/tiny_shakespeare_val.bin)\n");
+                  "dev/data/fineweb10B/fineweb_val_*.bin)\n");
   fprintf(stderr, "  -e <string> input .bin filename or descriptor, see code "
                   "comments as docs. (default = gpt3_125M_bf16.bin)\n");
   fprintf(stderr,
-          "  -o <string> output log dir (default = NULL, no logging)\n");
+      "  -o <string> output log dir (default = log_gpt3)\n");
   fprintf(
       stderr,
       "  -lg <int>   log gpu info every x steps (default = -1; disabled)\n");
@@ -1864,8 +1927,10 @@ void error_usage() {
   fprintf(stderr, "  -l <float>  learning rate (default = 3e-4f)\n");
   fprintf(stderr, "  -u <int>    learning rate warmup iterations (default = 0, "
                   "no warmup)\n");
-  fprintf(stderr, "               When used for quantization, verifies the "
-                  "binary was compiled with that mode.\n");
+  fprintf(stderr, "  -q <float>  final LR fraction at end of schedule "
+                  "(default = 1.0f)\n");
+  fprintf(stderr, "  -Q <int>    verify quant mode matches build "
+                  "(e.g. 115 for Q1.15)\n");
   fprintf(stderr, "  -c <float>  weight decay (default = 0.0f)\n");
   fprintf(stderr, "  -sl <float> outlier stability: skip update if loss goes "
                   "above this in zscore (0.0f=off)\n");
@@ -1873,11 +1938,11 @@ void error_usage() {
                   "goes above this in zscore (0.0f=off)\n");
   // evaluation
   fprintf(stderr, "  -v <int>    val_loss_every, how often we evaluate val "
-                  "loss (default = 20)\n");
+                  "loss (default = 100)\n");
   fprintf(stderr, "  -m <int>    val_max_steps, up to how many val batches to "
                   "estimate val loss? (default = 20)\n");
   fprintf(stderr, "  -s <int>    sample_every, how often we inference the "
-                  "model (default = 20)\n");
+                  "model (default = 100)\n");
   fprintf(
       stderr,
       "  -g <int>    genT, how many steps of inference we do (default = 64)\n");
@@ -1924,7 +1989,7 @@ int main(int argc, char *argv[]) {
   const char *val_data_pattern = "dev/data/fineweb10B/fineweb_val_*.bin";
   const char *load_filename = "gpt3_125M_bf16.bin"; // bf16 weights of the model
   const char *lr_scheduler_type = "cosine";
-  const char *output_log_dir = NULL;
+  const char *output_log_dir = "log_gpt3";
   int checkpoint_every = 0; // write checkpoints every how many steps?
   int checkpoints_keep =
       0; // how long checkpoint history do we keep? (in units of checkpoints)
@@ -1932,7 +1997,7 @@ int main(int argc, char *argv[]) {
       0; // major checkpoints never get deleted when maintaining history
   int resume =
       0;     // resume the optimization, if one is found inside output_log_dir?
-  int B = 4; // batch size
+  int B = 8; // batch size
   int T = 2048; // sequence length max - GPT-3 uses 2048 instead of 1024
   int total_batch_size =
       -1; // will be calculated down below later, if not provided
@@ -1946,10 +2011,11 @@ int main(int argc, char *argv[]) {
       0.0f; // skip update if loss goes above this in zscore
   float skip_update_gradz =
       0.0f;                // skip update if grad_norm goes above this in zscore
-  int val_loss_every = 20; // every how many steps do we eval validation loss?
+  int val_loss_every =
+      100; // every how many steps do we eval validation loss?
   int val_max_steps =
       20;                // how many batches max do we eval for validation loss?
-  int sample_every = 20; // every how many steps to do inference?
+  int sample_every = 100; // every how many steps to do inference?
   int genT = 64;         // number of steps of inference we will do
   int overfit_single_batch =
       0; // useful for debugging, 1 = only load a single data batch once
@@ -2009,13 +2075,14 @@ int main(int argc, char *argv[]) {
     } else if (argv[i][1] == 'u') {
       warmup_iterations = atoi(argv[i + 1]);
     } else if (argv[i][1] == 'q') {
-      // -q can be either quantization mode (115) or LR decay fraction (0.0-1.0)
-      int qval = atoi(argv[i + 1]);
-      if (qval == 115) {
-        requested_quant_mode = qval;
+      // Keep backward compatibility for legacy "-q 115" invocations.
+      if (strcmp(argv[i + 1], "115") == 0) {
+        requested_quant_mode = 115;
       } else {
         final_learning_rate_frac = atof(argv[i + 1]);
       }
+    } else if (argv[i][1] == 'Q') {
+      requested_quant_mode = atoi(argv[i + 1]);
     } else if (argv[i][1] == 'c') {
       weight_decay = atof(argv[i + 1]);
     } else if (argv[i][1] == 'x') {
@@ -2069,8 +2136,17 @@ int main(int argc, char *argv[]) {
     }
   }
 
-  // Validate quantization mode if requested via -q 115
+  // Validate quantization mode if requested via -Q 115 (or legacy -q 115)
   if (requested_quant_mode != 0) {
+    if (requested_quant_mode != 115) {
+      fprintf(stderr,
+              "ERROR: Unsupported quantization mode request: Q1.%d in GPT-3 "
+              "path.\n",
+              requested_quant_mode);
+      fprintf(stderr,
+              "       Use -Q 115 with a Q1.15 binary (or omit -Q).\n");
+      exit(EXIT_FAILURE);
+    }
     int compiled_mode = 0;
 #if defined(ENABLE_Q115)
     compiled_mode = 115;
@@ -2078,7 +2154,7 @@ int main(int argc, char *argv[]) {
     if (compiled_mode == 0) {
       fprintf(stderr, "ERROR: Requested quantization mode Q1.15 but binary was "
                       "compiled without quantization.\n");
-      fprintf(stderr, "       Use 'make q115' for Q1.15 build.\n");
+      fprintf(stderr, "       Use 'make q115' for Q1.15 builds.\n");
       exit(EXIT_FAILURE);
     }
     if (compiled_mode != requested_quant_mode) {
@@ -2086,7 +2162,8 @@ int main(int argc, char *argv[]) {
               "ERROR: Requested quantization mode Q1.%d but binary was "
               "compiled with Q1.15.\n",
               requested_quant_mode == 115 ? 15 : 31);
-      fprintf(stderr, "       Use the correct binary: train_gpt3q115cu\n");
+            fprintf(stderr,
+              "       Use the correct binary: train_gpt3q115cu\n");
       exit(EXIT_FAILURE);
     }
     printf("Quantization mode Q1.15 verified.\n");
@@ -2387,6 +2464,8 @@ int main(int argc, char *argv[]) {
       float val_perplexity = expf(val_loss);
       printf0("val loss %f | val perplexity %f\n", val_loss, val_perplexity);
       logger_log_val(&logger, step, val_loss);
+      logger_log_val_metrics_txt(&logger, "gpt3", step, val_loss,
+                                 val_perplexity);
     }
 
     // once in a while estimate HellaSwag accuracy (all processes collaborate)

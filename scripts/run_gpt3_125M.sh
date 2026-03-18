@@ -6,9 +6,13 @@
 # on 8X A100 80GB SXM ($14/hr) steps in ~150ms/iter
 # => training time 572,204 * 150ms ~= 24 hours ~= $336
 
-make train_gpt2cu USE_CUDNN=1
-out_dir="log_gpt3_125M"
+make train_gpt3q115cu
+
+out_dir="log_gpt3_125M_sf16"
 done_file="$out_dir/DONE_00572204"
+resume="${RESUME:-0}"
+skip_loss_z="${SKIP_LOSS_Z:-0.0}"
+skip_grad_z="${SKIP_GRAD_Z:-0.0}"
 
 while true; do
 
@@ -18,10 +22,10 @@ while true; do
         break
     fi
 
-    mpirun -np 8 ./train_gpt2cu \
+    mpirun -np 8 ./train_gpt3q115cu \
                 -i "dev/data/fineweb100B/fineweb_train_*.bin" \
                 -j "dev/data/fineweb100B/fineweb_val_*.bin" \
-                -o $out_dir \
+                -o "$out_dir" \
                 -v 250 -s 20000 -g 144 \
                 -h 1 \
                 -b 32 -t 2048 \
@@ -31,14 +35,15 @@ while true; do
                 -c 0.1 \
                 -l 0.0006 \
                 -q 0.1 \
+                -Q 115 \
                 -u 700 \
                 -n 10000 \
                 -nk 5 \
                 -nm 50000 \
                 -ge 1 \
-                -sl 7.0 \
-                -sg 7.0 \
-                -y 1 \
+                -sl "$skip_loss_z" \
+                -sg "$skip_grad_z" \
+                -y "$resume" \
                 -x 572204 \
                 -e "gpt3:c768"
 
