@@ -11,8 +11,6 @@ Attention, as a fallback when we do not use the Flash Attention from cuDNN
 #if defined(SF16_TRUE_FORWARD)
 #include "q131_common.cuh"
 #endif
-#elif defined(ENABLE_Q131)
-#include "q131_common.cuh"
 #endif
 
 constexpr int FLASH_WARPS_PER_BLOCK = 4;
@@ -20,9 +18,7 @@ constexpr int FLASH_K_TILE = 32;
 constexpr int FLASH_MAX_HEAD_DIM = 128;
 
 __device__ __forceinline__ float quantize_attention_score(float x) {
-#if defined(ENABLE_Q131)
-  return simulate_q131(x * 8.0f);
-#elif defined(ENABLE_Q115)
+#if   defined(ENABLE_Q115)
   return simulate_q115(x);
 #else
   return x;
@@ -30,9 +26,7 @@ __device__ __forceinline__ float quantize_attention_score(float x) {
 }
 
 __device__ __forceinline__ float quantize_attention_output(float x) {
-#if defined(ENABLE_Q131)
-  return simulate_q131(x);
-#elif defined(ENABLE_Q115)
+#if   defined(ENABLE_Q115)
 #if defined(SF16_TRUE_FORWARD)
   x = simulate_q131(x);
 #endif
@@ -511,9 +505,7 @@ void attention_backward(floatX *dinp, floatX *dqkvr, floatX *datt,
   matmul_cublaslt(dv, scratch, att, nullptr, HS, T, T, stream, false, true,
                   B * NH, T * HS, T * T, T * HS);
 
-#if defined(ENABLE_Q131)
-  const float att_scale = 8.0f;
-#elif defined(ENABLE_Q115)
+#if   defined(ENABLE_Q115)
   const float att_scale = 1.0f;
 #else
   const float att_scale = 1.0f;
@@ -537,3 +529,4 @@ void attention_backward(floatX *dinp, floatX *dqkvr, floatX *datt,
       dinp, dq, dk, dv, B, T, NH, HS);
   cudaCheck(cudaGetLastError());
 }
+

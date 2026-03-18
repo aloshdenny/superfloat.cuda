@@ -7,8 +7,6 @@ AdamW kernel
 #include "cuda_utils.cuh"
 #if defined(ENABLE_Q115)
 #include "q115_common.cuh"
-#elif defined(ENABLE_Q131)
-#include "q131_common.cuh"
 #endif
 
 // ----------------------------------------------------------------------------
@@ -93,17 +91,7 @@ __device__ void adamw_update(Tp* params_memory, float* master_params_memory, Tg*
     
     // fetch the old value of this parameter as a float
     float old_param;
-#if defined(ENABLE_Q131) && !defined(FIXED_POINT_Q31)
-    // In true Q1.31 mode, only q131_t storage should use q131 conversions.
-    if constexpr (std::is_same_v<Tp, q131_t>) {
-        old_param = q131_to_float(params_memory[idx]);
-        if (master_params_memory != NULL) {
-            old_param = master_params_memory[idx];
-        }
-    } else {
-        old_param = (master_params_memory != NULL) ? master_params_memory[idx] : (float)params_memory[idx];
-    }
-#elif defined(ENABLE_Q115)
+#if   defined(ENABLE_Q115)
     // In Q1.15 mode, only q115_t storage should use q115 conversions.
     if constexpr (std::is_same_v<Tp, q115_t>) {
         // Convert from Q1.15 to float
@@ -123,16 +111,7 @@ __device__ void adamw_update(Tp* params_memory, float* master_params_memory, Tg*
     float param = old_param - (learning_rate * (m / (sqrtf(v) + eps) + weight_decay * old_param));
     
     // Store updated parameter
-#if defined(ENABLE_Q131)
-    if constexpr (std::is_same_v<Tp, q131_t>) {
-        // Clamp to Q1.31 range and convert from float to Q1.31
-        param = fmaxf(Q131_WEIGHT_MIN, fminf(Q131_WEIGHT_MAX, param));
-        params_memory[idx] = float_to_q131(param);
-    } else {
-        // use stochastic rounding for non-Q1.31 types
-        stochastic_rounding(param, &params_memory[idx], seed);
-    }
-#elif defined(ENABLE_Q115)
+#if   defined(ENABLE_Q115)
     if constexpr (std::is_same_v<Tp, q115_t>) {
         // Convert from float to Q1.15
         params_memory[idx] = float_to_q115(param);
@@ -206,3 +185,4 @@ void init_from_master(Tp* params_memory, float* master_params_memory, size_t num
                              (params_memory, master_params_memory, num_parameters, w_stride, s_stride, seed);
     cudaCheck(cudaGetLastError());
 }
+
