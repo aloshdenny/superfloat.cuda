@@ -1938,11 +1938,11 @@ void error_usage() {
                   "goes above this in zscore (0.0f=off)\n");
   // evaluation
   fprintf(stderr, "  -v <int>    val_loss_every, how often we evaluate val "
-                  "loss (default = 1000)\n");
+                  "loss (default = 100)\n");
   fprintf(stderr, "  -m <int>    val_max_steps, up to how many val batches to "
                   "estimate val loss? (default = 20)\n");
   fprintf(stderr, "  -s <int>    sample_every, how often we inference the "
-                  "model (default = 20)\n");
+                  "model (default = 100)\n");
   fprintf(
       stderr,
       "  -g <int>    genT, how many steps of inference we do (default = 64)\n");
@@ -2012,10 +2012,10 @@ int main(int argc, char *argv[]) {
   float skip_update_gradz =
       0.0f;                // skip update if grad_norm goes above this in zscore
   int val_loss_every =
-      1000; // every how many steps do we eval validation loss?
+      100; // every how many steps do we eval validation loss?
   int val_max_steps =
       20;                // how many batches max do we eval for validation loss?
-  int sample_every = 20; // every how many steps to do inference?
+  int sample_every = 100; // every how many steps to do inference?
   int genT = 64;         // number of steps of inference we will do
   int overfit_single_batch =
       0; // useful for debugging, 1 = only load a single data batch once
