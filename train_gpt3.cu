@@ -2464,6 +2464,8 @@ int main(int argc, char *argv[]) {
       float val_perplexity = expf(val_loss);
       printf0("val loss %f | val perplexity %f\n", val_loss, val_perplexity);
       logger_log_val(&logger, step, val_loss);
+      logger_log_val_metrics_txt(&logger, "gpt3", step, val_loss,
+                                 val_perplexity);
     }
 
     // once in a while estimate HellaSwag accuracy (all processes collaborate)
