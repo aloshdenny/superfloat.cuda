@@ -32,15 +32,13 @@ cuBLAS related utils
 #define CUBLAS_COMPUTE_32F_FAST_16BF CUBLAS_COMPUTE_32F
 #endif
 
-// a good default for max workspace size is ~256MB
-// it will be only used during heuristic search, but won't be fully exhausted if unnecessary
-const size_t cublaslt_workspace_size = 256 * 1024 * 1024;
+// Keep workspace small to avoid OOM on memory-constrained runs.
+// 4 MiB is more than enough for cuBLASLt to find Tensor Core BF16 algorithms.
+const size_t cublaslt_workspace_size = 4 * 1024 * 1024;
 void *cublaslt_workspace = NULL;
-#if defined(ENABLE_Q115) && defined(SF16_TRUE_FORWARD)
-cublasComputeType_t cublas_compute = CUBLAS_COMPUTE_32F_FAST_16BF;
-#else
-cublasComputeType_t cublas_compute = CUBLAS_COMPUTE_32F_FAST_16BF;
-#endif
+// For BF16 inputs with FP32 accumulation, CUBLAS_COMPUTE_32F is the correct
+// compute type per NVIDIA docs. _FAST_16BF and _FAST_TF32 are for FP32 inputs.
+cublasComputeType_t cublas_compute = CUBLAS_COMPUTE_32F;
 cublasLtHandle_t cublaslt_handle;
 
 // ----------------------------------------------------------------------------

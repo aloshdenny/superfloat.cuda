@@ -169,10 +169,9 @@ void matmul_cublaslt(floatX *d, const floatX *a, const floatX *b,
   }
 #endif
 
-  // check alignment (some modes work unaligned but it always best to be aligned
-  // for performance)
+  // check alignment (only for non-null pointers)
   if (((uintptr_t)a % 16) != 0 || ((uintptr_t)b % 16) != 0 ||
-      ((uintptr_t)d % 16) != 0 || ((uintptr_t)bias % 16) != 0) {
+      ((uintptr_t)d % 16) != 0 || (has_bias && ((uintptr_t)bias % 16) != 0)) {
     printf("All cuBLASLt pointers must be aligned!\n");
     exit(EXIT_FAILURE);
   }
@@ -297,15 +296,47 @@ void matmul_cublaslt(floatX *d, const floatX *a, const floatX *b,
                                              CUBLASLT_MATMUL_DESC_SCALE_TYPE,
                                              &scale_type, sizeof(scale_type)));
 
-  // find a suitable algorithm (cached internally so shouldn't take much CPU
-  // time in practice)
+  // find a suitable algorithm
   cublasLtMatmulAlgoGetHeuristic(cublaslt_handle, operationDesc, ALayout,
                                  BLayout, CLayout, DLayout, preference, 1,
                                  &heuristic, &returnedResults);
   if (returnedResults == 0) {
-    printf("No cuBLASLt algorithm: m: %d, n: %d, k: %d, bias: %d\n", n, m, k,
-           has_bias);
-    exit(EXIT_FAILURE);
+    // Retry with CUBLAS_COMPUTE_32F_FAST_TF32 — on some CUDA driver versions,
+    // CUBLAS_COMPUTE_32F returns 0 algorithms for BF16 matmuls without bias.
+    cublasComputeType_t fallback_compute = CUBLAS_COMPUTE_32F_FAST_TF32;
+    cublasLtMatmulDesc_t fallbackDesc;
+    cublasCheck(cublasLtMatmulDescCreate(&fallbackDesc, fallback_compute, CUDA_R_32F));
+    cublasCheck(cublasLtMatmulDescSetAttribute(
+        fallbackDesc, CUBLASLT_MATMUL_DESC_TRANSA,
+        (transA) ? &opTranspose : &opNoTranspose, sizeof(opTranspose)));
+    cublasCheck(cublasLtMatmulDescSetAttribute(
+        fallbackDesc, CUBLASLT_MATMUL_DESC_TRANSB,
+        (transB) ? &opTranspose : &opNoTranspose, sizeof(opNoTranspose)));
+    cublasCheck(cublasLtMatmulDescSetAttribute(
+        fallbackDesc, CUBLASLT_MATMUL_DESC_EPILOGUE, &epilogue, sizeof(epilogue)));
+    cublasCheck(cublasLtMatmulDescSetAttribute(
+        fallbackDesc, CUBLASLT_MATMUL_DESC_SCALE_TYPE, &scale_type, sizeof(scale_type)));
+    if (has_bias) {
+        cublasDataType_t bias_data_type = (sizeof(floatX) == 1) ? CUDA_R_16BF : CUBLAS_LOWP;
+        cublasCheck(cublasLtMatmulDescSetAttribute(
+            fallbackDesc, CUBLASLT_MATMUL_DESC_BIAS_DATA_TYPE, &bias_data_type, sizeof(bias_data_type)));
+        cublasCheck(cublasLtMatmulDescSetAttribute(
+            fallbackDesc, CUBLASLT_MATMUL_DESC_BIAS_POINTER, &bias, sizeof(bias)));
+    }
+    int fallbackResults = 0;
+    cublasLtMatmulAlgoGetHeuristic(cublaslt_handle, fallbackDesc, ALayout,
+                                   BLayout, CLayout, DLayout, preference, 1,
+                                   &heuristic, &fallbackResults);
+    if (fallbackResults > 0) {
+      printf("cuBLASLt: using TF32 fallback for m=%d n=%d k=%d\n", m, n, k);
+      cublasCheck(cublasLtMatmulDescDestroy(operationDesc));
+      operationDesc = fallbackDesc;
+      returnedResults = fallbackResults;
+    } else {
+      cublasCheck(cublasLtMatmulDescDestroy(fallbackDesc));
+      printf("No cuBLASLt algorithm: m: %d, n: %d, k: %d, bias: %d\n", n, m, k, has_bias);
+      exit(EXIT_FAILURE);
+    }
   }
 
   // set whether to accumulate (i.e. D += C) or not - note this isn't considered
