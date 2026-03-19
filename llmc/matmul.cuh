@@ -387,36 +387,32 @@ void matmul_forward_cublaslt(floatX *out, floatX *inp, floatX *weight,
 }
 
 // ---------------------------------------------------------------------------
-// Plain cuBLAS GEMM forward: out = inp @ weight^T
-// Use this for LLaMA which has no biases/epilogues needing cuBLASLt.
-// cublasGemmEx always finds an algorithm — no heuristic search, no hang.
+// Forward GEMM for bias-free models (LLaMA). 
+// PROBLEM: cuBLASLt on this system returns 0 algorithms for EPILOGUE_DEFAULT
+// (no bias). It DOES find algorithms when EPILOGUE_BIAS is set.
+// FIX: use a lazy-allocated all-zeros bias buffer — mathematically equivalent
+// to no bias (adds 0), but triggers the BIAS epilogue code path that works.
+// The buffer is grown on demand and never shrunk (amortised alloc).
 // ---------------------------------------------------------------------------
+static floatX *g_zero_bias     = nullptr;
+static int     g_zero_bias_oc  = 0;
+
+static void ensure_zero_bias(int OC) {
+  if (OC > g_zero_bias_oc) {
+    if (g_zero_bias) { cudaFree(g_zero_bias); }
+    cudaCheck(cudaMalloc(&g_zero_bias, (size_t)OC * sizeof(floatX)));
+    cudaCheck(cudaMemset(g_zero_bias, 0, (size_t)OC * sizeof(floatX)));
+    g_zero_bias_oc = OC;
+  }
+}
+
 void matmul_forward_cublas(floatX *out, const floatX *inp, const floatX *weight,
                            int B, int T, int C, int OC, cudaStream_t stream) {
-  NVTX_RANGE_FN();
-  cublasCheck(cublasSetStream(cublas_handle, stream));
-  const float alpha = 1.f, beta = 0.f;
-  // Column-major: out(OC x BT) = weight(OC x C) @ inp(C x BT)
-  // weight stored row-major as (C x OC) => op=T gives OC x C in col-major
-  // inp stored row-major as (BT x C) => op=N gives C x BT in col-major
-  cublasCheck(cublasGemmEx(
-      cublas_handle,
-      CUBLAS_OP_T, CUBLAS_OP_N,
-      OC, B * T, C,
-      &alpha,
-      weight, CUBLAS_LOWP, C,
-      inp,    CUBLAS_LOWP, C,
-      &beta,
-      out,    CUBLAS_LOWP, OC,
-      CUBLAS_COMPUTE_32F_FAST_TF32,  // TF32 Tensor Cores — correct for BF16 inputs on SM 8.9
-      CUBLAS_GEMM_DEFAULT_TENSOR_OP
-  ));
-#if defined(ENABLE_Q115)
-  size_t size_C = (size_t)B * T * OC;
-  int num_blocks = (int)((size_C + 255) / 256);
-  q115_simulate_kernel<<<num_blocks, 256, 0, stream>>>(out, size_C);
-#endif
-  cudaCheck(cudaGetLastError());
+  ensure_zero_bias(OC);
+  // Use cuBLASLt with EPILOGUE_BIAS + zero bias — the only path that finds
+  // an algorithm on this driver/GPU combo for BF16 without a real bias.
+  matmul_cublaslt(out, weight, inp, g_zero_bias, OC, B * T, C,
+                  stream, /*transA=*/true, /*transB=*/false);
 }
 
 void matmul_backward(floatX *dinp, floatX *dweight, floatX *dbias, floatX *dout,

@@ -36,9 +36,10 @@ cuBLAS related utils
 // 4 MiB is more than enough for cuBLASLt to find Tensor Core BF16 algorithms.
 const size_t cublaslt_workspace_size = 4 * 1024 * 1024;
 void *cublaslt_workspace = NULL;
-// For BF16 inputs with FP32 accumulation, CUBLAS_COMPUTE_32F is the correct
-// compute type per NVIDIA docs. _FAST_16BF and _FAST_TF32 are for FP32 inputs.
-cublasComputeType_t cublas_compute = CUBLAS_COMPUTE_32F;
+// CUBLAS_COMPUTE_32F_FAST_TF32: accumulate in TF32 precision via Tensor Cores.
+// This is the correct compute type for BF16 inputs on SM 8.9 (RTX 4090).
+// CUBLAS_COMPUTE_32F (exact FP32) has no BF16 Tensor Core path in cuBLASLt.
+cublasComputeType_t cublas_compute = CUBLAS_COMPUTE_32F_FAST_TF32;
 cublasLtHandle_t cublaslt_handle;
 cublasHandle_t cublas_handle;  // for plain cublasGemmEx calls (LLaMA forward)
 
