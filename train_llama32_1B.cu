@@ -144,6 +144,8 @@ typedef struct {
 // SwiGLU MLP: gate_w (w1), up_w (w3), down_w (w2).
 // ============================================================================
 
+floatX *global_zeros_bias = nullptr;
+
 constexpr const int NUM_PARAMETER_TENSORS = 9;
 typedef struct {
     floatX *wte;      // (Vp, C)           — token embedding + lm_head (tied)
@@ -822,9 +824,8 @@ void llama32_forward(LLaMA32 *model, const int *inputs, size_t B, size_t T) {
         rmsnorm_forward(l_rms1, l_rms1_r, residual, l_rms1w,
                         B, T, C, model->config.norm_eps, main_stream);
 
-        // --- QKV projection ---
-        matmul_forward_cublaslt(l_qkvr, l_rms1, l_qkvw, /*bias=*/nullptr,
-                                B, T, C, (int)((NH+2*NKV)*HD), main_stream);
+        // 1) QKV projection
+        matmul_forward_cublaslt(l_qkvr, l_rms1, l_qkvw, global_zeros_bias, B, T, C, qkv_dim, main_stream);
 
         // --- RoPE ---
         rope_forward(l_qkvr, model->d_freqs_cis,
@@ -858,28 +859,24 @@ void llama32_forward(LLaMA32 *model, const int *inputs, size_t B, size_t T) {
             cudaCheck(cudaMemset(l_att, 0, B * NH * T * T * sizeof(floatX)));
         attention_forward(l_atty, l_qkvr, l_att, scratch, B, T, C, NH, main_stream);
 
-        // --- Attention output projection + residual ---
-        matmul_forward_cublaslt(scratch, l_atty, l_attn_ow, /*bias=*/nullptr,
-                                B, T, C, C, main_stream);
+        // 3) Output projection
+        matmul_forward_cublaslt(scratch, l_atty, l_attn_ow, global_zeros_bias, B, T, C, C, main_stream);
 
         // residual2 = residual + attn_out; pre-FFN RMSNorm -> l_rms2
         fused_residual_forward5(l_res2, l_rms2, l_rms2_r, /*mean=*/nullptr,
                                 residual, scratch, l_rms2w, /*b=*/nullptr,
                                 B*T, C, main_stream);
 
-        // --- SwiGLU MLP ---
-        // gate branch: gate_w @ rms2
-        matmul_forward_cublaslt(l_gate_a, l_rms2, l_gate_w, nullptr,
-                                B, T, C, (int)FFN, main_stream);
+        // 4) FFN
+        // gate branch:
+        matmul_forward_cublaslt(l_gate_a, l_rms2, l_gate_w, global_zeros_bias, B, T, C, ffn_dim, main_stream);
         // up branch: up_w @ rms2  (use swiglu_out as temp storage for up_act)
-        matmul_forward_cublaslt(l_swiglu, l_rms2, l_up_w, nullptr,
-                                B, T, C, (int)FFN, main_stream);
+        matmul_forward_cublaslt(l_swiglu, l_rms2, l_up_w, global_zeros_bias, B, T, C, ffn_dim, main_stream);
         // pointwise: gate_a = silu(gate_a), swiglu = gate_a * up
         swiglu_forward(l_gate_a, l_up_a, l_gate_a, l_swiglu, B*T*FFN, main_stream);
 
-        // down projection: scratch = down_w @ swiglu
-        matmul_forward_cublaslt(scratch, l_up_a, l_down_w, nullptr,
-                                B, T, (int)FFN, C, main_stream);
+        // Down projection
+        matmul_forward_cublaslt(scratch, l_up_a, l_down_w, global_zeros_bias, B, T, ffn_dim, C, main_stream);
 
         // residual3 = residual2 + mlp_out; pre-next-layer RMSNorm fused in
         if (l + 1 != (int)L) {
@@ -898,8 +895,7 @@ void llama32_forward(LLaMA32 *model, const int *inputs, size_t B, size_t T) {
     } // end layer loop
 
     // 3. LM head: logits = rms_f @ wte^T  (tied weights)
-    matmul_forward_cublaslt(acts.output, acts.rms_f, params.wte, nullptr,
-                            B, T, C, (int)Vp, main_stream);
+    matmul_forward_cublaslt(acts.output, acts.rms_f, params.wte, global_zeros_bias, B, T, C, Vp, main_stream);
     cudaCheck(cudaDeviceSynchronize());
 }
 
@@ -1328,6 +1324,8 @@ int main(int argc, char *argv[]) {
     if (tensorcores) cudaCheck(cudaDeviceSetLimit(cudaLimitDevRuntimeSyncDepth, 1));
     cublasCheck(cublasLtCreate(&cublaslt_handle));
     cudaCheck(cudaMalloc(&cublaslt_workspace, cublaslt_workspace_size));
+    cudaCheck(cudaMalloc(&global_zeros_bias, 16384 * sizeof(floatX)));
+    cudaCheck(cudaMemset(global_zeros_bias, 0, 16384 * sizeof(floatX)));
 
     // ---- Batch size logic ----
     int B = batch_size;
