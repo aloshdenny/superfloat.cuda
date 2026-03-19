@@ -2464,7 +2464,7 @@ int main(int argc, char *argv[]) {
       0; // major checkpoints never get deleted when maintaining history
   int resume =
       0;      // resume the optimization, if one is found inside output_log_dir?
-  int B = 8; // batch size (RTX 4090: 24GB VRAM can easily handle B=16 for
+  int B = 1024; // batch size (RTX 4090: 24GB VRAM can easily handle B=16 for
               // GPT-2 124M)
   int T = 1024; // sequence length max
   int total_batch_size =
