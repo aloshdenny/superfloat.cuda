@@ -67,6 +67,7 @@ Usage:
 #include <unistd.h>
 #endif
 #include <stdarg.h>
+// Recompiling with updated cuBLAS compute types and workspace size
 #include <stdio.h>
 #include <stdlib.h>
 #include <string>
@@ -1244,8 +1245,8 @@ int main(int argc, char *argv[]) {
     const char *input_bin    = "dev/data/fineweb100B/fineweb_train_*.bin";
     const char *input_val_bin= "dev/data/fineweb100B/fineweb_val_*.bin";
     const char *output_dir   = "";
-    int batch_size           = 4;
-    int sequence_length      = 512;
+    int batch_size           = 1;
+    int sequence_length      = 128;
     int total_batch_size     = 0;        // 0 = auto (B*T*ddp_world)
     int num_iterations       = -1;       // -1 = auto
     int inference_only       = 0;

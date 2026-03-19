@@ -32,9 +32,9 @@ cuBLAS related utils
 #define CUBLAS_COMPUTE_32F_FAST_16BF CUBLAS_COMPUTE_32F
 #endif
 
-// 64 MiB workspace — RTX 4090 has ample VRAM and larger workspace lets
-// cuBLASLt pick faster tile-splitting algorithms for big matmuls.
-const size_t cublaslt_workspace_size = 64 * 1024 * 1024;
+// a good default for max workspace size is ~256MB
+// it will be only used during heuristic search, but won't be fully exhausted if unnecessary
+const size_t cublaslt_workspace_size = 256 * 1024 * 1024;
 void *cublaslt_workspace = NULL;
 #if defined(ENABLE_Q115) && defined(SF16_TRUE_FORWARD)
 cublasComputeType_t cublas_compute = CUBLAS_COMPUTE_32F_FAST_16BF;
