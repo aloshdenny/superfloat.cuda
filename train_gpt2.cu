@@ -380,7 +380,7 @@ typedef struct {
 
 } GPT2;
 
-ShardedTensorInfo gpt2_get_tensor_at_layer(const GPT2 *model, int layer_id,
+ShardInfo gpt2_get_tensor_at_layer(const GPT2 *model, int layer_id,
                                    int param_tensor_id);
 
 void gpt2_init_common(GPT2 *model) {
@@ -736,13 +736,16 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char *checkpoint_path,
               "---> HINT: are you sure you're loading a _bf16.bin file?\n");
       exit(EXIT_FAILURE);
     }
-    if (PRECISION_MODE == PRECISION_FP32 && !(version == 3
-                                              )) {
+    if (PRECISION_MODE == PRECISION_FP32 && !(version == 3)) {
       fprintf(stderr,
               "Precision is configured as FP32 but model at %s is not.\n",
               checkpoint_path);
       fprintf(stderr, "---> HINT: to turn on FP32 you have to compile like: "
                       "`make train_gpt2cu PRECISION=FP32`\n");
+      fprintf(stderr, "---> HINT: are you sure you're loading a .bin file "
+                      "without any _bf16 in the name?\n");
+      exit(EXIT_FAILURE);
+    }
     if (PRECISION_MODE == PRECISION_Q115 && !(version == 3 || version == 5)) {
       fprintf(stderr,
               "Precision is configured as Q1.15 but checkpoint version "
@@ -755,6 +758,7 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char *checkpoint_path,
       gpt2_init_random(model, 1024, 50257, 12, 12, 768);
       return;
     }
+  }
 
   // read in hyperparameters
   model->config.max_seq_len = model_header[2];
