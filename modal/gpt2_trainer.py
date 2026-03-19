@@ -8,7 +8,7 @@ image = (
     .apt_install("git", "make", "gcc", "wget", "curl")
     .pip_install("torch", "numpy", "tiktoken", "requests", "tqdm", "transformers", "datasets")  # fineweb.py deps
     .run_commands(
-        "git clone https://github.com/aloshdenny/superfloat.cuda.git /workspace",
+        "git clone --branch modal --single-branch https://github.com/aloshdenny/superfloat.cuda.git /workspace",
     )
     .workdir("/workspace")
 )

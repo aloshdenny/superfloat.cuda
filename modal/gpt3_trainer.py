@@ -6,7 +6,7 @@ image = (
     modal.Image.from_registry("nvidia/cuda:12.4.0-devel-ubuntu22.04", add_python="3.11")
     .apt_install("git", "make", "gcc", "wget", "curl")
     .run_commands(
-        "git clone https://github.com/aloshdenny/superfloat.cuda.git /workspace",
+        "git clone --branch modal --single-branch https://github.com/aloshdenny/superfloat.cuda.git /workspace",
     )
     .workdir("/workspace")
 )
