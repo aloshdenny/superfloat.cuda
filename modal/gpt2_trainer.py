@@ -31,11 +31,11 @@ def train():
     if not os.path.exists(marker):
         print("==> Downloading FineWeb 10B dataset...")
 
-        subprocess.run(["chmod", "+x", "fineweb.sh"], check=True)
+        subprocess.run(["chmod", "+x", "dev/data/fineweb.sh"], check=True)
 
         # Example: first 100 shards (adjust as needed)
         subprocess.run(
-            ["bash", "/workspace/dev/data/fineweb.sh", "-10"],
+            ["bash", "dev/data/fineweb.sh", "-10"],
             check=True
         )
 
