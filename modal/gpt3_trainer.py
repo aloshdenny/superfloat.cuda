@@ -18,38 +18,51 @@ volume = modal.Volume.from_name("fineweb100b-data", create_if_missing=True)
     gpu="B200",
     timeout=60 * 60 * 24,
     volumes={"/workspace/fineweb100B": volume},
+    memory=131072
 )
 def train():
-    import subprocess, os
+    import subprocess, os, sys
 
     os.chdir("/workspace")
 
+    def run(cmd, **kwargs):
+        """Run a command and stream output line-by-line to Modal logs."""
+        process = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,   # merge stderr into stdout
+            text=True,
+            bufsize=1,                  # line-buffered
+            env={**os.environ, "PYTHONUNBUFFERED": "1"},
+            **kwargs
+        )
+        for line in process.stdout:
+            print(line, end="", flush=True)
+        process.wait()
+        if process.returncode != 0:
+            raise subprocess.CalledProcessError(process.returncode, cmd)
+
     marker = "/workspace/fineweb100B/.dataset_ready"
 
-    # Step 1: Download dataset
     if not os.path.exists(marker):
-        print("==> Downloading FineWeb 100B dataset...")
-
-        subprocess.run(["chmod", "+x", "dev/data/fineweb.sh"], check=True)
-
-        # Example: 200 shards (or remove arg for full dataset)
-        subprocess.run(
-            ["bash", "dev/data/fineweb.sh", "-100"],
-            check=True
-        )
-
+        print("==> Downloading FineWeb 100B dataset...", flush=True)
+        run(["chmod", "+x", "dev/data/fineweb.sh"])
+        run(["bash", "dev/data/fineweb.sh", "-100"])
         open(marker, "w").close()
         volume.commit()
     else:
-        print("==> Dataset already cached.")
+        print("==> Dataset already cached.", flush=True)
 
-    # Step 2: Compile
-    print("==> Compiling train_gpt3.cu...")
-    subprocess.run(["make", "train_gpt3cu"], check=True)
+    print("==> Compiling train_gpt3.cu...", flush=True)
+    run(["make", "train_gpt3cu"])
 
-    # Step 3: Train
-    print("==> Starting GPT-3 training...")
-    subprocess.run(["./train_gpt3cu"], check=True)
+    print("==> Starting GPT-3 training...", flush=True)
+    run([
+        "./train_gpt3cu",
+        "-i", "/workspace/fineweb100B/fineweb_train_*.bin",
+        "-j", "/workspace/fineweb100B/fineweb_val_*.bin",
+        "-v", "1",
+    ])
 
 
 @app.local_entrypoint()
