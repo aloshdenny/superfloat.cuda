@@ -6,8 +6,6 @@
 #include "cuda_common.h"
 #if defined(ENABLE_Q115)
 #include "q115_common.cuh"
-#elif defined(ENABLE_Q131)
-#include "q131_common.cuh"
 #endif
 
 // ----------------------------------------------------------------------------
@@ -140,17 +138,6 @@ template <> __device__ int16_t cast_value<int16_t, float>(float val) {
   float scaled = val * 32768.0f;
   int32_t rounded = __float2int_rn(scaled);
   return (int16_t)max(-32768, min(32767, rounded));
-}
-#elif defined(ENABLE_Q131)
-template <> __device__ float cast_value<float, int32_t>(int32_t val) {
-  // Q1.31 to float conversion
-  return (float)((double)val / 2147483648.0);
-}
-
-template <> __device__ int32_t cast_value<int32_t, float>(float val) {
-  // Float to Q1.31 conversion with clamping
-  double clamped = fmax(-1.0, fmin(0.9999999995, (double)val));
-  return (int32_t)(clamped * 2147483648.0);
 }
 #endif
 
@@ -346,12 +333,6 @@ __device__ __forceinline__ void stochastic_rounding(float in, int16_t *out,
                                                     unsigned int seed) {
   // For Q1.15 mode, use deterministic rounding via float_to_q115
   *out = float_to_q115(in);
-}
-#elif defined(ENABLE_Q131)
-__device__ __forceinline__ void stochastic_rounding(float in, int32_t *out,
-                                                    unsigned int seed) {
-  // For Q1.31 mode, use deterministic rounding via float_to_q131
-  *out = float_to_q131(in);
 }
 #endif
 

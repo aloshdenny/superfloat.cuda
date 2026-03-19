@@ -155,13 +155,11 @@ endif
 # ===============================
 TARGETS = train_gpt2 test_gpt2 train_gpt2cu train_gpt2rawcu train_gpt3cu test_gpt2cu train_gpt2fp32cu test_gpt2fp32cu $(NVCC_CUDNN)
 
-TARGETS_Q131 = train_gpt2q131cu train_gpt3q131cu
 TARGETS_Q115 = train_gpt2q115cu train_gpt3q115cu
 TARGETS_Q115_CONSTRAINED = train_gpt2q115_constrainedcu
 
-.PHONY: all clean libsyms run q131 q115 q115_constrained
+.PHONY: all clean libsyms run q115 q115_constrained
 all: $(TARGETS)
-q131: $(TARGETS_Q131)
 q115: $(TARGETS_Q115)
 q115_constrained: $(TARGETS_Q115_CONSTRAINED)
 
@@ -218,15 +216,6 @@ profile_gpt2cu: profile_gpt2.cu libsyms $(NVCC_CUDNN)
 	$(NVCC) $(NVCC_FLAGS) $(PFLAGS) -lineinfo $(NVCC_INCLUDES) $< $(NVCC_CUDNN) $(NVCC_LDFLAGS) $(NVCC_LDLIBS) $(CUDA_OUTPUT_FILE)
 
 # ===============================
-# Quantized CUDA targets (Q1.31)
-# ===============================
-train_gpt2q131cu: train_gpt2.cu libsyms $(NVCC_CUDNN)
-	$(NVCC) $(NVCC_FLAGS) $(PFLAGS) -DENABLE_Q131 -DFIXED_POINT_Q31 $(NVCC_INCLUDES) $< $(NVCC_CUDNN) $(NVCC_LDFLAGS) $(NVCC_LDLIBS) $(CUDA_OUTPUT_FILE)
-
-train_gpt3q131cu: train_gpt3.cu libsyms $(NVCC_CUDNN)
-	$(NVCC) $(NVCC_FLAGS) $(PFLAGS) -DENABLE_Q131 -DFIXED_POINT_Q31 $(NVCC_INCLUDES) $< $(NVCC_CUDNN) $(NVCC_LDFLAGS) $(NVCC_LDLIBS) $(CUDA_OUTPUT_FILE)
-
-# ===============================
 # Quantized CUDA targets (Q1.15)
 # ===============================
 train_gpt2q115cu: train_gpt2.cu libsyms $(NVCC_CUDNN)
@@ -251,6 +240,6 @@ run: train_gpt2cu
 # Clean
 # ===============================
 clean:
-	$(REMOVE_FILES) train_gpt2cu train_gpt2fp32cu train_gpt2q131cu train_gpt2q115cu *.o \
+	$(REMOVE_FILES) train_gpt2cu train_gpt2fp32cu train_gpt2q115cu *.o \
 	      libcublas.so libcublas.so.12 libcublasLt.so libcublasLt.so.12 libnvml.so libnvml.so.1
 	$(REMOVE_BUILD_OBJECT_FILES)

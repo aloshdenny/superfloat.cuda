@@ -25,8 +25,6 @@ For Q1.31 mode: Uses standard LayerNorm in FP32
 #include "cuda_utils.cuh"
 #if defined(ENABLE_Q115)
 #include "q115_common.cuh"
-#elif defined(ENABLE_Q131)
-#include "q131_common.cuh"
 #endif
 
 // ----------------------------------------------------------------------------
@@ -131,51 +129,7 @@ __global__ void rmsnorm_q_backward_kernel(floatX* dinp, floatX* dweight,
 __global__ void layernorm_forward_kernel3(floatX* __restrict__ out, float* __restrict__ mean, float* __restrict__ rstd,
                                     const floatX*  __restrict__ inp, const floatX*  __restrict__ weight,
                                     const floatX* __restrict__ bias, int N, int C) {
-#if defined(ENABLE_Q131)
-    // For Q1.31: Use standard LayerNorm computed in FP32
-    // Q1.31 has enough precision for proper LayerNorm
-    int lane_id = threadIdx.x % WARP_SIZE;
-    int warp_id = threadIdx.x / WARP_SIZE;
-    int num_warps = blockDim.x / WARP_SIZE;
-
-    int idx = blockIdx.x * num_warps + warp_id;
-    if(idx >= N) { return; }
-
-    const floatX* x = inp + idx * C;
-
-    // Compute mean
-    float sum = 0.0f;
-    for (int i = lane_id; i < C; i += WARP_SIZE) {
-        sum += q131_to_float(x[i]);
-    }
-    sum = warpReduceSum(sum);
-    float m = sum / C;
-    if(lane_id == 0 && mean != nullptr) {
-        __stcs(mean + idx, m);
-    }
-
-    // Compute variance
-    float var_sum = 0.0f;
-    for (int i = lane_id; i < C; i += WARP_SIZE) {
-        float val = q131_to_float(x[i]);
-        float diff = val - m;
-        var_sum += diff * diff;
-    }
-    var_sum = warpReduceSum(var_sum);
-    float s = rsqrtf(var_sum / C + Q131_LAYERNORM_EPS);
-    if(lane_id == 0 && rstd != nullptr) {
-        __stcs(rstd + idx, s);
-    }
-
-    // Normalize and scale
-    floatX* o = out + idx * C;
-    for (int c = lane_id; c < C; c += WARP_SIZE) {
-        float val = q131_to_float(__ldcs(x + c));
-        float normalized = (val - m) * s;
-        float result = normalized * q131_to_float(weight[c]) + q131_to_float(bias[c]);
-        __stcs(o + c, float_to_q131(result));
-    }
-#elif defined(ENABLE_Q115)
+#if   defined(ENABLE_Q115)
     // For Q1.15: Use RMSNorm instead of LayerNorm
     // RMSNorm does not subtract mean, which is critical for fixed-point
     int lane_id = threadIdx.x % WARP_SIZE;
@@ -418,56 +372,7 @@ __global__ void fused_residual_forward_kernel5(floatX* residual, floatX* normed,
 
     const float eps = 1e-5f;
     
-#if defined(ENABLE_Q131)
-    // Q1.31: Standard LayerNorm computed in FP32
-    // Compute residual and mean in one pass
-    float sum = 0.0f;
-    for(int c = threadIdx.x * x128::size; c < C; c += WARP_SIZE * x128::size) {
-        const x128 in1 = load128cs(inp1 + c);
-        const x128 in2 = load128cs(inp2 + c);
-        x128 out;
-        for(int k = 0; k < x128::size; ++k) {
-            float res_val = q131_to_float(in1[k]) + q131_to_float(in2[k]);
-            sum += res_val;
-            out[k] = float_to_q131(res_val);
-        }
-        store128cs(residual + c, out);
-        s_res[c / x128::size] = out;
-    }
-
-    sum = warpReduceSum(sum);
-    float m = sum / C;
-    float v = 0.f;
-
-    for(int c = threadIdx.x * x128::size; c < C; c += WARP_SIZE * x128::size) {
-        const x128 res = s_res[c / x128::size];
-        for(int k = 0; k < x128::size; ++k) {
-            float val = q131_to_float(res[k]);
-            v += (val - m) * (val - m);
-        }
-    }
-
-    v = warpReduceSum(v) / C;
-    float s = rsqrtf(v + Q131_LAYERNORM_EPS);
-
-    for(int c = threadIdx.x * x128::size; c < C; c += WARP_SIZE * x128::size) {
-        const x128 res = s_res[c / x128::size];
-        const x128 w = s_weight[c / x128::size];
-        const x128 b = s_bias[c / x128::size];
-        x128 out;
-        for(int k = 0; k < x128::size; ++k) {
-            float n = s * (q131_to_float(res[k]) - m);
-            float o = n * q131_to_float(w[k]) + q131_to_float(b[k]);
-            out[k] = float_to_q131(o);
-        }
-        store128cs(normed + c, out);
-    }
-    
-    if(threadIdx.x == 0) {
-        mean[idx] = m;
-        rstd[idx] = s;
-    }
-#elif defined(ENABLE_Q115)
+#if   defined(ENABLE_Q115)
     // RMSNorm for Q1.15: compute residual and RMS in one pass
     // Use scaled Q1.15 conversions to preserve dynamic range
     // Apply explicit residual branch scaling to prevent amplitude collapse
@@ -570,11 +475,7 @@ __global__ void residual_forward_kernel(floatX* out, const floatX* inp1, const f
     x128 packed_inp2 = load128cs(inp2 + idx);
     for (int k = 0; k < packed_inp1.size; k++) {
         // FP32 accumulation for residual stream
-#if defined(ENABLE_Q131)
-        // Q1.31: Convert to float, add, convert back
-        float res_val = q131_to_float(packed_inp1[k]) + q131_to_float(packed_inp2[k]);
-        packed_out[k] = float_to_q131(res_val);
-#elif defined(ENABLE_Q115)
+#if   defined(ENABLE_Q115)
         // Apply residual scaling to prevent amplitude collapse
         // inp1 is the residual stream (scale 1.0), inp2 is the branch output (scaled down)
         float res_val = (float)packed_inp1[k] + Q115_ATTENTION_RESIDUAL_SCALE * (float)packed_inp2[k];
@@ -862,3 +763,4 @@ void layernorm_backward(floatX* dinp, floatX* dweight, floatX* dbias, float* scr
     layernorm_backward_kernel10<<<grid_size, block_size, shared_mem_size, stream>>>(dinp, dweight, dbias, scratch, dout, inp, weight, mean, rstd, B, T, C);
     cudaCheck(cudaGetLastError());
 }
+

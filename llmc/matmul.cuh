@@ -32,8 +32,6 @@ Matrix Multiplication, with help from cuBLASLt
 #if defined(SF16_TRUE_FORWARD)
 #include "q131_common.cuh"
 #endif
-#elif defined(ENABLE_Q131)
-#include "q131_common.cuh"
 #endif
 
 // ----------------------------------------------------------------------------
@@ -413,3 +411,4 @@ void matmul_backward(floatX *dinp, floatX *dweight, floatX *dbias, floatX *dout,
   matmul_cublaslt(dweight, inp, dout, NULL /*dbias*/, C, OC, B * T, stream,
                   false, true, 0, 0, 0, 0, true /* accumulate */, NULL, true);
 }
+

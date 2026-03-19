@@ -7,8 +7,6 @@
 #include "cuda_utils.cuh"
 #if defined(ENABLE_Q115)
 #include "q115_common.cuh"
-#elif defined(ENABLE_Q131)
-#include "q131_common.cuh"
 #endif
 
 // M_PI is not defined by default on MSVC
@@ -26,9 +24,7 @@ __global__ void gelu_forward_kernel2(floatX *out, const floatX *inp) {
   x128 packed_out;
   x128 packed_inp = load128cs(inp + idx); // load and do not keep in cache
   for (int k = 0; k < packed_inp.size; ++k) {
-#if defined(ENABLE_Q131)
-    float xi = q131_to_float(packed_inp[k]);
-#elif defined(ENABLE_Q115)
+#if   defined(ENABLE_Q115)
     float xi = simulate_q115((float)packed_inp[k]);
 #else
     float xi = (float)packed_inp[k];
@@ -36,9 +32,7 @@ __global__ void gelu_forward_kernel2(floatX *out, const floatX *inp) {
     float cube = 0.044715f * xi * xi * xi;
     float result =
         0.5f * xi * (1.0f + tanhf(GELU_SCALING_FACTOR * (xi + cube)));
-#if defined(ENABLE_Q131)
-    packed_out[k] = float_to_q131(result);
-#elif defined(ENABLE_Q115)
+#if   defined(ENABLE_Q115)
     packed_out[k] = (floatX)simulate_q115(result);
 #else
     packed_out[k] = (floatX)result;
@@ -57,10 +51,7 @@ __global__ void gelu_backward_inplace_kernel(floatX *d_in_out,
   x128 packed_inp = load128cs(inp + idx);
   x128 packed_dout = load128(d_in_out + idx);
   for (int k = 0; k < packed_inp.size; ++k) {
-#if defined(ENABLE_Q131)
-    float x = q131_to_float(packed_inp[k]);
-    float dout = q131_to_float(packed_dout[k]);
-#elif defined(ENABLE_Q115)
+#if   defined(ENABLE_Q115)
     float x = simulate_q115((float)packed_inp[k]);
     float dout = (float)packed_dout[k];
 #else
@@ -76,9 +67,7 @@ __global__ void gelu_backward_inplace_kernel(floatX *d_in_out,
         0.5f * (1.0f + tanh_out) + x * 0.5f * sech_out * GELU_SCALING_FACTOR *
                                        (1.0f + 3.0f * 0.044715f * x * x);
     float result = local_grad * dout;
-#if defined(ENABLE_Q131)
-    packed_dinp[k] = float_to_q131(result);
-#elif defined(ENABLE_Q115)
+#if   defined(ENABLE_Q115)
     packed_dinp[k] = (floatX)result;
 #else
     packed_dinp[k] = (floatX)result;
@@ -109,3 +98,4 @@ void gelu_backward_inplace(floatX *d_in_out, const floatX *inp, const int N,
                                                                      inp);
   cudaCheck(cudaGetLastError());
 }
+

@@ -89,9 +89,6 @@ enum PrecisionMode {
 };
 
 // Compile-time guard: Q1.15 and Q1.31 are mutually exclusive
-#if defined(ENABLE_Q115) && defined(ENABLE_Q131)
-#error "Cannot enable both Q1.15 and Q1.31 modes simultaneously. Choose one."
-#endif
 
 // Q1.15/SF16 simulation relies on custom attention kernels with explicit
 // boundary quantization. Prevent accidental cuDNN attention bypass.
@@ -100,7 +97,7 @@ enum PrecisionMode {
 #endif
 
 // Unified fixed-point mode flag - set when any fixed-point format is enabled
-#if defined(ENABLE_Q115) || defined(ENABLE_Q131)
+#if defined(ENABLE_Q115)
 #define ENABLE_FIXED_POINT 1
 #endif
 
@@ -119,14 +116,6 @@ typedef half floatX;
 #include <stdint.h>
 typedef __nv_bfloat16 floatX;
 #define PRECISION_MODE PRECISION_Q115
-#elif defined(ENABLE_Q131) && !defined(FIXED_POINT_Q31)
-// Q1.31 fixed-point mode (32-bit) - higher precision than Q1.15
-// NOTE: This mode stores activations as Q1.31 and is NOT compatible with
-// cuBLASLt matmul. Use FIXED_POINT_Q31 to enable Q1.31 weight-constraint mode
-// with BF16/FP activations.
-#include <stdint.h>
-typedef int32_t floatX; // Q1.31 represented as int32_t
-#define PRECISION_MODE PRECISION_Q131
 #else // Default to bfloat16
 typedef __nv_bfloat16 floatX;
 #define PRECISION_MODE PRECISION_BF16
@@ -284,3 +273,4 @@ inline void file_to_device(void *dest, FILE *src, size_t num_bytes,
 }
 
 #endif // CUDA_COMMON_H
+
