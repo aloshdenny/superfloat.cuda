@@ -824,7 +824,7 @@ void llama32_forward(LLaMA32 *model, const int *inputs, size_t B, size_t T) {
                         B, T, C, model->config.norm_eps, main_stream);
 
         // 1) QKV projection
-        matmul_forward_cublaslt(l_qkvr, l_rms1, l_qkvw, global_zeros_bias, B, T, C, qkv_dim, main_stream);
+        matmul_forward_cublaslt(l_qkvr, l_rms1, l_qkvw, global_zeros_bias, B, T, C, (int)((NH+2*NKV)*HD), main_stream);
 
         // --- RoPE ---
         rope_forward(l_qkvr, model->d_freqs_cis,
@@ -867,13 +867,13 @@ void llama32_forward(LLaMA32 *model, const int *inputs, size_t B, size_t T) {
                                 B*T, C, main_stream);
 
         // 4) FFN
-        matmul_forward_cublaslt(l_gate_a, l_rms2, l_gate_w, global_zeros_bias, B, T, C, ffn_dim, main_stream);
-        matmul_forward_cublaslt(l_swiglu, l_rms2, l_up_w, global_zeros_bias, B, T, C, ffn_dim, main_stream);
+        matmul_forward_cublaslt(l_gate_a, l_rms2, l_gate_w, global_zeros_bias, B, T, C, (int)FFN, main_stream);
+        matmul_forward_cublaslt(l_swiglu, l_rms2, l_up_w, global_zeros_bias, B, T, C, (int)FFN, main_stream);
         // pointwise: gate_a = silu(gate_a), swiglu = gate_a * up
         swiglu_forward(l_gate_a, l_up_a, l_gate_a, l_swiglu, B*T*FFN, main_stream);
 
         // Down projection
-        matmul_forward_cublaslt(scratch, l_up_a, l_down_w, global_zeros_bias, B, T, ffn_dim, C, main_stream);
+        matmul_forward_cublaslt(scratch, l_up_a, l_down_w, global_zeros_bias, B, T, (int)FFN, C, main_stream);
 
         // residual3 = residual2 + mlp_out; pre-next-layer RMSNorm fused in
         if (l + 1 != (int)L) {
