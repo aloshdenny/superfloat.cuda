@@ -408,7 +408,7 @@ void matmul_forward_cublas(floatX *out, const floatX *inp, const floatX *weight,
       inp,    CUBLAS_LOWP, C,
       &beta,
       out,    CUBLAS_LOWP, OC,
-      CUBLAS_COMPUTE_32F,
+      CUBLAS_COMPUTE_32F_FAST_TF32,  // TF32 Tensor Cores — correct for BF16 inputs on SM 8.9
       CUBLAS_GEMM_DEFAULT_TENSOR_OP
   ));
 #if defined(ENABLE_Q115)
