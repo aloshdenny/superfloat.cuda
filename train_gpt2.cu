@@ -2452,8 +2452,8 @@ void error_usage() {
 // main training loop
 int main(int argc, char *argv[]) {
   // read in the (optional) command line arguments
-  const char *train_data_pattern = "dev/data/fineweb10B/fineweb_train_*.bin";
-  const char *val_data_pattern = "dev/data/fineweb10B/fineweb_val_*.bin";
+  const char *train_data_pattern = "workspace/dev/data/fineweb10B/fineweb_train_*.bin";
+  const char *val_data_pattern = "workspace/dev/data/fineweb10B/fineweb_val_*.bin";
   const char *load_filename = "gpt2_124M_bf16.bin"; // bf16 weights of the model
   const char *lr_scheduler_type = "cosine";
   const char *output_log_dir = "log_gpt2";
