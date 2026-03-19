@@ -1245,7 +1245,7 @@ int main(int argc, char *argv[]) {
     const char *input_val_bin= "dev/data/fineweb100B/fineweb_val_*.bin";
     const char *output_dir   = "";
     int batch_size           = 4;
-    int sequence_length      = 1024;
+    int sequence_length      = 512;
     int total_batch_size     = 0;        // 0 = auto (B*T*ddp_world)
     int num_iterations       = -1;       // -1 = auto
     int inference_only       = 0;
