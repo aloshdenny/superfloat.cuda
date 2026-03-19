@@ -40,6 +40,7 @@ void *cublaslt_workspace = NULL;
 // compute type per NVIDIA docs. _FAST_16BF and _FAST_TF32 are for FP32 inputs.
 cublasComputeType_t cublas_compute = CUBLAS_COMPUTE_32F;
 cublasLtHandle_t cublaslt_handle;
+cublasHandle_t cublas_handle;  // for plain cublasGemmEx calls (LLaMA forward)
 
 // ----------------------------------------------------------------------------
 // Error checking

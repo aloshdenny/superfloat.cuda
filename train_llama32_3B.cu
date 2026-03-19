@@ -822,7 +822,7 @@ void llama32_forward(LLaMA32 *model, const int *inputs, size_t B, size_t T) {
                         B, T, C, model->config.norm_eps, main_stream);
 
         // 1) QKV projection
-        matmul_forward_cublaslt(l_qkvr, l_rms1, l_qkvw, NULL, B, T, C, (int)((NH+2*NKV)*HD), main_stream);
+        matmul_forward_cublas(l_qkvr, l_rms1, l_qkvw, B, T, C, (int)((NH+2*NKV)*HD), main_stream);
 
         // --- RoPE ---
         rope_forward(l_qkvr, model->d_freqs_cis,
@@ -846,7 +846,7 @@ void llama32_forward(LLaMA32 *model, const int *inputs, size_t B, size_t T) {
         attention_forward(l_atty, l_qkvr, l_att, scratch, B, T, C, NH, main_stream);
 
         // 3) Output projection
-        matmul_forward_cublaslt(scratch, l_atty, l_attn_ow, NULL, B, T, C, C, main_stream);
+        matmul_forward_cublas(scratch, l_atty, l_attn_ow, B, T, C, C, main_stream);
 
         // residual2 = residual + attn_out; pre-FFN RMSNorm -> l_rms2
         fused_residual_forward5(l_res2, l_rms2, l_rms2_r, /*mean=*/nullptr,
@@ -854,13 +854,13 @@ void llama32_forward(LLaMA32 *model, const int *inputs, size_t B, size_t T) {
                                 B*T, C, main_stream);
 
         // 4) FFN
-        matmul_forward_cublaslt(l_gate_a, l_rms2, l_gate_w, NULL, B, T, C, (int)FFN, main_stream);
-        matmul_forward_cublaslt(l_swiglu, l_rms2, l_up_w, NULL, B, T, C, (int)FFN, main_stream);
+        matmul_forward_cublas(l_gate_a, l_rms2, l_gate_w, B, T, C, (int)FFN, main_stream);
+        matmul_forward_cublas(l_swiglu, l_rms2, l_up_w,  B, T, C, (int)FFN, main_stream);
         // pointwise: gate_a = silu(gate_a), swiglu = gate_a * up
         swiglu_forward(l_gate_a, l_up_a, l_gate_a, l_swiglu, B*T*FFN, main_stream);
 
         // Down projection
-        matmul_forward_cublaslt(scratch, l_up_a, l_down_w, NULL, B, T, (int)FFN, C, main_stream);
+        matmul_forward_cublas(scratch, l_up_a, l_down_w, B, T, (int)FFN, C, main_stream);
 
         // residual3 = residual2 + mlp_out; pre-next-layer RMSNorm fused in
         if (l + 1 != (int)L) {
@@ -879,7 +879,7 @@ void llama32_forward(LLaMA32 *model, const int *inputs, size_t B, size_t T) {
     } // end layer loop
 
     // Final matmul to logits (Vp output dimension)
-    matmul_forward_cublaslt(acts.output, acts.rms_f, params.wte, NULL, B, T, C, Vp, main_stream);
+    matmul_forward_cublas(acts.output, acts.rms_f, params.wte, B, T, C, Vp, main_stream);
 }
 
 // Validation (forward + loss, no backward)
@@ -1306,6 +1306,7 @@ int main(int argc, char *argv[]) {
 
     if (tensorcores) cudaCheck(cudaDeviceSetLimit(cudaLimitDevRuntimeSyncDepth, 1));
     cublasCheck(cublasLtCreate(&cublaslt_handle));
+    cublasCheck(cublasCreate(&cublas_handle));
     cudaCheck(cudaMalloc(&cublaslt_workspace, cublaslt_workspace_size));
 
     // TF32 precision for FP32 mode, otherwise default compute type for BF16
