@@ -102,6 +102,7 @@ Usage:
 // ============================================================================
 #include "llmc/encoder.cuh"      // encoder_forward, encoder_backward
 #include "llmc/rmsnorm.cuh"      // rmsnorm_forward, rmsnorm_backward
+#include "llmc/layernorm.cuh"    // fused_residual_forward5
 #include "llmc/matmul.cuh"       // matmul_forward_cublaslt, matmul_backward
 #include "llmc/attention.cuh"    // attention_forward, attention_backward
 #include "llmc/fused_classifier.cuh"
@@ -406,7 +407,7 @@ static float2 *precompute_freqs_cis(int max_seq_len, int head_dim, float rope_th
             float freq = llama3_scale_freq(raw, scale_factor, low_freq_factor,
                                            high_freq_factor, orig_ctx_len);
             float angle = (float)pos * freq;
-            h[pos * half + i] = {cosf(angle), sinf(angle)};
+            h[pos * half + i] = make_float2(cosf(angle), sinf(angle));
         }
     }
     float2 *d;
@@ -1229,6 +1230,13 @@ float llama32_estimate_mfu(LLaMA32 *model, int num_tokens, float dt) {
 // main()
 // ============================================================================
 
+#include <sys/time.h>
+static double time_in_seconds() {
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return tv.tv_sec + tv.tv_usec * 1e-6;
+}
+
 int main(int argc, char *argv[]) {
     // ---- Parse arguments ----
     const char *model_str    = "llama3.2:3b";
@@ -1289,11 +1297,11 @@ int main(int argc, char *argv[]) {
     if (test_tokenizer) { sf16_tokenizer_self_test(); return 0; }
 
     // ---- DDP setup ----
-    multi_gpu_config = multi_gpu_config_init(&argc, &argv);
+    multi_gpu_config = multi_gpu_config_init(-1, -1, -1, "", "", "");
     bool master_process = (multi_gpu_config.process_rank == 0);
     int  ddp_rank       = multi_gpu_config.process_rank;
     int  ddp_world_size = multi_gpu_config.num_processes;
-    int  ddp_local_rank = multi_gpu_config.local_device_index;
+    int  ddp_local_rank = multi_gpu_config.local_device_idx;
     (void)compile;
 
     // ---- Device ----
@@ -1316,8 +1324,7 @@ int main(int argc, char *argv[]) {
 #endif
 
     if (tensorcores) cudaCheck(cudaDeviceSetLimit(cudaLimitDevRuntimeSyncDepth, 1));
-    cublasCreate_check(&cublas_handle);
-    cublasCreate_check(&cublaslt_handle);
+    cublasCheck(cublasLtCreate(&cublaslt_handle));
     cudaCheck(cudaMalloc(&cublaslt_workspace, cublaslt_workspace_size));
 
     // ---- Batch size logic ----
@@ -1363,7 +1370,7 @@ int main(int argc, char *argv[]) {
 
     // ---- LR scheduler ----
     LearningRateScheduler lr_sched;
-    lr_scheduler_init(&lr_sched, learning_rate, warmup_iters, num_iterations, lr_decay_frac);
+    lr_scheduler_init(&lr_sched, "cosine", learning_rate, warmup_iters, num_iterations, lr_decay_frac);
 
     // ---- Outlier detector ----
     OutlierDetector loss_detector;
