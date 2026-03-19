@@ -24,23 +24,24 @@ def train():
 
     os.chdir("/workspace")
 
-    # Step 1: Download dataset (skipped if already cached)
     marker = "/workspace/fineweb100B/.dataset_ready"
-    if not os.path.exists(marker):
-        print("==> Downloading FineWeb100B dataset...")
 
-        # Make the shell script executable and run it
-        # Passing a shard count arg is optional — omit for all 1028 shards
+    # Step 1: Download dataset
+    if not os.path.exists(marker):
+        print("==> Downloading FineWeb 100B dataset...")
+
         subprocess.run(["chmod", "+x", "fineweb.sh"], check=True)
+
+        # Example: 200 shards (or remove arg for full dataset)
         subprocess.run(
-            ["bash", "fineweb.sh", "100"],  # change or remove "100" to get more/all shards
+            ["bash", "fineweb.sh", "-100", "200"],
             check=True
         )
 
         open(marker, "w").close()
         volume.commit()
     else:
-        print("==> Dataset already cached, skipping download.")
+        print("==> Dataset already cached.")
 
     # Step 2: Compile
     print("==> Compiling train_gpt3.cu...")

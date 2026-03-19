@@ -2,43 +2,47 @@ import modal
 
 app = modal.App("train-gpt2-cuda")
 
-# Build the image once — dataset download is separate (see below)
 image = (
     modal.Image.from_registry("nvidia/cuda:12.4.0-devel-ubuntu22.04", add_python="3.11")
     .apt_install("git", "make", "gcc", "wget", "curl")
-    .pip_install("torch", "numpy", "tiktoken", "requests", "tqdm", "transformers", "datasets")  # fineweb.py deps
     .run_commands(
         "git clone --branch modal --single-branch https://github.com/aloshdenny/superfloat.cuda.git /workspace",
     )
     .workdir("/workspace")
 )
 
-# Use a persistent volume so the dataset survives across runs
-volume = modal.Volume.from_name("fineweb-data", create_if_missing=True)
+# Volume for 10B dataset
+volume = modal.Volume.from_name("fineweb10b-data", create_if_missing=True)
 
 @app.function(
     image=image,
     gpu="B200",
-    timeout=60 * 60 * 24,          # 6 hours
-    volumes={"/workspace/data": volume},
+    timeout=60 * 60 * 24,
+    volumes={"/workspace/fineweb10B": volume},
 )
 def train():
     import subprocess, os
 
     os.chdir("/workspace")
 
-    # Step 1: Download dataset (skips if already cached in the volume)
-    marker = "/workspace/data/.dataset_ready"
+    marker = "/workspace/fineweb10B/.dataset_ready"
+
+    # Step 1: Download dataset
     if not os.path.exists(marker):
-        print("==> Downloading FineWeb dataset...")
+        print("==> Downloading FineWeb 10B dataset...")
+
+        subprocess.run(["chmod", "+x", "fineweb.sh"], check=True)
+
+        # Example: first 100 shards (adjust as needed)
         subprocess.run(
-            ["python", "dev/data/fineweb.py"],
+            ["bash", "fineweb.sh", "-10", "100"],
             check=True
         )
+
         open(marker, "w").close()
-        volume.commit()  # persist to volume
+        volume.commit()
     else:
-        print("==> Dataset already cached, skipping download.")
+        print("==> Dataset already cached.")
 
     # Step 2: Compile
     print("==> Compiling train_gpt2.cu...")
