@@ -1997,7 +1997,7 @@ int main(int argc, char *argv[]) {
       0; // major checkpoints never get deleted when maintaining history
   int resume =
       0;     // resume the optimization, if one is found inside output_log_dir?
-  int B = 64; // batch size
+  int B = 8; // batch size
   int T = 2048; // sequence length max - GPT-3 uses 2048 instead of 1024
   int total_batch_size =
       -1; // will be calculated down below later, if not provided
