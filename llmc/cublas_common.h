@@ -39,7 +39,7 @@ void *cublaslt_workspace = NULL;
 #if defined(ENABLE_Q115) && defined(SF16_TRUE_FORWARD)
 cublasComputeType_t cublas_compute = CUBLAS_COMPUTE_32F_FAST_16BF;
 #else
-cublasComputeType_t cublas_compute = CUBLAS_COMPUTE_32F;
+cublasComputeType_t cublas_compute = CUBLAS_COMPUTE_32F_FAST_16BF;
 #endif
 cublasLtHandle_t cublaslt_handle;
 
