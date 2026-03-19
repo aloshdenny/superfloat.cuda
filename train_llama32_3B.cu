@@ -143,8 +143,6 @@ typedef struct {
 // SwiGLU MLP: gate_w (w1), up_w (w3), down_w (w2).
 // ============================================================================
 
-floatX *global_zeros_bias = nullptr;
-
 constexpr const int NUM_PARAMETER_TENSORS = 9;
 typedef struct {
     floatX *wte;      // (Vp, C)           — token embedding + lm_head (tied)
@@ -824,42 +822,31 @@ void llama32_forward(LLaMA32 *model, const int *inputs, size_t B, size_t T) {
                         B, T, C, model->config.norm_eps, main_stream);
 
         // 1) QKV projection
-        matmul_forward_cublaslt(l_qkvr, l_rms1, l_qkvw, global_zeros_bias, B, T, C, (int)((NH+2*NKV)*HD), main_stream);
+        matmul_forward_cublaslt(l_qkvr, l_rms1, l_qkvw, NULL, B, T, C, (int)((NH+2*NKV)*HD), main_stream);
 
         // --- RoPE ---
         rope_forward(l_qkvr, model->d_freqs_cis,
                      B, T, NH, NKV, HD, main_stream);
 
         // --- GQA: expand K,V to NH heads for standard attention ---
-        // The attention kernel expects contiguous Q,K,V as (B,T,3C) with full heads.
-        // We build an expanded QKV buffer in scratch: [Q(NH,HD) | K_exp(NH,HD) | V_exp(NH,HD)]
-        // Copy Q directly
-        floatX *q_src = l_qkvr;
+        // Build expanded QKV in l_qkvr in-place: [Q(NH,HD) | K_exp(NH,HD) | V_exp(NH,HD)]
+        // We expand K,V backwards to avoid overwriting source data
         floatX *k_src = l_qkvr + (size_t)B*T*NH*HD;
         floatX *v_src = l_qkvr + (size_t)B*T*(NH+NKV)*HD;
-        // scratch layout: [Q | K_exp | V_exp] total B*T*3*NH*HD
-        floatX *q_dst = scratch;
-        floatX *k_dst = scratch + (size_t)B*T*NH*HD;
-        floatX *v_dst = scratch + (size_t)B*T*NH*HD*2;
-        // Copy Q (no expansion needed, NH==NH)
-        cudaCheck(cudaMemcpyAsync(q_dst, q_src, B*T*NH*HD*sizeof(floatX),
-                                  cudaMemcpyDeviceToDevice, main_stream));
-        // Expand K and V from NKV to NH heads
-        repeat_kv(k_dst, k_src, B*T, NKV, n_rep, HD, main_stream);
+        floatX *k_dst = l_qkvr + (size_t)B*T*NH*HD;
+        floatX *v_dst = l_qkvr + (size_t)B*T*NH*HD*2;
+        // Expand V first (at end of buffer, safe), then K
         repeat_kv(v_dst, v_src, B*T, NKV, n_rep, HD, main_stream);
+        repeat_kv(k_dst, k_src, B*T, NKV, n_rep, HD, main_stream);
+        // Q is already in place at the start of l_qkvr, no copy needed
 
-        // --- Attention forward (uses expanded Q,K,V in scratch) ---
-        // NOTE: attention_forward expects qkvr as (B,T,3*C) shape
-        // We reuse l_qkvr to hold the expanded result properly
-        // by writing expanded data back into l_qkvr for attention kernel compatibility.
-        cudaCheck(cudaMemcpyAsync(l_qkvr, scratch, B*T*3*NH*HD*sizeof(floatX),
-                                  cudaMemcpyDeviceToDevice, main_stream));
+        // --- Attention forward (uses expanded Q,K,V in l_qkvr) ---
         if (T != model->seq_len)
             cudaCheck(cudaMemset(l_att, 0, B * NH * T * T * sizeof(floatX)));
         attention_forward(l_atty, l_qkvr, l_att, scratch, B, T, C, NH, main_stream);
 
         // 3) Output projection
-        matmul_forward_cublaslt(scratch, l_atty, l_attn_ow, global_zeros_bias, B, T, C, C, main_stream);
+        matmul_forward_cublaslt(scratch, l_atty, l_attn_ow, NULL, B, T, C, C, main_stream);
 
         // residual2 = residual + attn_out; pre-FFN RMSNorm -> l_rms2
         fused_residual_forward5(l_res2, l_rms2, l_rms2_r, /*mean=*/nullptr,
@@ -867,13 +854,13 @@ void llama32_forward(LLaMA32 *model, const int *inputs, size_t B, size_t T) {
                                 B*T, C, main_stream);
 
         // 4) FFN
-        matmul_forward_cublaslt(l_gate_a, l_rms2, l_gate_w, global_zeros_bias, B, T, C, (int)FFN, main_stream);
-        matmul_forward_cublaslt(l_swiglu, l_rms2, l_up_w, global_zeros_bias, B, T, C, (int)FFN, main_stream);
+        matmul_forward_cublaslt(l_gate_a, l_rms2, l_gate_w, NULL, B, T, C, (int)FFN, main_stream);
+        matmul_forward_cublaslt(l_swiglu, l_rms2, l_up_w, NULL, B, T, C, (int)FFN, main_stream);
         // pointwise: gate_a = silu(gate_a), swiglu = gate_a * up
         swiglu_forward(l_gate_a, l_up_a, l_gate_a, l_swiglu, B*T*FFN, main_stream);
 
         // Down projection
-        matmul_forward_cublaslt(scratch, l_up_a, l_down_w, global_zeros_bias, B, T, (int)FFN, C, main_stream);
+        matmul_forward_cublaslt(scratch, l_up_a, l_down_w, NULL, B, T, (int)FFN, C, main_stream);
 
         // residual3 = residual2 + mlp_out; pre-next-layer RMSNorm fused in
         if (l + 1 != (int)L) {
@@ -892,8 +879,7 @@ void llama32_forward(LLaMA32 *model, const int *inputs, size_t B, size_t T) {
     } // end layer loop
 
     // Final matmul to logits (Vp output dimension)
-    matmul_forward_cublaslt(acts.output, acts.rms_f, params.wte, global_zeros_bias, B, T, C, Vp, main_stream);
-    cudaCheck(cudaDeviceSynchronize());
+    matmul_forward_cublaslt(acts.output, acts.rms_f, params.wte, NULL, B, T, C, Vp, main_stream);
 }
 
 // Validation (forward + loss, no backward)
@@ -1088,7 +1074,7 @@ void llama32_backward_and_reduce(LLaMA32 *model, int *inputs, const int *targets
         const size_t nelems[] = {(size_t)Vp * C, C};
         multi_gpu_async_reduce_gradient(ptrs, nelems, &multi_gpu_config, main_stream);
     }
-    cudaCheck(cudaDeviceSynchronize());
+    cudaCheck(cudaStreamSynchronize(main_stream));
     if (last_step) model->mean_loss /= (float)(B * T * grad_accum_steps);
     else           model->mean_loss = -1.0f;
 }
@@ -1205,7 +1191,7 @@ void llama32_update(LLaMA32 *model, float lr, float beta1, float beta2,
 #endif
         }
     }
-    cudaCheck(cudaDeviceSynchronize());
+    cudaCheck(cudaStreamSynchronize(main_stream));
 }
 
 // ============================================================================
@@ -1250,8 +1236,8 @@ int main(int argc, char *argv[]) {
     float grad_clip          = 1.0f;
     int val_loss_every       = 0;
     int val_max_steps        = 20;
-    int overfit_single_batch = 1;
-    int tensorcores          = 0;
+    int overfit_single_batch = 0;
+    int tensorcores          = 1;
     const char *device_str   = "";
     int zero_stage           = 1;
     int compile              = 0;
@@ -1321,8 +1307,10 @@ int main(int argc, char *argv[]) {
     if (tensorcores) cudaCheck(cudaDeviceSetLimit(cudaLimitDevRuntimeSyncDepth, 1));
     cublasCheck(cublasLtCreate(&cublaslt_handle));
     cudaCheck(cudaMalloc(&cublaslt_workspace, cublaslt_workspace_size));
-    cudaCheck(cudaMalloc(&global_zeros_bias, 16384 * sizeof(floatX)));
-    cudaCheck(cudaMemset(global_zeros_bias, 0, 16384 * sizeof(floatX)));
+
+    // TF32 precision for FP32 mode, otherwise default compute type for BF16
+    bool enable_tf32 = PRECISION_MODE == PRECISION_FP32 && deviceProp.major >= 8;
+    cublas_compute = enable_tf32 ? CUBLAS_COMPUTE_32F_FAST_TF32 : cublas_compute;
 
     // ---- Batch size logic ----
     int B = batch_size;
@@ -1373,15 +1361,20 @@ int main(int argc, char *argv[]) {
     LearningRateScheduler lr_sched;
     lr_scheduler_init(&lr_sched, "cosine", learning_rate, warmup_iters, num_iterations, lr_decay_frac);
 
-    // ---- Outlier detector ----
-    OutlierDetector loss_detector;
+    // ---- Outlier detectors ----
+    OutlierDetector loss_detector, grad_norm_detector;
     init_detector(&loss_detector);
+    init_detector(&grad_norm_detector);
+
+    // ---- cudaEvent timing ----
+    cudaEvent_t ev_start, ev_end;
+    cudaCheck(cudaEventCreate(&ev_start));
+    cudaCheck(cudaEventCreate(&ev_end));
 
     // ---- Training loop ----
     float norm = -1.0f;
     for (int step = 0; step <= num_iterations; step++) {
         bool last_step = (step == num_iterations);
-        double t0 = time_in_seconds();
 
         // Validation
         if (has_val && val_loss_every > 0 &&
@@ -1405,6 +1398,7 @@ int main(int argc, char *argv[]) {
         if (last_step) break;
 
         // Training
+        cudaCheck(cudaEventRecord(ev_start));
         for (int micro = 0; micro < grad_accum_steps; micro++) {
             if (overfit_single_batch) dataloader_reset(&train_loader);
             dataloader_next_batch(&train_loader);
@@ -1414,25 +1408,25 @@ int main(int argc, char *argv[]) {
         }
 
         norm = llama32_calculate_grad_norm(&model, &multi_gpu_config);
-        if (grad_clip > 0.0f && norm > grad_clip) {
-            float scale = grad_clip / (norm + 1e-6f);
-            // scale is applied implicitly via adamw grad_scale argument
-            norm = grad_clip; // for display
-        }
+        float zloss = (float)update_detector(&loss_detector, (double)model.mean_loss);
+        float zgrad = (float)update_detector(&grad_norm_detector, (double)norm);
+        (void)zloss; (void)zgrad;
 
         float lr = get_learning_rate(&lr_sched, step);
-        float grad_scale = (norm > grad_clip && grad_clip > 0.0f)
-                           ? grad_clip / (norm + 1e-6f) : 1.0f;
+        float grad_scale = (grad_clip > 0.0f && norm > grad_clip)
+                           ? grad_clip / norm : 1.0f;
         llama32_update(&model, lr, 0.9f, 0.95f, 1e-8f, weight_decay,
                        grad_scale, step+1, &multi_gpu_config);
 
-        double t1 = time_in_seconds();
-        float tok_s = (float)(grad_accum_steps * ddp_world_size * B * T) / (float)(t1 - t0);
-        float mfu = llama32_estimate_mfu(&model, grad_accum_steps * B * T, (float)(t1 - t0));
+        cudaCheck(cudaEventRecord(ev_end));
+        cudaCheck(cudaEventSynchronize(ev_end));
+        float time_elapsed_ms;
+        cudaCheck(cudaEventElapsedTime(&time_elapsed_ms, ev_start, ev_end));
+        float tok_s = (float)(grad_accum_steps * ddp_world_size * B * T) / (time_elapsed_ms * 1e-3f);
+        float mfu = llama32_estimate_mfu(&model, grad_accum_steps * B * T, time_elapsed_ms / 1000.0f);
         printf0("step %4d/%d | loss %.6f | norm %.4f | lr %.2e | %.2f ms | %.0f tok/s | MFU %.2f%%\n",
                 step+1, num_iterations, model.mean_loss, norm, lr,
-                (float)(t1-t0)*1000.0f, tok_s, mfu * 100.0f);
-        update_detector(&loss_detector, model.mean_loss);
+                time_elapsed_ms, tok_s, mfu * 100.0f);
 
         if (master_process && logfile) {
             FILE *lf = fopen(logfile, "a");
