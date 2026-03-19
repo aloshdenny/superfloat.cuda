@@ -35,7 +35,7 @@ def train():
 
         # Example: first 100 shards (adjust as needed)
         subprocess.run(
-            ["bash", "dev/data/fineweb.sh", "-10"],
+            ["bash", "/workspace/dev/data/fineweb.sh", "-10"],
             check=True
         )
 
