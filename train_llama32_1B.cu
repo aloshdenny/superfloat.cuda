@@ -1245,9 +1245,9 @@ int main(int argc, char *argv[]) {
     const char *input_val_bin= "dev/data/fineweb100B/fineweb_val_*.bin";
     const char *output_dir   = "";
     int batch_size           = 4;
-    int sequence_length      = 4096;
+    int sequence_length      = 1024;
     int total_batch_size     = 0;        // 0 = auto (B*T*ddp_world)
-    int num_iterations       = 10;
+    int num_iterations       = -1;       // -1 = auto
     int inference_only       = 0;
     float learning_rate      = 3e-4f;
     int warmup_iters         = 0;
@@ -1259,7 +1259,7 @@ int main(int argc, char *argv[]) {
     int overfit_single_batch = 1;
     int tensorcores          = 0;
     const char *device_str   = "";
-    int zero_stage           = 0;
+    int zero_stage           = 1;
     int compile              = 0;
     const char *dtype_str    = "bfloat16";
     int test_tokenizer       = 0;
@@ -1360,7 +1360,11 @@ int main(int argc, char *argv[]) {
     // ---- Data loaders ----
     DataLoader train_loader;
     dataloader_init(&train_loader, input_bin, B, T, ddp_rank, ddp_world_size, 1);
-    printf0("Training data: %lld tokens\n", (long long)train_loader.num_tokens);
+    
+    if (num_iterations == -1) {
+        num_iterations = train_loader.num_tokens / total_batch_size;
+    }
+    printf0("Training data: %lld tokens, %d steps\n", (long long)train_loader.num_tokens, num_iterations);
 
     DataLoader val_loader;
     bool has_val = (strlen(input_val_bin) > 0);
