@@ -362,14 +362,15 @@ static void sf16_tokenizer_self_test(void) {
         sf16_token_encode(id, &hi, &lo);
         int decoded = sf16_token_decode(hi, lo);
         if (decoded != id) {
-            if (errors < 5)
+            if (errors < 5) {
                 printf0("  FAIL: id=%d -> (%d,%d) -> %d\n", id, hi, lo, decoded);
+            }
             errors++;
         }
     }
-    if (errors == 0)
+    if (errors == 0) {
         printf0("SF16 tokenizer self-test: PASS (all 128256 IDs lossless)\n");
-    else {
+    } else {
         printf0("SF16 tokenizer self-test: FAIL (%d errors)\n", errors);
         exit(EXIT_FAILURE);
     }
@@ -1297,7 +1298,7 @@ int main(int argc, char *argv[]) {
     if (test_tokenizer) { sf16_tokenizer_self_test(); return 0; }
 
     // ---- DDP setup ----
-    multi_gpu_config = multi_gpu_config_init(-1, -1, -1, "", "", "");
+    multi_gpu_config = multi_gpu_config_init(-1, -1, -1, (char *)"", (char *)"", (char *)"");
     bool master_process = (multi_gpu_config.process_rank == 0);
     int  ddp_rank       = multi_gpu_config.process_rank;
     int  ddp_world_size = multi_gpu_config.num_processes;
