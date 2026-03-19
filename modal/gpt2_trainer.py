@@ -25,19 +25,20 @@ def train():
 
     os.chdir("/workspace")
 
-    marker = "/workspace/fineweb10B/.dataset_ready"
+    marker = "/workspace/dev/data/fineweb10B/.dataset_ready"
 
-    # Step 1: Download dataset
     if not os.path.exists(marker):
         print("==> Downloading FineWeb 10B dataset...")
 
         subprocess.run(["chmod", "+x", "dev/data/fineweb.sh"], check=True)
+        subprocess.run(["bash", "dev/data/fineweb.sh", "-10"], check=True)
 
-        # Example: first 100 shards (adjust as needed)
-        subprocess.run(
-            ["bash", "dev/data/fineweb.sh", "-10"],
-            check=True
-        )
+        # Verify files are real before marking done
+        import glob
+        bins = glob.glob("/workspace/dev/data/fineweb10B/*.bin")
+        real = [f for f in bins if os.path.getsize(f) > 1024]  # must be >1KB
+        if not real:
+            raise RuntimeError("Download failed — .bin files are empty or missing. Check the shell script output.")
 
         open(marker, "w").close()
         volume.commit()
@@ -45,11 +46,9 @@ def train():
         print("==> Dataset already cached.")
 
     # Step 2: Compile
-    print("==> Compiling train_gpt2.cu...")
     subprocess.run(["make", "train_gpt2cu"], check=True)
 
     # Step 3: Train
-    print("==> Starting training...")
     subprocess.run(["./train_gpt2cu"], check=True)
 
 

@@ -1895,9 +1895,9 @@ void error_usage() {
   fprintf(stderr, "Options:\n");
   // file system input / output
   fprintf(stderr, "  -i <string> train data filename pattern (default = "
-                  "dev/data/fineweb10B/fineweb_train_*.bin)\n");
+                  "workspace/dev/data/fineweb100B/fineweb_train_*.bin)\n");
   fprintf(stderr, "  -j <string> val data filename pattern (default = "
-                  "dev/data/fineweb10B/fineweb_val_*.bin)\n");
+                  "workspace/dev/data/fineweb100B/fineweb_val_*.bin)\n");
   fprintf(stderr, "  -e <string> input .bin filename or descriptor, see code "
                   "comments as docs. (default = gpt3_125M_bf16.bin)\n");
   fprintf(stderr,
