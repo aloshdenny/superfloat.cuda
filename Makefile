@@ -268,7 +268,7 @@ run: train_gpt2cu
 # Clean
 # ===============================
 clean:
-	$(REMOVE_FILES) train_gpt2cu train_gpt2fp32cu train_gpt2q131cu train_gpt2q115cu \
+	$(REMOVE_FILES) train_gpt2cu train_gpt3cu train_gpt2fp32cu train_gpt2q131cu train_gpt2q115cu \
 	      train_llama32_1Bcu train_llama32_1Bq115cu train_llama32_3Bcu train_llama32_3Bq115cu *.o \
 	      libcublas.so libcublas.so.12 libcublasLt.so libcublasLt.so.12 libnvml.so libnvml.so.1
 	$(REMOVE_BUILD_OBJECT_FILES)
