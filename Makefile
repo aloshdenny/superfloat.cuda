@@ -158,12 +158,14 @@ TARGETS = train_gpt2 test_gpt2 train_gpt2cu train_gpt2rawcu train_gpt3cu test_gp
 TARGETS_Q131 = train_gpt2q131cu train_gpt3q131cu
 TARGETS_Q115 = train_gpt2q115cu train_gpt3q115cu
 TARGETS_Q115_CONSTRAINED = train_gpt2q115_constrainedcu
+TARGETS_LLAMA32 = train_llama32_1Bcu train_llama32_3Bcu train_llama32_1Bq115cu train_llama32_3Bq115cu
 
-.PHONY: all clean libsyms run q131 q115 q115_constrained
+.PHONY: all clean libsyms run q131 q115 q115_constrained llama32
 all: $(TARGETS)
 q131: $(TARGETS_Q131)
 q115: $(TARGETS_Q115)
 q115_constrained: $(TARGETS_Q115_CONSTRAINED)
+llama32: $(TARGETS_LLAMA32)
 
 # ===============================
 # Linux library symlinks
@@ -242,6 +244,21 @@ train_gpt2q115_constrainedcu: train_gpt2.cu libsyms $(NVCC_CUDNN)
 	$(NVCC) $(NVCC_FLAGS) $(PFLAGS) -DENABLE_Q115 -DENABLE_Q115_WEIGHT_CONSTRAINT -DSF16_TRUE_FORWARD=1 $(NVCC_INCLUDES) $< $(NVCC_CUDNN) $(NVCC_LDFLAGS) $(NVCC_LDLIBS) $(CUDA_OUTPUT_FILE)
 
 # ===============================
+# LLaMA 3.2 CUDA targets
+# ===============================
+train_llama32_1Bcu: train_llama32_1B.cu libsyms
+	$(NVCC) $(NVCC_FLAGS) $(PFLAGS) $(NVCC_INCLUDES) $< $(NVCC_LDFLAGS) $(NVCC_LDLIBS) $(CUDA_OUTPUT_FILE)
+
+train_llama32_1Bq115cu: train_llama32_1B.cu libsyms
+	$(NVCC) $(NVCC_FLAGS) $(PFLAGS) -DENABLE_Q115 -DSF16_TRUE_FORWARD=1 $(NVCC_INCLUDES) $< $(NVCC_LDFLAGS) $(NVCC_LDLIBS) $(CUDA_OUTPUT_FILE)
+
+train_llama32_3Bcu: train_llama32_3B.cu libsyms
+	$(NVCC) $(NVCC_FLAGS) $(PFLAGS) $(NVCC_INCLUDES) $< $(NVCC_LDFLAGS) $(NVCC_LDLIBS) $(CUDA_OUTPUT_FILE)
+
+train_llama32_3Bq115cu: train_llama32_3B.cu libsyms
+	$(NVCC) $(NVCC_FLAGS) $(PFLAGS) -DENABLE_Q115 -DSF16_TRUE_FORWARD=1 $(NVCC_INCLUDES) $< $(NVCC_LDFLAGS) $(NVCC_LDLIBS) $(CUDA_OUTPUT_FILE)
+
+# ===============================
 # Convenience run (Linux only)
 # ===============================
 run: train_gpt2cu
@@ -251,6 +268,7 @@ run: train_gpt2cu
 # Clean
 # ===============================
 clean:
-	$(REMOVE_FILES) train_gpt2cu train_gpt2fp32cu train_gpt2q131cu train_gpt2q115cu *.o \
+	$(REMOVE_FILES) train_gpt2cu train_gpt2fp32cu train_gpt2q131cu train_gpt2q115cu \
+	      train_llama32_1Bcu train_llama32_1Bq115cu train_llama32_3Bcu train_llama32_3Bq115cu *.o \
 	      libcublas.so libcublas.so.12 libcublasLt.so libcublasLt.so.12 libnvml.so libnvml.so.1
 	$(REMOVE_BUILD_OBJECT_FILES)
