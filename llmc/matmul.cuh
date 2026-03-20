@@ -352,86 +352,58 @@ void matmul_forward_cublaslt(floatX *out, floatX *inp, floatX *weight,
 }
 
 // ---------------------------------------------------------------------------
-// Forward GEMM for LLaMA (no bias).
-// cuBLASLt fails to find algorithms for LLaMA's matrix dimensions with ANY
-// compute type or epilogue on this system. cublasSgemm (plain FP32) always
-// works. Cast BF16/FP16 → FP32, run SGEMM, cast output FP32 → BF16/FP16.
+// Custom tiled matmul kernel — no cuBLAS dependency.
+// Computes: out[BT, OC] = inp[BT, C] @ weight[OC, C]^T
+// Each thread computes one output element.
+// Accumulates in FP32 regardless of input dtype for numerical stability.
 // ---------------------------------------------------------------------------
-static float *g_sgemm_A = nullptr;   // FP32 copy of weight [OC x C]
-static float *g_sgemm_B = nullptr;   // FP32 copy of inp    [BT x C]
-static float *g_sgemm_C = nullptr;   // FP32 output         [OC x BT]
-static size_t g_sgemm_A_size = 0;
-static size_t g_sgemm_B_size = 0;
-static size_t g_sgemm_C_size = 0;
+#define MATMUL_TILE 32
+__global__ void matmul_nt_kernel(
+    floatX* __restrict__ out,        // [BT, OC]
+    const floatX* __restrict__ inp,  // [BT, C]
+    const floatX* __restrict__ wt,   // [OC, C]
+    int BT, int OC, int C
+) {
+  __shared__ float sA[MATMUL_TILE][MATMUL_TILE + 1]; // inp tile, +1 avoids bank conflict
+  __shared__ float sB[MATMUL_TILE][MATMUL_TILE + 1]; // weight tile
 
-__global__ void upcast_to_fp32(float *dst, const floatX *src, size_t N) {
-  size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-  if (i < N) dst[i] = (float)src[i];
-}
-__global__ void downcast_from_fp32(floatX *dst, const float *src, size_t N) {
-  size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-  if (i < N) dst[i] = (floatX)src[i];
+  int row = blockIdx.y * MATMUL_TILE + threadIdx.y; // BT index
+  int col = blockIdx.x * MATMUL_TILE + threadIdx.x; // OC index
+  float acc = 0.f;
+
+  for (int t = 0; t < (C + MATMUL_TILE - 1) / MATMUL_TILE; t++) {
+    // sA[ty][tx]: inp row=ty (BT_local), col=tx (K_local)
+    int kA = t * MATMUL_TILE + threadIdx.x;
+    sA[threadIdx.y][threadIdx.x] = (row < BT && kA < C) ? (float)inp[row * C + kA] : 0.f;
+
+    // sB[tx][ty]: weight row=tx (OC_local), col=ty (K_local)  
+    // threadIdx.x = col_local (OC), threadIdx.y = k_local
+    int kB = t * MATMUL_TILE + threadIdx.y;
+    int col_oc = blockIdx.x * MATMUL_TILE + threadIdx.x;
+    sB[threadIdx.x][threadIdx.y] = (col_oc < OC && kB < C) ? (float)wt[col_oc * C + kB] : 0.f;
+    __syncthreads();
+
+    #pragma unroll
+    for (int k = 0; k < MATMUL_TILE; k++) {
+      // out[row,col] += inp[row,k] * weight[col,k]
+      // = sA[threadIdx.y][k] * sB[threadIdx.x][k]
+      acc += sA[threadIdx.y][k] * sB[threadIdx.x][k];
+    }
+    __syncthreads();
+  }
+
+  if (row < BT && col < OC) {
+    out[row * OC + col] = (floatX)acc;
+  }
 }
 
 void matmul_forward_cublas(floatX *out, const floatX *inp, const floatX *weight,
                            int B, int T, int C, int OC, cudaStream_t stream) {
   NVTX_RANGE_FN();
-  size_t szA = (size_t)OC * C;           // weight: OC x C
-  size_t szB = (size_t)B * T * C;        // inp:    BT x C
-  size_t szC = (size_t)OC * B * T;       // out:    OC x BT
-
-  // Lazy-grow FP32 scratch buffers
-  if (szA > g_sgemm_A_size) { if (g_sgemm_A) cudaFree(g_sgemm_A); cudaCheck(cudaMalloc(&g_sgemm_A, szA*sizeof(float))); g_sgemm_A_size = szA; }
-  if (szB > g_sgemm_B_size) { if (g_sgemm_B) cudaFree(g_sgemm_B); cudaCheck(cudaMalloc(&g_sgemm_B, szB*sizeof(float))); g_sgemm_B_size = szB; }
-  if (szC > g_sgemm_C_size) { if (g_sgemm_C) cudaFree(g_sgemm_C); cudaCheck(cudaMalloc(&g_sgemm_C, szC*sizeof(float))); g_sgemm_C_size = szC; }
-
-  // Cast inputs to FP32
-  int nblocks_A = (int)((szA + 255) / 256);
-  int nblocks_B = (int)((szB + 255) / 256);
-  upcast_to_fp32<<<nblocks_A, 256, 0, stream>>>(g_sgemm_A, weight, szA);
-  upcast_to_fp32<<<nblocks_B, 256, 0, stream>>>(g_sgemm_B, inp,    szB);
-  cudaCheck(cudaGetLastError());
-
-  // SGEMM: C = A^T * B  →  out[OC x BT] = weight[OC x C]^T-nope, weight stored as [OC,C]
-  // Column-major view: weight is (C x OC) with ld=C, inp is (C x BT) with ld=C
-  // cublasSgemm(handle, transA, transB, m, n, k, alpha, A, lda, B, ldb, beta, C, ldc)
-  // We want: out(OC,BT) = weight(OC,C) @ inp(C,BT)
-  // In col-major: weight col-major is (C rows, OC cols) with lda=C → CUBLAS_OP_T gives OC x C
-  // Simpler: out = weight * inp^T, no: out[OC,BT] = weight[OC,C] @ inp[BT,C]^T
-  // Col-major equiv: op(A)=weight^T[C,OC], op(B)=inp[C,BT], C=out[OC,BT]
-  //   → SGEMM with transA=T m=OC n=BT k=C A=weight lda=C B=inp ldb=C C=out ldc=OC
-  // Set stream for this handle
-  cublasStatus_t ss = cublasSetStream(cublas_handle, stream);
-  if (ss != CUBLAS_STATUS_SUCCESS) {
-    printf("[cublas] cublasSetStream failed: %d\n", (int)ss);
-    exit(1);
-  }
-  const float alpha = 1.f, beta = 0.f;
-
-  // cublasSgemm: always supported, operates in FP32
-  // C(m,n) = op(A)(m,k) * op(B)(k,n)
-  // We want out[OC,BT] = weight[OC,C] @ inp[BT,C]^T
-  // In col-major: weight stored row-major [OC,C] → col-major [C,OC], lda=C, transa=T
-  //               inp stored row-major [BT,C]   → col-major [C,BT], ldb=C, transb=N
-  //               out col-major [OC,BT], ldc=OC
-  cublasStatus_t st = cublasSgemm(
-      cublas_handle,
-      CUBLAS_OP_T, CUBLAS_OP_N,
-      OC, B * T, C,
-      &alpha,
-      g_sgemm_A, C,
-      g_sgemm_B, C,
-      &beta,
-      g_sgemm_C, OC
-  );
-  if (st != CUBLAS_STATUS_SUCCESS) {
-    printf("[cublas] cublasSgemm failed: %d (m=%d n=%d k=%d)\n", (int)st, OC, B*T, C);
-    exit(1);
-  }
-
-  // Cast FP32 output back to floatX
-  int nblocks_C = (int)((szC + 255) / 256);
-  downcast_from_fp32<<<nblocks_C, 256, 0, stream>>>(out, g_sgemm_C, szC);
+  int BT = B * T;
+  dim3 grid(CEIL_DIV(OC, MATMUL_TILE), CEIL_DIV(BT, MATMUL_TILE));
+  dim3 block(MATMUL_TILE, MATMUL_TILE);
+  matmul_nt_kernel<<<grid, block, 0, stream>>>(out, inp, weight, BT, OC, C);
   cudaCheck(cudaGetLastError());
 }
 
