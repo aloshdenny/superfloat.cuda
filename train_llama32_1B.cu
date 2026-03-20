@@ -258,7 +258,7 @@ void fill_in_activation_sizes(const ActivationTensors *data,
     tensors[0]  = TENSOR_SPEC(data->encoded,    B * T * C);
     tensors[1]  = TENSOR_SPEC(data->rms1,       (recompute < 2) ? L * B * T * C : 0);
     tensors[2]  = TENSOR_SPEC(data->rms1_rstd,  L * B * T);
-    tensors[3]  = TENSOR_SPEC(data->qkvr,       L * B * T * (NH + 2*NKV) * HD);
+    tensors[3]  = TENSOR_SPEC(data->qkvr,       L * B * T * 3 * C);
     tensors[4]  = TENSOR_SPEC(data->atty,       L * B * T * C);
     tensors[5]  = TENSOR_SPEC(data->att,        L * B * NH * T * T);
     tensors[6]  = TENSOR_SPEC(data->residual2,  L * B * T * C);
@@ -491,13 +491,69 @@ static void repeat_kv(floatX *out, const floatX *inp,
     cudaCheck(cudaGetLastError());
 }
 
+__global__ void reduce_kv_grad_kernel(
+    floatX *__restrict__ out,       // (BT, NH + 2*NKV, HD)
+    const floatX *__restrict__ inp, // (BT, 3*NH, HD)
+    int BT, int NH, int NKV, int n_rep, int HD)
+{
+    size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    const size_t compact_stride = (size_t)(NH + 2 * NKV) * HD;
+    const size_t expanded_stride = (size_t)3 * NH * HD;
+    const size_t total = (size_t)BT * compact_stride;
+    const size_t q_span = (size_t)NH * HD;
+    const size_t k_span = (size_t)NKV * HD;
+
+    for (; idx < total; idx += (size_t)blockDim.x * gridDim.x) {
+        size_t bt = idx / compact_stride;
+        size_t o = idx - bt * compact_stride;
+        size_t in_base = bt * expanded_stride;
+
+        if (o < q_span) {
+            out[idx] = inp[in_base + o];
+        } else if (o < q_span + k_span) {
+            size_t kk = o - q_span;
+            int kv_h = (int)(kk / HD);
+            int d = (int)(kk % HD);
+            float acc = 0.0f;
+            for (int r = 0; r < n_rep; r++) {
+                int h = kv_h * n_rep + r;
+                acc += (float)inp[in_base + q_span + (size_t)h * HD + d];
+            }
+            out[idx] = (floatX)acc;
+        } else {
+            size_t vv = o - (q_span + k_span);
+            int kv_h = (int)(vv / HD);
+            int d = (int)(vv % HD);
+            float acc = 0.0f;
+            for (int r = 0; r < n_rep; r++) {
+                int h = kv_h * n_rep + r;
+                acc += (float)inp[in_base + 2 * q_span + (size_t)h * HD + d];
+            }
+            out[idx] = (floatX)acc;
+        }
+    }
+}
+
+static void reduce_kv_grad(floatX *out, const floatX *inp,
+                           int BT, int NH, int NKV, int n_rep, int HD,
+                           cudaStream_t stream) {
+    const size_t compact_stride = (size_t)(NH + 2 * NKV) * HD;
+    const size_t total = (size_t)BT * compact_stride;
+    const int block = 256;
+    unsigned int grid = (unsigned int)((total + block - 1) / block);
+    if (grid > 65535u) grid = 65535u;
+    if (grid == 0u) grid = 1u;
+    reduce_kv_grad_kernel<<<grid, block, 0, stream>>>(
+        out, inp, BT, NH, NKV, n_rep, HD);
+    cudaCheck(cudaGetLastError());
+}
+
 // ============================================================================
 // SwiGLU: forward and backward
 // ============================================================================
 
 __global__ void swiglu_forward_kernel(
-    floatX *__restrict__ gate_act,   // silu(gate_in)
-    floatX *__restrict__ swiglu_out, // gate_act * up_in
+    floatX *__restrict__ swiglu_out, // silu(gate_in) * up_in
     const floatX *__restrict__ gate_in,
     const floatX *__restrict__ up_in,
     int N)
@@ -511,16 +567,15 @@ __global__ void swiglu_forward_kernel(
         sg = (float)simulate_q115((floatX)sg);
         u  = (float)simulate_q115((floatX)u);
 #endif
-        __stcs(&gate_act[i],    (floatX)sg);
         __stcs(&swiglu_out[i],  (floatX)(sg * u));
     }
 }
 
-static void swiglu_forward(floatX *gate_act, floatX *swiglu_out,
-                            const floatX *gate_in, const floatX *up_in,
-                            int N, cudaStream_t stream) {
+static void swiglu_forward(floatX *swiglu_out,
+                           const floatX *gate_in, const floatX *up_in,
+                           int N, cudaStream_t stream) {
     swiglu_forward_kernel<<<CEIL_DIV(N, 256), 256, 0, stream>>>(
-        gate_act, swiglu_out, gate_in, up_in, N);
+        swiglu_out, gate_in, up_in, N);
     cudaCheck(cudaGetLastError());
 }
 
@@ -529,7 +584,6 @@ __global__ void swiglu_backward_kernel(
     floatX *__restrict__ d_up_in,
     const floatX *__restrict__ d_out,
     const floatX *__restrict__ gate_in,
-    const floatX *__restrict__ gate_act,
     const floatX *__restrict__ up_in,
     int N)
 {
@@ -537,9 +591,9 @@ __global__ void swiglu_backward_kernel(
          i += (size_t)blockDim.x * gridDim.x) {
         float dout_i = (float)__ldcs(&d_out[i]);
         float gi     = (float)__ldcs(&gate_in[i]);
-        float si     = (float)__ldcs(&gate_act[i]);
         float ui     = (float)__ldcs(&up_in[i]);
         float sig    = 1.0f / (1.0f + expf(-gi));
+        float si     = gi * sig;
         float dsilu  = si + sig * (1.0f - si);
         __stcs(&d_gate_in[i], (floatX)(dout_i * ui * dsilu));
         __stcs(&d_up_in[i],   (floatX)(dout_i * si));
@@ -548,11 +602,11 @@ __global__ void swiglu_backward_kernel(
 
 static void swiglu_backward(floatX *d_gate_in, floatX *d_up_in,
                              const floatX *d_out,
-                             const floatX *gate_in, const floatX *gate_act,
+                             const floatX *gate_in,
                              const floatX *up_in,
                              int N, cudaStream_t stream) {
     swiglu_backward_kernel<<<CEIL_DIV(N, 256), 256, 0, stream>>>(
-        d_gate_in, d_up_in, d_out, gate_in, gate_act, up_in, N);
+        d_gate_in, d_up_in, d_out, gate_in, up_in, N);
     cudaCheck(cudaGetLastError());
 }
 
@@ -807,7 +861,7 @@ void llama32_forward(LLaMA32 *model, const int *inputs, size_t B, size_t T) {
         // Layer-l activation slices
         floatX *l_rms1   = (model->recompute < 2) ? acts.rms1 + (size_t)l*B*T*C : acts.rms_f;
         float  *l_rms1_r = acts.rms1_rstd + (size_t)l * B * T;
-        floatX *l_qkvr   = acts.qkvr    + (size_t)l * B * T * (NH+2*NKV) * HD;
+        floatX *l_qkvr   = acts.qkvr    + (size_t)l * B * T * 3 * C;
         floatX *l_atty   = acts.atty    + (size_t)l * B * T * C;
         floatX *l_att    = acts.att     + (size_t)l * B * NH * T * T;
         floatX *l_res2   = acts.residual2 + (size_t)l * B * T * C;
@@ -845,6 +899,9 @@ void llama32_forward(LLaMA32 *model, const int *inputs, size_t B, size_t T) {
         // --- Attention forward (uses expanded Q,K,V in l_qkvr) ---
         if (T != model->seq_len)
             cudaCheck(cudaMemset(l_att, 0, B * NH * T * T * sizeof(floatX)));
+        cudaCheck(cudaMemcpyAsync(scratch, l_qkvr,
+                                  (size_t)B * T * 3 * C * sizeof(floatX),
+                                  cudaMemcpyDeviceToDevice, main_stream));
         attention_forward(l_atty, l_qkvr, l_att, scratch, B, T, C, NH, main_stream);
 
         // 3) Output projection
@@ -861,7 +918,7 @@ void llama32_forward(LLaMA32 *model, const int *inputs, size_t B, size_t T) {
         // up branch: up_w @ rms2  (use swiglu_out as temp storage for up_act)
         matmul_forward_cublas(l_swiglu, l_rms2, l_up_w, B, T, C, (int)FFN, main_stream);
         // pointwise: gate_a = silu(gate_a), swiglu = gate_a * up
-        swiglu_forward(l_gate_a, l_up_a, l_gate_a, l_swiglu, B*T*FFN, main_stream);
+        swiglu_forward(l_up_a, l_gate_a, l_swiglu, B*T*FFN, main_stream);
 
         // Down projection
         matmul_forward_cublas(scratch, l_up_a, l_down_w, B, T, (int)FFN, C, main_stream);
@@ -940,7 +997,6 @@ void llama32_backward_and_reduce(LLaMA32 *model, int *inputs, const int *targets
     const size_t Vp  = model->config.padded_vocab_size;
     const int    V   = model->config.vocab_size;
     const int n_rep  = (int)(NH / NKV);
-    (void)n_rep; // used indirectly
 
     ParameterTensors params = model->params;
     ParameterTensors grads  = model->grads;
@@ -959,6 +1015,16 @@ void llama32_backward_and_reduce(LLaMA32 *model, int *inputs, const int *targets
 
     float *scratchF = (float *)acts.output;
     floatX *scratchX = (floatX *)acts.output;
+    const size_t att_scratch_elems = (size_t)B * NH * T * T;
+    const size_t bt = (size_t)B * T;
+    size_t output_row = (NH + 2 * NKV) * HD;
+    if (NH * (size_t)T > output_row) output_row = NH * (size_t)T;
+    if (Vp > output_row) output_row = Vp;
+    const size_t output_total_elems = bt * output_row;
+    const size_t qkv_expanded_elems = bt * 3 * C;
+    const size_t ffn_grad_elems = 2 * bt * FFN;
+    const size_t mlp_scratch_elems = (ffn_grad_elems > qkv_expanded_elems) ? ffn_grad_elems : qkv_expanded_elems;
+    assert(att_scratch_elems + mlp_scratch_elems + qkv_expanded_elems <= output_total_elems);
 
     // Backward through lm_head (tied: grad goes to wte grads)
     matmul_backward_naive(acts.scratch_btc, grads.wte, acts.output,
@@ -998,7 +1064,7 @@ void llama32_backward_and_reduce(LLaMA32 *model, int *inputs, const int *targets
         // Activation pointers
         floatX *l_rms1  = (model->recompute < 2) ? acts.rms1 + (size_t)l*B*T*C : acts.rms_f;
         float  *l_rms1r = acts.rms1_rstd + (size_t)l * B * T;
-        floatX *l_qkvr  = acts.qkvr + (size_t)l*B*T*(NH+2*NKV)*HD;
+        floatX *l_qkvr  = acts.qkvr + (size_t)l*B*T*3*C;
         floatX *l_atty  = acts.atty + (size_t)l*B*T*C;
         floatX *l_att   = acts.att  + (size_t)l*B*NH*T*T;
         floatX *l_res2  = acts.residual2 + (size_t)l*B*T*C;
@@ -1007,17 +1073,26 @@ void llama32_backward_and_reduce(LLaMA32 *model, int *inputs, const int *targets
         floatX *l_gate_a= (model->recompute < 1) ? acts.gate_act  + (size_t)l*B*T*FFN : acts.gate_act;
         floatX *l_up_a  = (model->recompute < 1) ? acts.up_act    + (size_t)l*B*T*FFN : acts.up_act;
         floatX *l_swiglu= (model->recompute < 1) ? acts.swiglu_out+ (size_t)l*B*T*FFN : acts.swiglu_out;
-        floatX *l_gate_in = l_gate_a; // gate_in stored in gate_act slot before silu
+        floatX *l_gate_in = l_gate_a; // pre-SwiGLU gate projection output
+        floatX *l_up_in   = l_swiglu; // pre-SwiGLU up projection output
 
-        floatX *dl_bt_ffn = (floatX *)acts.gate_act; // scratch for FFN backward
+        // Reserve disjoint regions inside acts.output for FFN and attention scratch.
+        floatX *dl_bt_ffn = scratchX + att_scratch_elems;
+        floatX *dqkvr_tmp = dl_bt_ffn + mlp_scratch_elems;
+
+        if (model->recompute >= 1) {
+            matmul_forward_cublas(l_gate_a, l_rms2, l_gate_w, B, T, C, (int)FFN, main_stream);
+            matmul_forward_cublas(l_swiglu, l_rms2, l_up_w, B, T, C, (int)FFN, main_stream);
+            swiglu_forward(l_up_a, l_gate_a, l_swiglu, B*T*FFN, main_stream);
+        }
 
         // --- Backward MLP ---
         // d(down): dresidual += down_w^T @ d_swiglu
         matmul_backward_naive(dl_bt_ffn, dl_down_w, dresidual,
-                      l_swiglu, l_down_w, B, T, FFN, C, main_stream);
+                      l_up_a, l_down_w, B, T, FFN, C, main_stream);
         // d(swiglu pointwise): d_gate_in, d_up_in from d_swiglu
         swiglu_backward(dl_bt_ffn, dl_bt_ffn + B*T*FFN,   // reuse; treat as d_gate_in,d_up_in
-                        dl_bt_ffn, l_gate_in, l_gate_a, l_up_a,
+                dl_bt_ffn, l_gate_in, l_up_in,
                         B*T*FFN, main_stream);
         // d(gate proj): dl_rms2 += dl_gate_in @ gate_w
         matmul_backward_naive(dl_btc, dl_gate_w, dl_bt_ffn,
@@ -1035,12 +1110,12 @@ void llama32_backward_and_reduce(LLaMA32 *model, int *inputs, const int *targets
 
         // --- Backward Attention (assumes expanded QKV) ---
         floatX *buffer_a = l_atty;
-        floatX *buffer_b = (floatX *)acts.gate_act;
-        attention_backward(dl_bt_ffn, buffer_b, scratchX, buffer_a,
+        attention_backward(dl_bt_ffn, dqkvr_tmp, scratchX, buffer_a,
                            dl_btc, l_qkvr, l_att, B, T, C, NH, main_stream);
+        reduce_kv_grad(dqkvr_tmp, dl_bt_ffn, B*T, NH, NKV, n_rep, HD, main_stream);
 
         // --- Backward QKV proj ---
-        matmul_backward_naive(dl_btc, dl_qkvw, dl_bt_ffn,
+        matmul_backward_naive(dl_btc, dl_qkvw, dqkvr_tmp,
                       l_rms1, l_qkvw, B, T, C, (int)(NH+2*NKV)*HD,
                       main_stream);
 
@@ -1211,7 +1286,7 @@ float llama32_estimate_mfu(LLaMA32 *model, int num_tokens, float dt) {
     if (dt <= 0.0f || promised <= 0.0f) {
         return 0.0f;
     }
-    return flops / (dt * promised);
+    return flops / (dt * promised * 1e12f);
 }
 
 // ============================================================================
