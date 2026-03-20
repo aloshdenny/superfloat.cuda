@@ -579,7 +579,8 @@ void llama32_init_common(LLaMA32 *model) {
     model->master_weights = NULL;
     model->d_freqs_cis = NULL;
     model->rng_state = 13371337 + multi_gpu_config.process_rank;
-    model->use_master_weights = 1;
+    // BF16 pretraining: no FP32 master copy needed — saves ~9+ GiB on 3B.
+    model->use_master_weights = 0;
     model->init_state = true;
     model->recompute = 1;
 }
