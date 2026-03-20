@@ -94,6 +94,9 @@ Usage:
 #include "llmc/cuda_common.h"
 #if defined(ENABLE_Q115)
 #include "llmc/q115_common.cuh"
+#if defined(SF16_TRUE_FORWARD)
+#include "llmc/q131_common.cuh"
+#endif
 #endif
 #include "llmc/cuda_utils.cuh"
 #include "llmc/cublas_common.h"
@@ -421,6 +424,17 @@ static float2 *precompute_freqs_cis(int max_seq_len, int head_dim, float rope_th
 
 // GPU: apply RoPE in-place to the Q and K parts of packed QKV buffer.
 // qkv layout per (b,t): [Q: NH*HD | K: NKV*HD | V: NKV*HD]
+__device__ __forceinline__ float quantize_sf16_forward(float x) {
+#if defined(ENABLE_Q115)
+#if defined(SF16_TRUE_FORWARD)
+    x = simulate_q131(x);
+#endif
+    return simulate_q115(x);
+#else
+    return x;
+#endif
+}
+
 __global__ void rope_forward_kernel(
     floatX *__restrict__ qkv,
     const float2 *__restrict__ freqs, // (T, HD/2)
@@ -439,8 +453,10 @@ __global__ void rope_forward_kernel(
         int base = head * HD + i * 2;
         float x0 = (float)row[base], x1 = (float)row[base+1];
         float cv = f[i].x, sv = f[i].y;
-        row[base]   = (floatX)(x0*cv - x1*sv);
-        row[base+1] = (floatX)(x0*sv + x1*cv);
+        float y0 = x0 * cv - x1 * sv;
+        float y1 = x0 * sv + x1 * cv;
+        row[base]   = (floatX)quantize_sf16_forward(y0);
+        row[base+1] = (floatX)quantize_sf16_forward(y1);
     }
     // Rotate K heads
     for (int h = threadIdx.x; h < NKV * (HD / 2); h += blockDim.x) {
@@ -448,8 +464,10 @@ __global__ void rope_forward_kernel(
         int base = NH * HD + head * HD + i * 2;
         float x0 = (float)row[base], x1 = (float)row[base+1];
         float cv = f[i].x, sv = f[i].y;
-        row[base]   = (floatX)(x0*cv - x1*sv);
-        row[base+1] = (floatX)(x0*sv + x1*cv);
+        float y0 = x0 * cv - x1 * sv;
+        float y1 = x0 * sv + x1 * cv;
+        row[base]   = (floatX)quantize_sf16_forward(y0);
+        row[base+1] = (floatX)quantize_sf16_forward(y1);
     }
 }
 
@@ -478,8 +496,9 @@ __global__ void repeat_kv_kernel(
     int h    = (idx / HD) % (NKV * n_rep);
     int bt   = idx / (HD * NKV * n_rep);
     int kv_h = h / n_rep;
+    float v = (float)inp[(size_t)bt * NKV * HD + kv_h * HD + d];
     out[(size_t)bt * NKV * n_rep * HD + h * HD + d] =
-        inp[(size_t)bt * NKV * HD + kv_h * HD + d];
+        (floatX)quantize_sf16_forward(v);
 }
 
 static void repeat_kv(floatX *out, const floatX *inp,
@@ -567,7 +586,8 @@ __global__ void swiglu_forward_kernel(
         sg = (float)simulate_q115((floatX)sg);
         u  = (float)simulate_q115((floatX)u);
 #endif
-        __stcs(&swiglu_out[i],  (floatX)(sg * u));
+    float su = quantize_sf16_forward(sg * u);
+    __stcs(&swiglu_out[i],  (floatX)su);
     }
 }
 
@@ -754,10 +774,21 @@ void llama32_random_init(LLaMA32 *model, const char *model_str) {
         // Weight matrices
         // attn output proj and down_proj scaled by residual_scale
         float scale = (t == 3 || t == 7) ? init_scale * residual_scale : init_scale;
+#if defined(ENABLE_Q115)
+        if (t == 0) {
+            scale *= Q115_WTE_INIT_SCALE;
+        } else if (t == 2) {
+            scale *= Q115_QKV_INIT_SCALE;
+        }
+#endif
         float *buf = (float *)mallocCheck(n * sizeof(float));
         normal_(buf, n, 0.0f, scale, &rng);
         for (size_t j = 0; j < n; j++) {
-            cpu[offsets[t] + j] = (floatX)buf[j];
+            float v = buf[j];
+#if defined(ENABLE_Q115_WEIGHT_CONSTRAINT)
+            v = fmaxf(-1.0f, fminf(0.999969482421875f, v));
+#endif
+            cpu[offsets[t] + j] = (floatX)v;
         }
         free(buf);
     }
