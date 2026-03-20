@@ -302,23 +302,24 @@ void matmul_cublaslt(floatX *d, const floatX *a, const floatX *b,
                                  &heuristic, &returnedResults);
   if (returnedResults == 0) {
     // Try multiple compute types — different shapes/drivers need different types
-    cublasComputeType_t fallbacks[] = {
-      CUBLAS_COMPUTE_32F_FAST_16BF,
-      CUBLAS_COMPUTE_32F_FAST_TF32,
-      CUBLAS_COMPUTE_32F
+    // Also try EPILOGUE_BIAS with a zero bias if EPILOGUE_DEFAULT fails
+    struct { cublasComputeType_t ct; cudaDataType_t st; const char *name; } fallbacks[] = {
+      {CUBLAS_COMPUTE_32F_FAST_TF32, CUDA_R_32F, "FAST_TF32"},
+      {CUBLAS_COMPUTE_32F,           CUDA_R_32F, "32F"},
+      {CUBLAS_COMPUTE_16F,           CUDA_R_16F, "16F"},
     };
-    const char *names[] = {"FAST_16BF", "FAST_TF32", "32F"};
     for (int fi = 0; fi < 3 && returnedResults == 0; fi++) {
       cublasLtMatmulDesc_t fbDesc;
-      cublasCheck(cublasLtMatmulDescCreate(&fbDesc, fallbacks[fi], CUDA_R_32F));
+      cublasCheck(cublasLtMatmulDescCreate(&fbDesc, fallbacks[fi].ct, fallbacks[fi].st));
       cublasCheck(cublasLtMatmulDescSetAttribute(fbDesc, CUBLASLT_MATMUL_DESC_TRANSA,
           (transA) ? &opTranspose : &opNoTranspose, sizeof(opTranspose)));
       cublasCheck(cublasLtMatmulDescSetAttribute(fbDesc, CUBLASLT_MATMUL_DESC_TRANSB,
           (transB) ? &opTranspose : &opNoTranspose, sizeof(opNoTranspose)));
       cublasCheck(cublasLtMatmulDescSetAttribute(fbDesc, CUBLASLT_MATMUL_DESC_EPILOGUE,
           &epilogue, sizeof(epilogue)));
+      cudaDataType_t fb_scale = fallbacks[fi].st;
       cublasCheck(cublasLtMatmulDescSetAttribute(fbDesc, CUBLASLT_MATMUL_DESC_SCALE_TYPE,
-          &scale_type, sizeof(scale_type)));
+          &fb_scale, sizeof(fb_scale)));
       if (has_bias) {
         cublasDataType_t bdt = (sizeof(floatX) == 1) ? CUDA_R_16BF : CUBLAS_LOWP;
         cublasCheck(cublasLtMatmulDescSetAttribute(fbDesc, CUBLASLT_MATMUL_DESC_BIAS_DATA_TYPE, &bdt, sizeof(bdt)));
@@ -329,7 +330,7 @@ void matmul_cublaslt(floatX *d, const floatX *a, const floatX *b,
                                      BLayout, CLayout, DLayout, preference, 1,
                                      &heuristic, &fbResults);
       if (fbResults > 0) {
-        printf("cuBLASLt: using %s for m=%d n=%d k=%d\n", names[fi], m, n, k);
+        printf("cuBLASLt: using %s for m=%d n=%d k=%d\n", fallbacks[fi].name, m, n, k);
         cublasCheck(cublasLtMatmulDescDestroy(operationDesc));
         operationDesc = fbDesc;
         returnedResults = fbResults;
