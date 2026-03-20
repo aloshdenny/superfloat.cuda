@@ -389,6 +389,18 @@ void matmul_forward_cublas(floatX *out, const floatX *inp, const floatX *weight,
   matmul_naive_kernel<<<grid, block, 0, stream>>>(
       out, inp, weight, BT, (size_t)OC, (size_t)C);
   cudaCheck(cudaGetLastError());
+
+#if defined(ENABLE_Q115)
+  // Keep naive forward aligned with the cuBLASLt forward path: quantize every
+  // matmul output element at SF16 boundaries (and SF32->SF16 in true-forward).
+  if (total > 0) {
+    unsigned int num_blocks = (unsigned int)((total + 255) / 256);
+    if (num_blocks == 0u)
+      num_blocks = 1u;
+    q115_simulate_kernel<<<num_blocks, 256, 0, stream>>>(out, total);
+    cudaCheck(cudaGetLastError());
+  }
+#endif
 }
 
 // ---------------------------------------------------------------------------
