@@ -1379,6 +1379,7 @@ int main(int argc, char *argv[]) {
     cudaCheck(cudaEventCreate(&ev_end));
 
     // ---- Training loop ----
+    printf0("starting training loop...\n"); fflush(stdout);
     float norm = -1.0f;
     for (int step = 0; step <= num_iterations; step++) {
         bool last_step = (step == num_iterations);
