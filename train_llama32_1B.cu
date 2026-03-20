@@ -104,7 +104,7 @@ Usage:
 #include "llmc/encoder.cuh"      // encoder_forward, encoder_backward
 #include "llmc/rmsnorm.cuh"      // rmsnorm_forward, rmsnorm_backward
 #include "llmc/layernorm.cuh"    // fused_residual_forward5
-#include "llmc/matmul.cuh"       // matmul_forward_cublaslt, matmul_backward
+#include "llmc/matmul.cuh"       // matmul_forward_cublaslt, matmul_backward_naive
 #include "llmc/attention.cuh"    // attention_forward, attention_backward
 #include "llmc/fused_classifier.cuh"
 #include "llmc/adamw.cuh"
@@ -963,8 +963,8 @@ void llama32_backward_and_reduce(LLaMA32 *model, int *inputs, const int *targets
     floatX *scratchX = (floatX *)acts.output;
 
     // Backward through lm_head (tied: grad goes to wte grads)
-    matmul_backward(acts.scratch_btc, grads.wte, nullptr, acts.output,
-                    acts.rms_f, params.wte, nullptr, B, T, C, Vp, main_stream);
+    matmul_backward_naive(acts.scratch_btc, grads.wte, acts.output,
+                          acts.rms_f, params.wte, B, T, C, Vp, main_stream);
 
     // Backward through final RMSNorm
     floatX *residual_last = acts.residual3 + (size_t)(L-1) * B * T * C;
@@ -1015,25 +1015,25 @@ void llama32_backward_and_reduce(LLaMA32 *model, int *inputs, const int *targets
 
         // --- Backward MLP ---
         // d(down): dresidual += down_w^T @ d_swiglu
-        matmul_backward(dl_bt_ffn, dl_down_w, nullptr, dresidual,
-                        l_swiglu, l_down_w, scratchF, B, T, FFN, C, main_stream);
+        matmul_backward_naive(dl_bt_ffn, dl_down_w, dresidual,
+                      l_swiglu, l_down_w, B, T, FFN, C, main_stream);
         // d(swiglu pointwise): d_gate_in, d_up_in from d_swiglu
         swiglu_backward(dl_bt_ffn, dl_bt_ffn + B*T*FFN,   // reuse; treat as d_gate_in,d_up_in
                         dl_bt_ffn, l_gate_in, l_gate_a, l_up_a,
                         B*T*FFN, main_stream);
         // d(gate proj): dl_rms2 += dl_gate_in @ gate_w
-        matmul_backward(dl_btc, dl_gate_w, nullptr, dl_bt_ffn,
-                        l_rms2, l_gate_w, scratchF, B, T, C, FFN, main_stream);
+        matmul_backward_naive(dl_btc, dl_gate_w, dl_bt_ffn,
+                      l_rms2, l_gate_w, B, T, C, FFN, main_stream);
         // d(up proj): dl_rms2 += dl_up_in @ up_w (accumulates)
-        matmul_backward(dl_btc, dl_up_w, nullptr, dl_bt_ffn + B*T*FFN,
-                        l_rms2, l_up_w, scratchF, B, T, C, FFN, main_stream);
+        matmul_backward_naive(dl_btc, dl_up_w, dl_bt_ffn + B*T*FFN,
+                      l_rms2, l_up_w, B, T, C, FFN, main_stream);
         // d(pre-FFN RMSNorm)
         rmsnorm_backward(dresidual, dl_rms2w, scratchF,
                          dl_btc, l_res2, l_rms2w, l_rms2r, B, T, C, main_stream);
 
         // --- Backward Attention output proj ---
-        matmul_backward(dl_btc, dl_attn_ow, nullptr, dresidual,
-                        l_atty, l_attn_ow, scratchF, B, T, C, C, main_stream);
+        matmul_backward_naive(dl_btc, dl_attn_ow, dresidual,
+                      l_atty, l_attn_ow, B, T, C, C, main_stream);
 
         // --- Backward Attention (assumes expanded QKV) ---
         floatX *buffer_a = l_atty;
@@ -1042,9 +1042,9 @@ void llama32_backward_and_reduce(LLaMA32 *model, int *inputs, const int *targets
                            dl_btc, l_qkvr, l_att, B, T, C, NH, main_stream);
 
         // --- Backward QKV proj ---
-        matmul_backward(dl_btc, dl_qkvw, nullptr, dl_bt_ffn,
-                        l_rms1, l_qkvw, scratchF, B, T, C, (int)(NH+2*NKV)*HD,
-                        main_stream);
+        matmul_backward_naive(dl_btc, dl_qkvw, dl_bt_ffn,
+                      l_rms1, l_qkvw, B, T, C, (int)(NH+2*NKV)*HD,
+                      main_stream);
 
         // --- Backward pre-attention RMSNorm ---
         rmsnorm_backward(dresidual, dl_rms1w, scratchF,
