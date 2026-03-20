@@ -1162,11 +1162,38 @@ void llama32_backward_and_reduce(LLaMA32 *model, int *inputs, const int *targets
 // Grad norm
 // ============================================================================
 
+__global__ void sanitize_nonfinite_kernel(floatX *grad, size_t n, unsigned int *bad_count) {
+    size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    for (; idx < n; idx += (size_t)blockDim.x * gridDim.x) {
+        float g = (float)grad[idx];
+        if (!isfinite(g)) {
+            grad[idx] = (floatX)0;
+            atomicAdd(bad_count, 1u);
+        }
+    }
+}
+
 float llama32_calculate_grad_norm(LLaMA32 *model, MultiGpuConfig *mgc) {
     NVTX_RANGE_FN();
     floatX *gm = (floatX *)model->grads_memory;
     float *gns = (float *)model->acts.output;
+    unsigned int *bad_count = (unsigned int *)gns;
     float gns_cpu = 0.0f;
+
+    cudaCheck(cudaMemsetAsync(bad_count, 0, sizeof(unsigned int), main_stream));
+    const int block = 256;
+    unsigned int grid = (unsigned int)((model->num_parameters + block - 1) / block);
+    if (grid > 65535u) grid = 65535u;
+    if (grid == 0u) grid = 1u;
+    sanitize_nonfinite_kernel<<<grid, block, 0, main_stream>>>(gm, model->num_parameters, bad_count);
+    cudaCheck(cudaGetLastError());
+
+    unsigned int bad_cpu = 0;
+    cudaCheck(cudaMemcpy(&bad_cpu, bad_count, sizeof(unsigned int), cudaMemcpyDeviceToHost));
+    if (bad_cpu > 0) {
+        printf0("warning: sanitized %u non-finite gradients\n", bad_cpu);
+    }
+
     int num_slices[2] = {1, model->config.n_layers};
     int max_sums = get_max_num_block_sums(num_slices, 2);
     if (mgc->zero_stage == 1) {
@@ -1501,10 +1528,14 @@ int main(int argc, char *argv[]) {
         (void)zloss; (void)zgrad;
 
         float lr = get_learning_rate(&lr_sched, step);
-        float grad_scale = (grad_clip > 0.0f && norm > grad_clip)
-                           ? grad_clip / norm : 1.0f;
-        llama32_update(&model, lr, 0.9f, 0.95f, 1e-8f, weight_decay,
-                       grad_scale, step+1, &multi_gpu_config);
+        if (!isfinite(norm)) {
+            printf0("warning: non-finite grad norm at step %d, skipping update\n", step + 1);
+        } else {
+            float grad_scale = (grad_clip > 0.0f && norm > grad_clip)
+                               ? grad_clip / norm : 1.0f;
+            llama32_update(&model, lr, 0.9f, 0.95f, 1e-8f, weight_decay,
+                           grad_scale, step+1, &multi_gpu_config);
+        }
 
         cudaCheck(cudaEventRecord(ev_end));
         cudaCheck(cudaEventSynchronize(ev_end));
