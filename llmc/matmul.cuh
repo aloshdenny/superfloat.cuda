@@ -392,52 +392,12 @@ void matmul_forward_cublaslt(floatX *out, floatX *inp, floatX *weight,
 
 // ---------------------------------------------------------------------------
 // Forward GEMM for bias-free models (LLaMA).
-// cuBLASLt fails to find algorithms for LLaMA's matrix dimensions on this
-// system. cublasGemmEx with BF16 output also returns NOT_SUPPORTED.
-// Solution: use cublasGemmEx with FP32 output (universally supported),
-// then cast FP32→BF16 with a small kernel. Uses a scratch FP32 buffer.
+// Simply delegates to matmul_forward_cublaslt with NULL bias (EPILOGUE_DEFAULT).
+// The fallback chain in matmul_cublaslt tries multiple compute types.
 // ---------------------------------------------------------------------------
-static float *g_fp32_scratch = nullptr;
-static size_t g_fp32_scratch_size = 0;
-
-__global__ void cast_fp32_to_bf16_kernel(floatX *dst, const float *src, size_t N) {
-  size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-  if (idx < N) {
-    dst[idx] = (floatX)src[idx];
-  }
-}
-
 void matmul_forward_cublas(floatX *out, const floatX *inp, const floatX *weight,
                            int B, int T, int C, int OC, cudaStream_t stream) {
-  NVTX_RANGE_FN();
-  size_t out_size = (size_t)B * T * OC;
-  // Lazy-allocate FP32 scratch buffer (grows, never shrinks)
-  if (out_size > g_fp32_scratch_size) {
-    if (g_fp32_scratch) { cudaFree(g_fp32_scratch); }
-    cudaCheck(cudaMalloc(&g_fp32_scratch, out_size * sizeof(float)));
-    g_fp32_scratch_size = out_size;
-  }
-
-  cublasCheck(cublasSetStream(cublas_handle, stream));
-  const float alpha = 1.f, beta = 0.f;
-  // out_fp32[BT, OC] = inp[BT, C] @ weight[OC, C]^T
-  // Column-major: weight^T is (OC x C), inp^T is (C x BT)
-  cublasCheck(cublasGemmEx(
-      cublas_handle,
-      CUBLAS_OP_T, CUBLAS_OP_N,
-      OC, B * T, C,
-      &alpha,
-      weight, CUBLAS_LOWP, C,     // BF16 input A
-      inp,    CUBLAS_LOWP, C,     // BF16 input B
-      &beta,
-      g_fp32_scratch, CUDA_R_32F, OC,  // FP32 output (always supported)
-      CUBLAS_COMPUTE_32F,
-      CUBLAS_GEMM_DEFAULT           // let cuBLAS pick (not forced Tensor Ops)
-  ));
-  // Cast FP32 → BF16
-  int nblocks = (int)((out_size + 255) / 256);
-  cast_fp32_to_bf16_kernel<<<nblocks, 256, 0, stream>>>(out, g_fp32_scratch, out_size);
-  cudaCheck(cudaGetLastError());
+  matmul_forward_cublaslt(out, (floatX*)inp, (floatX*)weight, NULL, B, T, C, OC, stream);
 }
 
 void matmul_backward(floatX *dinp, floatX *dweight, floatX *dbias, floatX *dout,
