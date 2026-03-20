@@ -296,27 +296,41 @@ void matmul_cublaslt(floatX *d, const floatX *a, const floatX *b,
                                              CUBLASLT_MATMUL_DESC_SCALE_TYPE,
                                              &scale_type, sizeof(scale_type)));
 
-  // find a suitable algorithm
+  // Exhaustive search over all compute types
+  // Print diagnostic on first call to help debug cuBLASLt issues
+  static bool first_call = true;
+  cublasComputeType_t try_computes[] = {
+    CUBLAS_COMPUTE_32F,            // 68
+    CUBLAS_COMPUTE_32F_FAST_16F,   // 74
+    CUBLAS_COMPUTE_32F_FAST_TF32,  // 77
+    CUBLAS_COMPUTE_32F_FAST_16BF,  // 78 (or 68 if not defined)
+  };
+  const char *try_names[] = {"32F", "FAST_16F", "FAST_TF32", "FAST_16BF"};
+  
+  // Try primary compute type first
   cublasLtMatmulAlgoGetHeuristic(cublaslt_handle, operationDesc, ALayout,
                                  BLayout, CLayout, DLayout, preference, 1,
                                  &heuristic, &returnedResults);
+  if (first_call) {
+    printf("[cuBLASLt diag] primary compute=%d ws=%zuMB m=%d n=%d k=%d bias=%d -> %d results\n",
+           (int)cublas_compute, cublaslt_workspace_size/(1024*1024), m, n, k, has_bias, returnedResults);
+  }
+  
   if (returnedResults == 0) {
-    // Try multiple compute types — different shapes/drivers need different types
-    // Also try EPILOGUE_BIAS with a zero bias if EPILOGUE_DEFAULT fails
-    struct { cublasComputeType_t ct; cudaDataType_t st; const char *name; } fallbacks[] = {
-      {CUBLAS_COMPUTE_32F_FAST_TF32, CUDA_R_32F, "FAST_TF32"},
-      {CUBLAS_COMPUTE_32F,           CUDA_R_32F, "32F"},
-    };
-    for (int fi = 0; fi < 2 && returnedResults == 0; fi++) {
+    // Try all compute types exhaustively
+    for (int fi = 0; fi < 4 && returnedResults == 0; fi++) {
+      // Skip if same as primary
+      if (try_computes[fi] == cublas_compute) continue;
+      
       cublasLtMatmulDesc_t fbDesc;
-      cublasCheck(cublasLtMatmulDescCreate(&fbDesc, fallbacks[fi].ct, fallbacks[fi].st));
+      cublasCheck(cublasLtMatmulDescCreate(&fbDesc, try_computes[fi], CUDA_R_32F));
       cublasCheck(cublasLtMatmulDescSetAttribute(fbDesc, CUBLASLT_MATMUL_DESC_TRANSA,
           (transA) ? &opTranspose : &opNoTranspose, sizeof(opTranspose)));
       cublasCheck(cublasLtMatmulDescSetAttribute(fbDesc, CUBLASLT_MATMUL_DESC_TRANSB,
           (transB) ? &opTranspose : &opNoTranspose, sizeof(opNoTranspose)));
       cublasCheck(cublasLtMatmulDescSetAttribute(fbDesc, CUBLASLT_MATMUL_DESC_EPILOGUE,
           &epilogue, sizeof(epilogue)));
-      cudaDataType_t fb_scale = fallbacks[fi].st;
+      cudaDataType_t fb_scale = CUDA_R_32F;
       cublasCheck(cublasLtMatmulDescSetAttribute(fbDesc, CUBLASLT_MATMUL_DESC_SCALE_TYPE,
           &fb_scale, sizeof(fb_scale)));
       if (has_bias) {
@@ -328,8 +342,11 @@ void matmul_cublaslt(floatX *d, const floatX *a, const floatX *b,
       cublasLtMatmulAlgoGetHeuristic(cublaslt_handle, fbDesc, ALayout,
                                      BLayout, CLayout, DLayout, preference, 1,
                                      &heuristic, &fbResults);
+      if (first_call) {
+        printf("[cuBLASLt diag] try %s (compute=%d) -> %d results\n", try_names[fi], (int)try_computes[fi], fbResults);
+      }
       if (fbResults > 0) {
-        printf("cuBLASLt: using %s for m=%d n=%d k=%d\n", fallbacks[fi].name, m, n, k);
+        printf("cuBLASLt: using %s for m=%d n=%d k=%d\n", try_names[fi], m, n, k);
         cublasCheck(cublasLtMatmulDescDestroy(operationDesc));
         operationDesc = fbDesc;
         returnedResults = fbResults;
@@ -342,6 +359,9 @@ void matmul_cublaslt(floatX *d, const floatX *a, const floatX *b,
       exit(EXIT_FAILURE);
     }
   }
+  first_call = false;
+
+
 
   // set whether to accumulate (i.e. D += C) or not - note this isn't considered
   // in algorithm selection (?!)
