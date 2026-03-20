@@ -352,25 +352,68 @@ void matmul_forward_cublaslt(floatX *out, floatX *inp, floatX *weight,
 }
 
 // ---------------------------------------------------------------------------
-// Forward GEMM for LLaMA (no bias). cuBLASLt only has Tensor Core algorithms
-// for CUBLASLT_EPILOGUE_BIAS on this system — CUBLASLT_EPILOGUE_DEFAULT
-// returns 0 results for LLaMA's matrix dimensions. Workaround: pass a static
-// all-zero bias buffer. Adding zeros is mathematically a no-op.
+// Forward GEMM for LLaMA (no bias).
+// cuBLASLt fails to find algorithms for LLaMA's matrix dimensions with ANY
+// compute type or epilogue on this system. cublasSgemm (plain FP32) always
+// works. Cast BF16/FP16 → FP32, run SGEMM, cast output FP32 → BF16/FP16.
 // ---------------------------------------------------------------------------
-static floatX *g_zero_bias = nullptr;
-static int     g_zero_bias_oc = 0;
+static float *g_sgemm_A = nullptr;   // FP32 copy of weight [OC x C]
+static float *g_sgemm_B = nullptr;   // FP32 copy of inp    [BT x C]
+static float *g_sgemm_C = nullptr;   // FP32 output         [OC x BT]
+static size_t g_sgemm_A_size = 0;
+static size_t g_sgemm_B_size = 0;
+static size_t g_sgemm_C_size = 0;
+
+__global__ void upcast_to_fp32(float *dst, const floatX *src, size_t N) {
+  size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < N) dst[i] = (float)src[i];
+}
+__global__ void downcast_from_fp32(floatX *dst, const float *src, size_t N) {
+  size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < N) dst[i] = (floatX)src[i];
+}
 
 void matmul_forward_cublas(floatX *out, const floatX *inp, const floatX *weight,
                            int B, int T, int C, int OC, cudaStream_t stream) {
-  // Grow zero bias buffer on demand (never shrinks — amortised allocation)
-  if (OC > g_zero_bias_oc) {
-    if (g_zero_bias) cudaFree(g_zero_bias);
-    cudaCheck(cudaMalloc(&g_zero_bias, (size_t)OC * sizeof(floatX)));
-    cudaCheck(cudaMemset(g_zero_bias, 0, (size_t)OC * sizeof(floatX)));
-    g_zero_bias_oc = OC;
-  }
-  // Pass zero bias → CUBLASLT_EPILOGUE_BIAS → algorithms exist on this system
-  matmul_forward_cublaslt(out, (floatX*)inp, (floatX*)weight, g_zero_bias, B, T, C, OC, stream);
+  NVTX_RANGE_FN();
+  size_t szA = (size_t)OC * C;           // weight: OC x C
+  size_t szB = (size_t)B * T * C;        // inp:    BT x C
+  size_t szC = (size_t)OC * B * T;       // out:    OC x BT
+
+  // Lazy-grow FP32 scratch buffers
+  if (szA > g_sgemm_A_size) { if (g_sgemm_A) cudaFree(g_sgemm_A); cudaCheck(cudaMalloc(&g_sgemm_A, szA*sizeof(float))); g_sgemm_A_size = szA; }
+  if (szB > g_sgemm_B_size) { if (g_sgemm_B) cudaFree(g_sgemm_B); cudaCheck(cudaMalloc(&g_sgemm_B, szB*sizeof(float))); g_sgemm_B_size = szB; }
+  if (szC > g_sgemm_C_size) { if (g_sgemm_C) cudaFree(g_sgemm_C); cudaCheck(cudaMalloc(&g_sgemm_C, szC*sizeof(float))); g_sgemm_C_size = szC; }
+
+  // Cast inputs to FP32
+  upcast_to_fp32<<<CEIL_DIV(szA, 256), 256, 0, stream>>>(g_sgemm_A, weight, szA);
+  upcast_to_fp32<<<CEIL_DIV(szB, 256), 256, 0, stream>>>(g_sgemm_B, inp,    szB);
+  cudaCheck(cudaGetLastError());
+
+  // SGEMM: C = A^T * B  →  out[OC x BT] = weight[OC x C]^T-nope, weight stored as [OC,C]
+  // Column-major view: weight is (C x OC) with ld=C, inp is (C x BT) with ld=C
+  // cublasSgemm(handle, transA, transB, m, n, k, alpha, A, lda, B, ldb, beta, C, ldc)
+  // We want: out(OC,BT) = weight(OC,C) @ inp(C,BT)
+  // In col-major: weight col-major is (C rows, OC cols) with lda=C → CUBLAS_OP_T gives OC x C
+  // Simpler: out = weight * inp^T, no: out[OC,BT] = weight[OC,C] @ inp[BT,C]^T
+  // Col-major equiv: op(A)=weight^T[C,OC], op(B)=inp[C,BT], C=out[OC,BT]
+  //   → SGEMM with transA=T m=OC n=BT k=C A=weight lda=C B=inp ldb=C C=out ldc=OC
+  cublasCheck(cublasSetStream(cublas_handle, stream));
+  const float alpha = 1.f, beta = 0.f;
+  cublasCheck(cublasSgemm(
+      cublas_handle,
+      CUBLAS_OP_T, CUBLAS_OP_N,   // weight^T, inp (no transpose)
+      OC, B * T, C,               // m=OC, n=BT, k=C
+      &alpha,
+      g_sgemm_A, C,               // A=weight(C cols, OC rows in col-major), lda=C
+      g_sgemm_B, C,               // B=inp(C rows, BT cols in col-major), ldb=C
+      &beta,
+      g_sgemm_C, OC               // C=out(OC rows, BT cols), ldc=OC
+  ));
+
+  // Cast FP32 output back to floatX
+  downcast_from_fp32<<<CEIL_DIV(szC, 256), 256, 0, stream>>>(out, g_sgemm_C, szC);
+  cudaCheck(cudaGetLastError());
 }
 
 void matmul_backward(floatX *dinp, floatX *dweight, floatX *dbias, floatX *dout,
