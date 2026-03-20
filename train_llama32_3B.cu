@@ -540,10 +540,8 @@ __global__ void swiglu_backward_kernel(
         float ui     = (float)__ldcs(&up_in[i]);
         float sig    = 1.0f / (1.0f + expf(-gi));
         float dsilu  = si + sig * (1.0f - si);
-        float prev_dg = (float)__ldcs(&d_gate_in[i]);
-        float prev_du = (float)__ldcs(&d_up_in[i]);
-        __stcs(&d_gate_in[i], (floatX)(prev_dg + dout_i * ui * dsilu));
-        __stcs(&d_up_in[i],   (floatX)(prev_du + dout_i * si));
+        __stcs(&d_gate_in[i], (floatX)(dout_i * ui * dsilu));
+        __stcs(&d_up_in[i],   (floatX)(dout_i * si));
     }
 }
 
@@ -1204,8 +1202,11 @@ float llama32_estimate_mfu(LLaMA32 *model, int num_tokens, float dt) {
     // (ignoring attention quadratic term for simplicity)
     float N = (float)model->num_parameters;
     float flops = 6.0f * N * (float)num_tokens;
-    float mfu = flops / (dt * get_flops_promised(deviceProp.name, deviceProp.major + deviceProp.minor * 0.1f));
-    return mfu;
+    float promised = get_flops_promised(deviceProp.name, PRECISION_MODE);
+    if (dt <= 0.0f || promised <= 0.0f) {
+        return 0.0f;
+    }
+    return flops / (dt * promised);
 }
 
 // ============================================================================
