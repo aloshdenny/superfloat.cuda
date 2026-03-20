@@ -1372,12 +1372,12 @@ int main(int argc, char *argv[]) {
     int num_iterations       = -1;       // -1 = auto
     int inference_only       = 0;
 #if defined(ENABLE_Q115)
-    float learning_rate      = 1e-4f;
-    int warmup_iters         = 200;
+    float learning_rate      = 5e-5f;
+    int warmup_iters         = 400;
     float grad_clip          = 0.5f;
 #else
-    float learning_rate      = 3e-4f;
-    int warmup_iters         = 0;
+    float learning_rate      = 5e-5f;
+    int warmup_iters         = 400;
     float grad_clip          = 1.0f;
 #endif
     float lr_decay_frac      = 1.0f;
