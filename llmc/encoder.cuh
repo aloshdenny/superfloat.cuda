@@ -37,11 +37,18 @@ __global__ void encoder_forward_kernel3(floatX* out,
 
     floatX* out_btc = out + b * T * C + t * C + c;
     const floatX* wte_ix = wte + ix * C + c;
-    const floatX* wpe_tc = wpe + t * C + c;
 
     x128 packed_out;
     x128 wte128 = load128cs(wte_ix);
-    x128 wpe128 = load128cs(wpe_tc);
+    x128 wpe128;
+    if (wpe != nullptr) {
+        const floatX* wpe_tc = wpe + t * C + c;
+        wpe128 = load128cs(wpe_tc);
+    } else {
+        for (int k = 0; k < x128::size; k++) {
+            wpe128[k] = (floatX)0;
+        }
+    }
     
 #if defined(ENABLE_Q131)
     // Q1.31 mode: add using Q1.31 arithmetic (saturating add)
@@ -211,12 +218,14 @@ void encoder_backward(floatX* dwte, floatX* dwpe, floatX* scratch, // gpu output
                       int B, int T, int C, unsigned int seed, cudaStream_t stream) {
     NVTX_RANGE_FN();
 
-    // Launch wpe kernel first (so it runs on the GPU in parallel with the CPU pre-processing for wte)
+    // Launch wpe kernel first when positional embeddings are present.
     const int block_size = 256;
-    const int N = T * C / x128::size;
-    const int grid_size = CEIL_DIV(N, block_size);
-    wpe_backward_kernel<<<grid_size, block_size, 0, stream>>>(dwpe, dout, inp, B, T, C, seed);
-    cudaCheck(cudaGetLastError());
+    if (dwpe != nullptr) {
+        const int N = T * C / x128::size;
+        const int grid_size = CEIL_DIV(N, block_size);
+        wpe_backward_kernel<<<grid_size, block_size, 0, stream>>>(dwpe, dout, inp, B, T, C, seed);
+        cudaCheck(cudaGetLastError());
+    }
 
     // check the GPU scratch buffer is large enough to hold the bucket info and workload indices
     // todo - this is trivially true given hardcoded scratch buffer size here, is this useful?
