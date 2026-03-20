@@ -427,6 +427,27 @@ __global__ void matmul_backward_dinp_kernel(
   }
 }
 
+__global__ void matmul_backward_dinp_accum_kernel(
+    floatX* __restrict__ dinp,
+    const floatX* __restrict__ dout,
+    const floatX* __restrict__ weight,
+    size_t BT, size_t OC, size_t C
+) {
+  size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  const size_t total = BT * C;
+  const size_t stride = (size_t)blockDim.x * gridDim.x;
+
+  for (; idx < total; idx += stride) {
+    size_t bt = idx / C;
+    size_t c  = idx - bt * C;
+    float acc = 0.f;
+    for (size_t oc = 0; oc < OC; oc++) {
+      acc += (float)dout[bt * OC + oc] * (float)weight[oc * C + c];
+    }
+    dinp[idx] = (floatX)((float)dinp[idx] + acc);
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Naive backward dweight: dweight[oc, c] += sum_bt(dout[bt, oc] * inp[bt, c])
 // ---------------------------------------------------------------------------
@@ -458,6 +479,7 @@ __global__ void matmul_backward_dweight_kernel(
 void matmul_backward_naive(floatX *dinp, floatX *dweight, floatX *dout,
                            floatX *inp, floatX *weight,
                            int B, int T, int C, int OC,
+                           bool accumulate_dinp,
                            cudaStream_t stream) {
   NVTX_RANGE_FN();
   const size_t BT = (size_t)B * (size_t)T;
@@ -469,8 +491,13 @@ void matmul_backward_naive(floatX *dinp, floatX *dweight, floatX *dout,
     unsigned int grid = (unsigned int)((total + block - 1) / block);
     if (grid > 65535u) grid = 65535u;
     if (grid == 0u) grid = 1u;
-    matmul_backward_dinp_kernel<<<grid, block, 0, stream>>>(
-        dinp, dout, weight, BT, (size_t)OC, (size_t)C);
+    if (accumulate_dinp) {
+      matmul_backward_dinp_accum_kernel<<<grid, block, 0, stream>>>(
+          dinp, dout, weight, BT, (size_t)OC, (size_t)C);
+    } else {
+      matmul_backward_dinp_kernel<<<grid, block, 0, stream>>>(
+          dinp, dout, weight, BT, (size_t)OC, (size_t)C);
+    }
     cudaCheck(cudaGetLastError());
   }
 
