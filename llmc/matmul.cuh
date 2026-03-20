@@ -352,61 +352,38 @@ void matmul_forward_cublaslt(floatX *out, floatX *inp, floatX *weight,
 }
 
 // ---------------------------------------------------------------------------
-// Custom tiled matmul kernel — no cuBLAS dependency.
-// Computes: out[BT, OC] = inp[BT, C] @ weight[OC, C]^T
-// Each thread computes one output element.
-// Accumulates in FP32 regardless of input dtype for numerical stability.
+// Naive matmul: one thread per output element. No shared memory.
+// out[bt, oc] = sum_c(inp[bt, c] * wt[oc, c])
 // ---------------------------------------------------------------------------
-#define MATMUL_TILE 32
-__global__ void matmul_nt_kernel(
+__global__ void matmul_naive_kernel(
     floatX* __restrict__ out,        // [BT, OC]
     const floatX* __restrict__ inp,  // [BT, C]
     const floatX* __restrict__ wt,   // [OC, C]
     int BT, int OC, int C
 ) {
-  __shared__ float sA[MATMUL_TILE][MATMUL_TILE + 1]; // inp tile, +1 avoids bank conflict
-  __shared__ float sB[MATMUL_TILE][MATMUL_TILE + 1]; // weight tile
-
-  int row = blockIdx.y * MATMUL_TILE + threadIdx.y; // BT index
-  int col = blockIdx.x * MATMUL_TILE + threadIdx.x; // OC index
+  size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  size_t total = (size_t)BT * OC;
+  if (idx >= total) return;
+  int bt = (int)(idx / OC);
+  int oc = (int)(idx % OC);
   float acc = 0.f;
-
-  for (int t = 0; t < (C + MATMUL_TILE - 1) / MATMUL_TILE; t++) {
-    // sA[ty][tx]: inp row=ty (BT_local), col=tx (K_local)
-    int kA = t * MATMUL_TILE + threadIdx.x;
-    sA[threadIdx.y][threadIdx.x] = (row < BT && kA < C) ? (float)inp[row * C + kA] : 0.f;
-
-    // sB[tx][ty]: weight row=tx (OC_local), col=ty (K_local)  
-    // threadIdx.x = col_local (OC), threadIdx.y = k_local
-    int kB = t * MATMUL_TILE + threadIdx.y;
-    int col_oc = blockIdx.x * MATMUL_TILE + threadIdx.x;
-    sB[threadIdx.x][threadIdx.y] = (col_oc < OC && kB < C) ? (float)wt[col_oc * C + kB] : 0.f;
-    __syncthreads();
-
-    #pragma unroll
-    for (int k = 0; k < MATMUL_TILE; k++) {
-      // out[row,col] += inp[row,k] * weight[col,k]
-      // = sA[threadIdx.y][k] * sB[threadIdx.x][k]
-      acc += sA[threadIdx.y][k] * sB[threadIdx.x][k];
-    }
-    __syncthreads();
+  const floatX* row_inp = inp + (size_t)bt * C;
+  const floatX* row_wt  = wt  + (size_t)oc * C;
+  for (int c = 0; c < C; c++) {
+    acc += (float)row_inp[c] * (float)row_wt[c];
   }
-
-  // Output in column-major [OC, BT] to match cuBLASLt convention:
-  // out[oc, bt] = out[bt * OC + oc]  (col-major OC stride=1, BT stride=OC)
-  // This is identical to row-major [BT, OC] in memory — same layout.
-  if (row < BT && col < OC) {
-    out[row * OC + col] = (floatX)acc;  // row-major [BT,OC] == col-major [OC,BT]
-  }
+  out[(size_t)bt * OC + oc] = (floatX)acc;
 }
 
 void matmul_forward_cublas(floatX *out, const floatX *inp, const floatX *weight,
                            int B, int T, int C, int OC, cudaStream_t stream) {
   NVTX_RANGE_FN();
-  int BT = B * T;
-  dim3 grid(CEIL_DIV(OC, MATMUL_TILE), CEIL_DIV(BT, MATMUL_TILE));
-  dim3 block(MATMUL_TILE, MATMUL_TILE);
-  matmul_nt_kernel<<<grid, block, 0, stream>>>(out, inp, weight, BT, OC, C);
+  size_t BT    = (size_t)B * T;
+  size_t total = BT * OC;                    // up to 2048*128256 = 262M; needs size_t
+  int block    = 256;
+  size_t grid  = (total + block - 1) / block; // up to ~1M blocks; fits in int but use size_t
+  matmul_naive_kernel<<<(unsigned int)grid, block, 0, stream>>>(
+      out, inp, weight, (int)BT, OC, C);
   cudaCheck(cudaGetLastError());
 }
 
