@@ -121,6 +121,7 @@ char filename_buffer[512];
 cudaDeviceProp deviceProp;
 cudaStream_t main_stream;
 constexpr const size_t IO_BUF_SIZE = 32 * 1024 * 1024;
+static unsigned int g_last_sanitized_grad_count = 0;
 
 // ============================================================================
 // LLaMA 3.2 Model Configuration
@@ -1059,7 +1060,7 @@ void llama32_backward_and_reduce(LLaMA32 *model, int *inputs, const int *targets
 
     // Backward through lm_head (tied: grad goes to wte grads)
     matmul_backward_naive(acts.scratch_btc, grads.wte, acts.output,
-                          acts.rms_f, params.wte, B, T, C, Vp, main_stream);
+                          acts.rms_f, params.wte, B, T, C, Vp, false, main_stream);
 
     // Backward through final RMSNorm
     floatX *residual_last = acts.residual3 + (size_t)(L-1) * B * T * C;
@@ -1120,24 +1121,24 @@ void llama32_backward_and_reduce(LLaMA32 *model, int *inputs, const int *targets
         // --- Backward MLP ---
         // d(down): dresidual += down_w^T @ d_swiglu
         matmul_backward_naive(dl_bt_ffn, dl_down_w, dresidual,
-                      l_up_a, l_down_w, B, T, FFN, C, main_stream);
+                      l_up_a, l_down_w, B, T, FFN, C, false, main_stream);
         // d(swiglu pointwise): d_gate_in, d_up_in from d_swiglu
         swiglu_backward(dl_bt_ffn, dl_bt_ffn + B*T*FFN,   // reuse; treat as d_gate_in,d_up_in
                 dl_bt_ffn, l_gate_in, l_up_in,
                         B*T*FFN, main_stream);
         // d(gate proj): dl_rms2 += dl_gate_in @ gate_w
         matmul_backward_naive(dl_btc, dl_gate_w, dl_bt_ffn,
-                      l_rms2, l_gate_w, B, T, C, FFN, main_stream);
+                      l_rms2, l_gate_w, B, T, C, FFN, false, main_stream);
         // d(up proj): dl_rms2 += dl_up_in @ up_w (accumulates)
         matmul_backward_naive(dl_btc, dl_up_w, dl_bt_ffn + B*T*FFN,
-                      l_rms2, l_up_w, B, T, C, FFN, main_stream);
+                      l_rms2, l_up_w, B, T, C, FFN, true, main_stream);
         // d(pre-FFN RMSNorm)
         rmsnorm_backward(dresidual, dl_rms2w, scratchF,
                          dl_btc, l_res2, l_rms2w, l_rms2r, B, T, C, main_stream);
 
         // --- Backward Attention output proj ---
         matmul_backward_naive(dl_btc, dl_attn_ow, dresidual,
-                      l_atty, l_attn_ow, B, T, C, C, main_stream);
+                      l_atty, l_attn_ow, B, T, C, C, false, main_stream);
 
         // --- Backward Attention (assumes expanded QKV) ---
         floatX *buffer_a = l_atty;
@@ -1148,7 +1149,7 @@ void llama32_backward_and_reduce(LLaMA32 *model, int *inputs, const int *targets
         // --- Backward QKV proj ---
         matmul_backward_naive(dl_btc, dl_qkvw, dqkvr_tmp,
                       l_rms1, l_qkvw, B, T, C, (int)(NH+2*NKV)*HD,
-                      main_stream);
+                      false, main_stream);
 
         // --- Backward pre-attention RMSNorm ---
         rmsnorm_backward(dresidual, dl_rms1w, scratchF,
@@ -1221,6 +1222,7 @@ float llama32_calculate_grad_norm(LLaMA32 *model, MultiGpuConfig *mgc) {
 
     unsigned int bad_cpu = 0;
     cudaCheck(cudaMemcpy(&bad_cpu, bad_count, sizeof(unsigned int), cudaMemcpyDeviceToHost));
+    g_last_sanitized_grad_count = bad_cpu;
     if (bad_cpu > 0) {
         printf0("warning: sanitized %u non-finite/extreme gradients\n", bad_cpu);
     }
@@ -1369,11 +1371,17 @@ int main(int argc, char *argv[]) {
     int total_batch_size     = 0;        // 0 = auto (B*T*ddp_world)
     int num_iterations       = -1;       // -1 = auto
     int inference_only       = 0;
+#if defined(ENABLE_Q115)
+    float learning_rate      = 1e-4f;
+    int warmup_iters         = 200;
+    float grad_clip          = 0.5f;
+#else
     float learning_rate      = 3e-4f;
     int warmup_iters         = 0;
+    float grad_clip          = 1.0f;
+#endif
     float lr_decay_frac      = 1.0f;
     float weight_decay       = 0.0f;
-    float grad_clip          = 1.0f;
     int val_loss_every       = 0;
     int val_max_steps        = 20;
     int overfit_single_batch = 0;
@@ -1559,7 +1567,12 @@ int main(int argc, char *argv[]) {
         (void)zloss; (void)zgrad;
 
         float lr = get_learning_rate(&lr_sched, step);
-        if (!isfinite(norm)) {
+        bool excessive_sanitize =
+            g_last_sanitized_grad_count > (unsigned int)(model.num_parameters / 1000);
+        if (excessive_sanitize) {
+            printf0("warning: sanitized %u gradients at step %d, skipping update\n",
+                    g_last_sanitized_grad_count, step + 1);
+        } else if (!isfinite(norm)) {
             printf0("warning: non-finite grad norm at step %d, skipping update\n", step + 1);
         } else {
             float grad_scale = (grad_clip > 0.0f && norm > grad_clip)
