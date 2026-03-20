@@ -49,12 +49,13 @@ ifeq ($(OS),Windows_NT)
 else
   NVCC ?= $(shell which nvcc 2>/dev/null || echo /usr/local/cuda/bin/nvcc)
   NVCC_FLAGS = --threads=0 -t=0 --use_fast_math -std=c++17 -O3 -arch=sm_89
-  NVCC_INCLUDES = -I/usr/local/lib/python3.12/site-packages/nvidia/cublas/include \
+  # System CUDA headers FIRST (full BF16 support), then pip as fallback
+  NVCC_INCLUDES = -I/usr/local/cuda/include \
+                  -I/usr/include \
+                  -I/usr/local/lib/python3.12/site-packages/nvidia/cublas/include \
                   -I/usr/local/lib/python3.12/site-packages/nvidia/cudart/include \
                   -I/usr/local/lib/python3.12/site-packages/nvidia/nvtx/include \
-                  -I/usr/local/lib/python3.12/site-packages/nvidia/cudnn/include \
-                  -I/usr/local/cuda/include \
-                  -I/usr/include
+                  -I/usr/local/lib/python3.12/site-packages/nvidia/cudnn/include
   # Link against local shim directory first.
   # Pass rpath via -Xlinker (NOT -Wl,...) so runtime can find libs next to the binary.
   NVCC_LDFLAGS = -L. -Xlinker -rpath -Xlinker \$$ORIGIN

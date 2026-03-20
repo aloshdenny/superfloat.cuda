@@ -295,65 +295,14 @@ void matmul_cublaslt(floatX *d, const floatX *a, const floatX *b,
   cublasCheck(cublasLtMatmulDescSetAttribute(operationDesc,
                                              CUBLASLT_MATMUL_DESC_SCALE_TYPE,
                                              &scale_type, sizeof(scale_type)));
-
-  // Exhaustive search over all compute types
-  static bool first_call = true;
-  
-  // Try primary compute type first
+  // find a suitable algorithm (same as GPT-2)
   cublasLtMatmulAlgoGetHeuristic(cublaslt_handle, operationDesc, ALayout,
                                  BLayout, CLayout, DLayout, preference, 1,
                                  &heuristic, &returnedResults);
-  if (first_call) {
-    printf("[cuBLASLt diag] CUBLAS_LOWP=%d primary compute=%d ws=%zuMB m=%d n=%d k=%d bias=%d -> %d results\n",
-           (int)CUBLAS_LOWP, (int)cublas_compute, cublaslt_workspace_size/(1024*1024), m, n, k, has_bias, returnedResults);
-    // Test with FP32 layouts to see if the library works at all
-    cublasLtMatrixLayout_t fA, fB, fC, fD;
-    if (transA) {
-      cublasCheck(cublasLtMatrixLayoutCreate(&fA, CUDA_R_32F, k, m, k));
-    } else {
-      cublasCheck(cublasLtMatrixLayoutCreate(&fA, CUDA_R_32F, m, k, m));
-    }
-    if (transB) {
-      cublasCheck(cublasLtMatrixLayoutCreate(&fB, CUDA_R_32F, n, k, n));
-    } else {
-      cublasCheck(cublasLtMatrixLayoutCreate(&fB, CUDA_R_32F, k, n, k));
-    }
-    cublasCheck(cublasLtMatrixLayoutCreate(&fC, CUDA_R_32F, m, n, m));
-    cublasCheck(cublasLtMatrixLayoutCreate(&fD, CUDA_R_32F, m, n, m));
-    int fp32_results = 0;
-    cublasLtMatmulAlgoGetHeuristic(cublaslt_handle, operationDesc, fA, fB, fC, fD, preference, 1, &heuristic, &fp32_results);
-    printf("[cuBLASLt diag] FP32 layouts same dims -> %d results\n", fp32_results);
-    // Also test with FP16 layouts
-    cublasLtMatrixLayout_t hA, hB, hC, hD;
-    if (transA) {
-      cublasCheck(cublasLtMatrixLayoutCreate(&hA, CUDA_R_16F, k, m, k));
-    } else {
-      cublasCheck(cublasLtMatrixLayoutCreate(&hA, CUDA_R_16F, m, k, m));
-    }
-    if (transB) {
-      cublasCheck(cublasLtMatrixLayoutCreate(&hB, CUDA_R_16F, n, k, n));
-    } else {
-      cublasCheck(cublasLtMatrixLayoutCreate(&hB, CUDA_R_16F, k, n, k));
-    }
-    cublasCheck(cublasLtMatrixLayoutCreate(&hC, CUDA_R_16F, m, n, m));
-    cublasCheck(cublasLtMatrixLayoutCreate(&hD, CUDA_R_16F, m, n, m));
-    int fp16_results = 0;
-    cublasLtMatmulAlgoGetHeuristic(cublaslt_handle, operationDesc, hA, hB, hC, hD, preference, 1, &heuristic, &fp16_results);
-    printf("[cuBLASLt diag] FP16 layouts same dims -> %d results\n", fp16_results);
-    cublasLtMatrixLayoutDestroy(fA); cublasLtMatrixLayoutDestroy(fB);
-    cublasLtMatrixLayoutDestroy(fC); cublasLtMatrixLayoutDestroy(fD);
-    cublasLtMatrixLayoutDestroy(hA); cublasLtMatrixLayoutDestroy(hB);
-    cublasLtMatrixLayoutDestroy(hC); cublasLtMatrixLayoutDestroy(hD);
-    fflush(stdout);
-  }
-  
   if (returnedResults == 0) {
     printf("No cuBLASLt algorithm: m: %d, n: %d, k: %d, bias: %d\n", n, m, k, has_bias);
     exit(EXIT_FAILURE);
   }
-  first_call = false;
-
-
 
   // set whether to accumulate (i.e. D += C) or not - note this isn't considered
   // in algorithm selection (?!)
