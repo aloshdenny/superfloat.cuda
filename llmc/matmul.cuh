@@ -301,39 +301,43 @@ void matmul_cublaslt(floatX *d, const floatX *a, const floatX *b,
                                  BLayout, CLayout, DLayout, preference, 1,
                                  &heuristic, &returnedResults);
   if (returnedResults == 0) {
-    // Retry with CUBLAS_COMPUTE_32F_FAST_TF32 — on some CUDA driver versions,
-    // CUBLAS_COMPUTE_32F returns 0 algorithms for BF16 matmuls without bias.
-    cublasComputeType_t fallback_compute = CUBLAS_COMPUTE_32F_FAST_TF32;
-    cublasLtMatmulDesc_t fallbackDesc;
-    cublasCheck(cublasLtMatmulDescCreate(&fallbackDesc, fallback_compute, CUDA_R_32F));
-    cublasCheck(cublasLtMatmulDescSetAttribute(
-        fallbackDesc, CUBLASLT_MATMUL_DESC_TRANSA,
-        (transA) ? &opTranspose : &opNoTranspose, sizeof(opTranspose)));
-    cublasCheck(cublasLtMatmulDescSetAttribute(
-        fallbackDesc, CUBLASLT_MATMUL_DESC_TRANSB,
-        (transB) ? &opTranspose : &opNoTranspose, sizeof(opNoTranspose)));
-    cublasCheck(cublasLtMatmulDescSetAttribute(
-        fallbackDesc, CUBLASLT_MATMUL_DESC_EPILOGUE, &epilogue, sizeof(epilogue)));
-    cublasCheck(cublasLtMatmulDescSetAttribute(
-        fallbackDesc, CUBLASLT_MATMUL_DESC_SCALE_TYPE, &scale_type, sizeof(scale_type)));
-    if (has_bias) {
-        cublasDataType_t bias_data_type = (sizeof(floatX) == 1) ? CUDA_R_16BF : CUBLAS_LOWP;
-        cublasCheck(cublasLtMatmulDescSetAttribute(
-            fallbackDesc, CUBLASLT_MATMUL_DESC_BIAS_DATA_TYPE, &bias_data_type, sizeof(bias_data_type)));
-        cublasCheck(cublasLtMatmulDescSetAttribute(
-            fallbackDesc, CUBLASLT_MATMUL_DESC_BIAS_POINTER, &bias, sizeof(bias)));
+    // Try multiple compute types — different shapes/drivers need different types
+    cublasComputeType_t fallbacks[] = {
+      CUBLAS_COMPUTE_32F_FAST_16BF,
+      CUBLAS_COMPUTE_32F_FAST_TF32,
+      CUBLAS_COMPUTE_32F
+    };
+    const char *names[] = {"FAST_16BF", "FAST_TF32", "32F"};
+    for (int fi = 0; fi < 3 && returnedResults == 0; fi++) {
+      cublasLtMatmulDesc_t fbDesc;
+      cublasCheck(cublasLtMatmulDescCreate(&fbDesc, fallbacks[fi], CUDA_R_32F));
+      cublasCheck(cublasLtMatmulDescSetAttribute(fbDesc, CUBLASLT_MATMUL_DESC_TRANSA,
+          (transA) ? &opTranspose : &opNoTranspose, sizeof(opTranspose)));
+      cublasCheck(cublasLtMatmulDescSetAttribute(fbDesc, CUBLASLT_MATMUL_DESC_TRANSB,
+          (transB) ? &opTranspose : &opNoTranspose, sizeof(opNoTranspose)));
+      cublasCheck(cublasLtMatmulDescSetAttribute(fbDesc, CUBLASLT_MATMUL_DESC_EPILOGUE,
+          &epilogue, sizeof(epilogue)));
+      cublasCheck(cublasLtMatmulDescSetAttribute(fbDesc, CUBLASLT_MATMUL_DESC_SCALE_TYPE,
+          &scale_type, sizeof(scale_type)));
+      if (has_bias) {
+        cublasDataType_t bdt = (sizeof(floatX) == 1) ? CUDA_R_16BF : CUBLAS_LOWP;
+        cublasCheck(cublasLtMatmulDescSetAttribute(fbDesc, CUBLASLT_MATMUL_DESC_BIAS_DATA_TYPE, &bdt, sizeof(bdt)));
+        cublasCheck(cublasLtMatmulDescSetAttribute(fbDesc, CUBLASLT_MATMUL_DESC_BIAS_POINTER, &bias, sizeof(bias)));
+      }
+      int fbResults = 0;
+      cublasLtMatmulAlgoGetHeuristic(cublaslt_handle, fbDesc, ALayout,
+                                     BLayout, CLayout, DLayout, preference, 1,
+                                     &heuristic, &fbResults);
+      if (fbResults > 0) {
+        printf("cuBLASLt: using %s for m=%d n=%d k=%d\n", names[fi], m, n, k);
+        cublasCheck(cublasLtMatmulDescDestroy(operationDesc));
+        operationDesc = fbDesc;
+        returnedResults = fbResults;
+      } else {
+        cublasCheck(cublasLtMatmulDescDestroy(fbDesc));
+      }
     }
-    int fallbackResults = 0;
-    cublasLtMatmulAlgoGetHeuristic(cublaslt_handle, fallbackDesc, ALayout,
-                                   BLayout, CLayout, DLayout, preference, 1,
-                                   &heuristic, &fallbackResults);
-    if (fallbackResults > 0) {
-      printf("cuBLASLt: using TF32 fallback for m=%d n=%d k=%d\n", m, n, k);
-      cublasCheck(cublasLtMatmulDescDestroy(operationDesc));
-      operationDesc = fallbackDesc;
-      returnedResults = fallbackResults;
-    } else {
-      cublasCheck(cublasLtMatmulDescDestroy(fallbackDesc));
+    if (returnedResults == 0) {
       printf("No cuBLASLt algorithm: m: %d, n: %d, k: %d, bias: %d\n", n, m, k, has_bias);
       exit(EXIT_FAILURE);
     }

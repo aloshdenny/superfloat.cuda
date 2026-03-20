@@ -32,14 +32,13 @@ cuBLAS related utils
 #define CUBLAS_COMPUTE_32F_FAST_16BF CUBLAS_COMPUTE_32F
 #endif
 
-// Keep workspace small to avoid OOM on memory-constrained runs.
-// 4 MiB is more than enough for cuBLASLt to find Tensor Core BF16 algorithms.
-const size_t cublaslt_workspace_size = 4 * 1024 * 1024;
+// 256 MiB workspace — gives cuBLASLt room to find algorithms for all shapes.
+// Memory is available now that master weights are disabled.
+const size_t cublaslt_workspace_size = 256 * 1024 * 1024;
 void *cublaslt_workspace = NULL;
-// CUBLAS_COMPUTE_32F_FAST_TF32: accumulate in TF32 precision via Tensor Cores.
-// This is the correct compute type for BF16 inputs on SM 8.9 (RTX 4090).
-// CUBLAS_COMPUTE_32F (exact FP32) has no BF16 Tensor Core path in cuBLASLt.
-cublasComputeType_t cublas_compute = CUBLAS_COMPUTE_32F_FAST_TF32;
+// CUBLAS_COMPUTE_32F_FAST_16BF: uses BF16 Tensor Cores natively.
+// Widest algorithm coverage for BF16 inputs on SM 8.9 (RTX 4090).
+cublasComputeType_t cublas_compute = CUBLAS_COMPUTE_32F_FAST_16BF;
 cublasLtHandle_t cublaslt_handle;
 cublasHandle_t cublas_handle;  // for plain cublasGemmEx calls (LLaMA forward)
 
