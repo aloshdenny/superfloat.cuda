@@ -94,26 +94,23 @@ void rmsnorm_forward(floatX *out, float *rstd,
 //   dinp += rstd * w * dout  - rstd^3 * x * sum_i(w_i * dout_i * x_i) / C
 //   dweight += sum_bt(y * dout)
 
-__global__ void rmsnorm_backward_kernel(
+__global__ void rmsnorm_backward_dinp_kernel(
     floatX *__restrict__ dinp,      // (B*T, C) — += here
-    floatX *__restrict__ dweight,   // (C,)      — += here (per block, then atomic)
-    float  *__restrict__ scratch,   // (B*T) scratch for partial sums (unused, reserved)
     const floatX *__restrict__ dout,   // (B*T, C)
     const floatX *__restrict__ inp,    // (B*T, C)
     const floatX *__restrict__ weight, // (C,)
     const float  *__restrict__ rstd,   // (B*T,)
-    int B, int T, int C)
+    int C, int BT)
 {
-    // Shared memory for dweight accumulation.
-    extern __shared__ float sh_dw[];  // [C] — one float per channel, zero-filled
-
     int bt = blockIdx.x;
-    const floatX *x  = inp    + (size_t)bt * C;
-    const floatX *dy = dout   + (size_t)bt * C;
-    floatX       *dx = dinp   + (size_t)bt * C;
+    if (bt >= BT) return;
+
+    const floatX *x  = inp  + (size_t)bt * C;
+    const floatX *dy = dout + (size_t)bt * C;
+    floatX       *dx = dinp + (size_t)bt * C;
     float r = rstd[bt];
 
-    // --- Step 1: Compute dot(dout * weight, x) for this row ---
+    // dot(dout * weight, x) for this row
     float thread_dot = 0.0f;
     for (int i = threadIdx.x; i < C; i += blockDim.x) {
         float dyi = (float)__ldcs(&dy[i]);
@@ -128,26 +125,34 @@ __global__ void rmsnorm_backward_kernel(
 
     float dot_val = s_dot;
 
-    // --- Step 2: Compute dinp and accumulate dweight ---
     for (int i = threadIdx.x; i < C; i += blockDim.x) {
         float dyi = (float)__ldcs(&dy[i]);
         float wi  = (float)__ldcs(&weight[i]);
         float xi  = (float)__ldcs(&x[i]);
-
-        // dinp contribution for this row.
         float dxi = r * wi * dyi - r * r * r * xi * dot_val / (float)C;
         float prev_dxi = (float)__ldcs(&dx[i]);
         __stcs(&dx[i], (floatX)(prev_dxi + dxi));
-
-        // Accumulate dweight in shared mem (one entry per channel).
-        sh_dw[i] += r * xi * dyi;
     }
-    __syncthreads();
+}
 
-    // --- Step 3: Atomic-add shared dweight into global dweight ---
-    for (int i = threadIdx.x; i < C; i += blockDim.x) {
+__global__ void rmsnorm_backward_dweight_kernel(
+    floatX *__restrict__ dweight,      // (C,) +=
+    const floatX *__restrict__ dout,   // (B*T, C)
+    const floatX *__restrict__ inp,    // (B*T, C)
+    const float  *__restrict__ rstd,   // (B*T,)
+    int BT, int C)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int stride = blockDim.x * gridDim.x;
+    for (; i < C; i += stride) {
+        float acc = 0.0f;
+        for (int bt = 0; bt < BT; bt++) {
+            float xi = (float)__ldcs(&inp[(size_t)bt * C + i]);
+            float dyi = (float)__ldcs(&dout[(size_t)bt * C + i]);
+            acc += rstd[bt] * xi * dyi;
+        }
         float prev = (float)__ldcs(&dweight[i]);
-        __stcs(&dweight[i], (floatX)(prev + sh_dw[i]));
+        __stcs(&dweight[i], (floatX)(prev + acc));
     }
 }
 
@@ -158,12 +163,23 @@ void rmsnorm_backward(floatX *dinp, floatX *dweight, float *scratch,
                       int B, int T, int C,
                       cudaStream_t stream)
 {
+    (void)scratch;
     int BT = B * T;
     int block_size = min(512, C);
     block_size = CEIL_DIV(block_size, 32) * 32;
-    size_t shared_bytes = (size_t)C * sizeof(float);
-    rmsnorm_backward_kernel<<<BT, block_size, shared_bytes, stream>>>(
-        dinp, dweight, scratch, dout, inp, weight, rstd, B, T, C);
+
+    // 1) dinput: one block per token row, no cross-block races
+    rmsnorm_backward_dinp_kernel<<<BT, block_size, 0, stream>>>(
+        dinp, dout, inp, weight, rstd, C, BT);
+    cudaCheck(cudaGetLastError());
+
+    // 2) dweight: one thread per channel with full BT reduction
+    const int dw_block = 256;
+    unsigned int dw_grid = (unsigned int)((C + dw_block - 1) / dw_block);
+    if (dw_grid > 65535u) dw_grid = 65535u;
+    if (dw_grid == 0u) dw_grid = 1u;
+    rmsnorm_backward_dweight_kernel<<<dw_grid, dw_block, 0, stream>>>(
+        dweight, dout, inp, rstd, BT, C);
     cudaCheck(cudaGetLastError());
 }
 
