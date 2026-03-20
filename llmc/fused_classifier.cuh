@@ -25,6 +25,17 @@ loaded
   Q115_LOGITS_SCALE // Use the scale from q115_common.cuh (24.0f)
 #endif
 
+__device__ __forceinline__ float q115_logit_scale_for_vocab(int V) {
+#if defined(SF16_TRUE_FORWARD)
+  // In strict true-forward mode, tiny logits over a very large vocabulary can
+  // impose a hard CE floor near ln(V)-2. Expand only large-vocab softmaxes.
+  return (V >= 100000) ? Q115_LOGITS_SCALE : Q115_LOGIT_SCALE;
+#else
+  (void)V;
+  return Q115_LOGIT_SCALE;
+#endif
+}
+
 // Temperature for softmax - lower = more confident predictions
 // For Q1.15, we use temperature implicitly via Q115_LOGIT_SCALE
 // A scale of 24 means: Q1.15 value of 0.5 -> actual logit of 12.0
@@ -55,6 +66,7 @@ __global__ void __launch_bounds__(1024, MAX_1024_THREADS_BLOCKS)
   int target_ix = targets[idx];
 
   const floatX *logits_row = logits + idx * P;
+  const float logit_scale = q115_logit_scale_for_vocab(V);
 
   // Shared memory for max reduction (for numerical stability)
   __shared__ float shared_max;
@@ -64,7 +76,7 @@ __global__ void __launch_bounds__(1024, MAX_1024_THREADS_BLOCKS)
   float thread_max = -INFINITY;
   for (int i = threadIdx.x; i < V; i += blockDim.x) {
     // Scale Q1.15 logits to actual logit range
-    float logit = simulate_q115((float)logits_row[i]) * Q115_LOGIT_SCALE;
+    float logit = simulate_q115((float)logits_row[i]) * logit_scale;
     thread_max = fmaxf(thread_max, logit);
   }
 
@@ -99,7 +111,7 @@ __global__ void __launch_bounds__(1024, MAX_1024_THREADS_BLOCKS)
   // Step 2: Compute sum of exp(logit - max)
   float thread_sum = 0.0f;
   for (int i = threadIdx.x; i < V; i += blockDim.x) {
-    float logit = simulate_q115((float)logits_row[i]) * Q115_LOGIT_SCALE;
+    float logit = simulate_q115((float)logits_row[i]) * logit_scale;
     thread_sum += expf(logit - max_logit);
   }
 
@@ -114,7 +126,7 @@ __global__ void __launch_bounds__(1024, MAX_1024_THREADS_BLOCKS)
 
   // Step 3: Compute loss (negative log probability of correct class)
   if (threadIdx.x == 0) {
-    float target_logit = simulate_q115((float)logits_row[target_ix]) * Q115_LOGIT_SCALE;
+    float target_logit = simulate_q115((float)logits_row[target_ix]) * logit_scale;
     float log_prob = target_logit - max_logit - logf(sum_exp);
     losses[idx] = -log_prob; // Cross-entropy loss
   }
@@ -125,7 +137,7 @@ __global__ void __launch_bounds__(1024, MAX_1024_THREADS_BLOCKS)
     float inv_sum = 1.0f / sum_exp;
 
     for (int i = threadIdx.x; i < V; i += blockDim.x) {
-      float logit = simulate_q115((float)logits_row[i]) * Q115_LOGIT_SCALE;
+      float logit = simulate_q115((float)logits_row[i]) * logit_scale;
       float prob = expf(logit - max_logit) * inv_sum;
 
       // Gradient: (prob - indicator) * dloss
@@ -135,7 +147,7 @@ __global__ void __launch_bounds__(1024, MAX_1024_THREADS_BLOCKS)
 
       // Chain Rule: since logit_used = logit_stored * Q115_LOGIT_SCALE
       // The gradient df/d(logit_stored) = df/d(logit_used) * Q115_LOGIT_SCALE
-      float grad_scaled = grad * Q115_LOGIT_SCALE;
+      float grad_scaled = grad * logit_scale;
 
       // Store gradient back to logits buffer
       logits[idx * P + i] = (floatX)simulate_q115(grad_scaled);
@@ -171,7 +183,7 @@ __device__ SoftmaxParams prepare_softmax_blockwide3(int64_t idx,
 #elif defined(ENABLE_Q115)
   // For Q1.15 mode: scale logits to expand dynamic range
   // This is critical to break the ~7.x loss wall
-  const float logit_scale = Q115_LOGIT_SCALE;
+  const float logit_scale = q115_logit_scale_for_vocab(V);
 #else
   const float logit_scale = 1.0f;
 #endif
@@ -239,7 +251,7 @@ __global__ void __launch_bounds__(1024, MAX_1024_THREADS_BLOCKS)
   const float logit_scale = Q131_LOGIT_SCALE;
 #elif defined(ENABLE_Q115)
   // For Q1.15 mode: scale logits to expand dynamic range
-  const float logit_scale = Q115_LOGIT_SCALE;
+  const float logit_scale = q115_logit_scale_for_vocab(V);
 #else
   const float logit_scale = 1.0f;
 #endif
