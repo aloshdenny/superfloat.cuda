@@ -392,8 +392,11 @@ __global__ void matmul_nt_kernel(
     __syncthreads();
   }
 
+  // Output in column-major [OC, BT] to match cuBLASLt convention:
+  // out[oc, bt] = out[bt * OC + oc]  (col-major OC stride=1, BT stride=OC)
+  // This is identical to row-major [BT, OC] in memory — same layout.
   if (row < BT && col < OC) {
-    out[row * OC + col] = (floatX)acc;
+    out[row * OC + col] = (floatX)acc;  // row-major [BT,OC] == col-major [OC,BT]
   }
 }
 
