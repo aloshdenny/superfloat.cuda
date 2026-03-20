@@ -173,9 +173,21 @@ llama32: $(TARGETS_LLAMA32)
 # ===============================
 ifneq ($(OS),Windows_NT)
 libsyms:
-	ln -sf /usr/local/lib/python3.12/site-packages/nvidia/cublas/lib/libcublas.so.12    ./libcublas.so.12
+	@# Prefer system CUDA toolkit cuBLAS (full algorithm support for BF16 Tensor Cores).
+	@# Fall back to pip-installed cuBLAS if system libs don't exist.
+	@if [ -f /usr/local/cuda/lib64/libcublas.so.12 ]; then \
+		ln -sf /usr/local/cuda/lib64/libcublas.so.12    ./libcublas.so.12; \
+		echo "Linked system cuBLAS (full BF16 support)"; \
+	else \
+		ln -sf /usr/local/lib/python3.12/site-packages/nvidia/cublas/lib/libcublas.so.12 ./libcublas.so.12; \
+		echo "Linked pip cuBLAS (limited BF16 support)"; \
+	fi
 	ln -sf ./libcublas.so.12                                                            ./libcublas.so
-	ln -sf /usr/local/lib/python3.12/site-packages/nvidia/cublas/lib/libcublasLt.so.12  ./libcublasLt.so.12
+	@if [ -f /usr/local/cuda/lib64/libcublasLt.so.12 ]; then \
+		ln -sf /usr/local/cuda/lib64/libcublasLt.so.12  ./libcublasLt.so.12; \
+	else \
+		ln -sf /usr/local/lib/python3.12/site-packages/nvidia/cublas/lib/libcublasLt.so.12 ./libcublasLt.so.12; \
+	fi
 	ln -sf ./libcublasLt.so.12                                                          ./libcublasLt.so
 	ln -sf /usr/lib/x86_64-linux-gnu/libnvidia-ml.so.1                                   ./libnvml.so.1
 	ln -sf ./libnvml.so.1                                                               ./libnvml.so

@@ -306,9 +306,8 @@ void matmul_cublaslt(floatX *d, const floatX *a, const floatX *b,
     struct { cublasComputeType_t ct; cudaDataType_t st; const char *name; } fallbacks[] = {
       {CUBLAS_COMPUTE_32F_FAST_TF32, CUDA_R_32F, "FAST_TF32"},
       {CUBLAS_COMPUTE_32F,           CUDA_R_32F, "32F"},
-      {CUBLAS_COMPUTE_16F,           CUDA_R_16F, "16F"},
     };
-    for (int fi = 0; fi < 3 && returnedResults == 0; fi++) {
+    for (int fi = 0; fi < 2 && returnedResults == 0; fi++) {
       cublasLtMatmulDesc_t fbDesc;
       cublasCheck(cublasLtMatmulDescCreate(&fbDesc, fallbacks[fi].ct, fallbacks[fi].st));
       cublasCheck(cublasLtMatmulDescSetAttribute(fbDesc, CUBLASLT_MATMUL_DESC_TRANSA,
