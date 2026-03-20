@@ -387,6 +387,77 @@ void matmul_forward_cublas(floatX *out, const floatX *inp, const floatX *weight,
   cudaCheck(cudaGetLastError());
 }
 
+// ---------------------------------------------------------------------------
+// Naive backward dinp: dinp[bt, c] = sum_oc(dout[bt, oc] * weight[oc, c])
+// ---------------------------------------------------------------------------
+__global__ void matmul_backward_dinp_kernel(
+    floatX* __restrict__ dinp,
+    const floatX* __restrict__ dout,
+    const floatX* __restrict__ weight,
+    int BT, int OC, int C
+) {
+  size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= (size_t)BT * C) return;
+  int bt = (int)(idx / C);
+  int c  = (int)(idx % C);
+  float acc = 0.f;
+  for (int oc = 0; oc < OC; oc++) {
+    acc += (float)dout[(size_t)bt * OC + oc] * (float)weight[(size_t)oc * C + c];
+  }
+  dinp[idx] = (floatX)acc;
+}
+
+// ---------------------------------------------------------------------------
+// Naive backward dweight: dweight[oc, c] += sum_bt(dout[bt, oc] * inp[bt, c])
+// ---------------------------------------------------------------------------
+__global__ void matmul_backward_dweight_kernel(
+    floatX* __restrict__ dweight,
+    const floatX* __restrict__ dout,
+    const floatX* __restrict__ inp,
+    int BT, int OC, int C
+) {
+  size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= (size_t)OC * C) return;
+  int oc = (int)(idx / C);
+  int c  = (int)(idx % C);
+  float acc = 0.f;
+  for (int bt = 0; bt < BT; bt++) {
+    acc += (float)dout[(size_t)bt * OC + oc] * (float)inp[(size_t)bt * C + c];
+  }
+  dweight[idx] = (floatX)((float)dweight[idx] + acc);
+}
+
+// ---------------------------------------------------------------------------
+// Naive matmul backward for LLaMA (no cuBLASLt dependency).
+// Same signature as matmul_backward but ignores dbias/gelu.
+// ---------------------------------------------------------------------------
+void matmul_backward_naive(floatX *dinp, floatX *dweight, floatX *dout,
+                           floatX *inp, floatX *weight,
+                           int B, int T, int C, int OC,
+                           cudaStream_t stream) {
+  NVTX_RANGE_FN();
+  int BT = B * T;
+  int block = 256;
+
+  // 1. dinp = dout @ weight (set, not accumulate)
+  if (dinp) {
+    size_t total = (size_t)BT * C;
+    unsigned int grid = (unsigned int)((total + block - 1) / block);
+    matmul_backward_dinp_kernel<<<grid, block, 0, stream>>>(
+        dinp, dout, weight, BT, OC, C);
+    cudaCheck(cudaGetLastError());
+  }
+
+  // 2. dweight += dout^T @ inp (accumulate)
+  if (dweight) {
+    size_t total = (size_t)OC * C;
+    unsigned int grid = (unsigned int)((total + block - 1) / block);
+    matmul_backward_dweight_kernel<<<grid, block, 0, stream>>>(
+        dweight, dout, inp, BT, OC, C);
+    cudaCheck(cudaGetLastError());
+  }
+}
+
 void matmul_backward(floatX *dinp, floatX *dweight, floatX *dbias, floatX *dout,
                      floatX *inp, floatX *weight, float *dbias_buffer, int B,
                      int T, int C, int OC, cudaStream_t stream,
