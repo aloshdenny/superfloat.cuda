@@ -391,32 +391,53 @@ void matmul_forward_cublaslt(floatX *out, floatX *inp, floatX *weight,
 }
 
 // ---------------------------------------------------------------------------
-// Forward GEMM for bias-free models (LLaMA). 
-// PROBLEM: cuBLASLt on this system returns 0 algorithms for EPILOGUE_DEFAULT
-// (no bias). It DOES find algorithms when EPILOGUE_BIAS is set.
-// FIX: use a lazy-allocated all-zeros bias buffer — mathematically equivalent
-// to no bias (adds 0), but triggers the BIAS epilogue code path that works.
-// The buffer is grown on demand and never shrunk (amortised alloc).
+// Forward GEMM for bias-free models (LLaMA).
+// cuBLASLt fails to find algorithms for LLaMA's matrix dimensions on this
+// system. cublasGemmEx with BF16 output also returns NOT_SUPPORTED.
+// Solution: use cublasGemmEx with FP32 output (universally supported),
+// then cast FP32→BF16 with a small kernel. Uses a scratch FP32 buffer.
 // ---------------------------------------------------------------------------
-static floatX *g_zero_bias     = nullptr;
-static int     g_zero_bias_oc  = 0;
+static float *g_fp32_scratch = nullptr;
+static size_t g_fp32_scratch_size = 0;
 
-static void ensure_zero_bias(int OC) {
-  if (OC > g_zero_bias_oc) {
-    if (g_zero_bias) { cudaFree(g_zero_bias); }
-    cudaCheck(cudaMalloc(&g_zero_bias, (size_t)OC * sizeof(floatX)));
-    cudaCheck(cudaMemset(g_zero_bias, 0, (size_t)OC * sizeof(floatX)));
-    g_zero_bias_oc = OC;
+__global__ void cast_fp32_to_bf16_kernel(floatX *dst, const float *src, size_t N) {
+  size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx < N) {
+    dst[idx] = (floatX)src[idx];
   }
 }
 
 void matmul_forward_cublas(floatX *out, const floatX *inp, const floatX *weight,
                            int B, int T, int C, int OC, cudaStream_t stream) {
-  ensure_zero_bias(OC);
-  // Use cuBLASLt with EPILOGUE_BIAS + zero bias — the only path that finds
-  // an algorithm on this driver/GPU combo for BF16 without a real bias.
-  matmul_cublaslt(out, weight, inp, g_zero_bias, OC, B * T, C,
-                  stream, /*transA=*/true, /*transB=*/false);
+  NVTX_RANGE_FN();
+  size_t out_size = (size_t)B * T * OC;
+  // Lazy-allocate FP32 scratch buffer (grows, never shrinks)
+  if (out_size > g_fp32_scratch_size) {
+    if (g_fp32_scratch) { cudaFree(g_fp32_scratch); }
+    cudaCheck(cudaMalloc(&g_fp32_scratch, out_size * sizeof(float)));
+    g_fp32_scratch_size = out_size;
+  }
+
+  cublasCheck(cublasSetStream(cublas_handle, stream));
+  const float alpha = 1.f, beta = 0.f;
+  // out_fp32[BT, OC] = inp[BT, C] @ weight[OC, C]^T
+  // Column-major: weight^T is (OC x C), inp^T is (C x BT)
+  cublasCheck(cublasGemmEx(
+      cublas_handle,
+      CUBLAS_OP_T, CUBLAS_OP_N,
+      OC, B * T, C,
+      &alpha,
+      weight, CUBLAS_LOWP, C,     // BF16 input A
+      inp,    CUBLAS_LOWP, C,     // BF16 input B
+      &beta,
+      g_fp32_scratch, CUDA_R_32F, OC,  // FP32 output (always supported)
+      CUBLAS_COMPUTE_32F,
+      CUBLAS_GEMM_DEFAULT_TENSOR_OP
+  ));
+  // Cast FP32 → BF16
+  int nblocks = (int)((out_size + 255) / 256);
+  cast_fp32_to_bf16_kernel<<<nblocks, 256, 0, stream>>>(out, g_fp32_scratch, out_size);
+  cudaCheck(cudaGetLastError());
 }
 
 void matmul_backward(floatX *dinp, floatX *dweight, floatX *dbias, floatX *dout,
