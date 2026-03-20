@@ -386,8 +386,10 @@ void matmul_forward_cublas(floatX *out, const floatX *inp, const floatX *weight,
   if (szC > g_sgemm_C_size) { if (g_sgemm_C) cudaFree(g_sgemm_C); cudaCheck(cudaMalloc(&g_sgemm_C, szC*sizeof(float))); g_sgemm_C_size = szC; }
 
   // Cast inputs to FP32
-  upcast_to_fp32<<<CEIL_DIV(szA, 256), 256, 0, stream>>>(g_sgemm_A, weight, szA);
-  upcast_to_fp32<<<CEIL_DIV(szB, 256), 256, 0, stream>>>(g_sgemm_B, inp,    szB);
+  int nblocks_A = (int)((szA + 255) / 256);
+  int nblocks_B = (int)((szB + 255) / 256);
+  upcast_to_fp32<<<nblocks_A, 256, 0, stream>>>(g_sgemm_A, weight, szA);
+  upcast_to_fp32<<<nblocks_B, 256, 0, stream>>>(g_sgemm_B, inp,    szB);
   cudaCheck(cudaGetLastError());
 
   // SGEMM: C = A^T * B  →  out[OC x BT] = weight[OC x C]^T-nope, weight stored as [OC,C]
@@ -398,21 +400,38 @@ void matmul_forward_cublas(floatX *out, const floatX *inp, const floatX *weight,
   // Simpler: out = weight * inp^T, no: out[OC,BT] = weight[OC,C] @ inp[BT,C]^T
   // Col-major equiv: op(A)=weight^T[C,OC], op(B)=inp[C,BT], C=out[OC,BT]
   //   → SGEMM with transA=T m=OC n=BT k=C A=weight lda=C B=inp ldb=C C=out ldc=OC
-  cublasCheck(cublasSetStream(cublas_handle, stream));
+  // Set stream for this handle
+  cublasStatus_t ss = cublasSetStream(cublas_handle, stream);
+  if (ss != CUBLAS_STATUS_SUCCESS) {
+    printf("[cublas] cublasSetStream failed: %d\n", (int)ss);
+    exit(1);
+  }
   const float alpha = 1.f, beta = 0.f;
-  cublasCheck(cublasSgemm(
+
+  // cublasSgemm: always supported, operates in FP32
+  // C(m,n) = op(A)(m,k) * op(B)(k,n)
+  // We want out[OC,BT] = weight[OC,C] @ inp[BT,C]^T
+  // In col-major: weight stored row-major [OC,C] → col-major [C,OC], lda=C, transa=T
+  //               inp stored row-major [BT,C]   → col-major [C,BT], ldb=C, transb=N
+  //               out col-major [OC,BT], ldc=OC
+  cublasStatus_t st = cublasSgemm(
       cublas_handle,
-      CUBLAS_OP_T, CUBLAS_OP_N,   // weight^T, inp (no transpose)
-      OC, B * T, C,               // m=OC, n=BT, k=C
+      CUBLAS_OP_T, CUBLAS_OP_N,
+      OC, B * T, C,
       &alpha,
-      g_sgemm_A, C,               // A=weight(C cols, OC rows in col-major), lda=C
-      g_sgemm_B, C,               // B=inp(C rows, BT cols in col-major), ldb=C
+      g_sgemm_A, C,
+      g_sgemm_B, C,
       &beta,
-      g_sgemm_C, OC               // C=out(OC rows, BT cols), ldc=OC
-  ));
+      g_sgemm_C, OC
+  );
+  if (st != CUBLAS_STATUS_SUCCESS) {
+    printf("[cublas] cublasSgemm failed: %d (m=%d n=%d k=%d)\n", (int)st, OC, B*T, C);
+    exit(1);
+  }
 
   // Cast FP32 output back to floatX
-  downcast_from_fp32<<<CEIL_DIV(szC, 256), 256, 0, stream>>>(out, g_sgemm_C, szC);
+  int nblocks_C = (int)((szC + 255) / 256);
+  downcast_from_fp32<<<nblocks_C, 256, 0, stream>>>(out, g_sgemm_C, szC);
   cudaCheck(cudaGetLastError());
 }
 
