@@ -1192,7 +1192,7 @@ __global__ void sanitize_nonfinite_kernel(floatX *grad, size_t n, unsigned int *
     size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     for (; idx < n; idx += (size_t)blockDim.x * gridDim.x) {
         float g = (float)grad[idx];
-        if (!isfinite(g)) {
+        if (!isfinite(g) || fabsf(g) > 1.0e6f) {
             grad[idx] = (floatX)0;
             atomicAdd(bad_count, 1u);
         }
@@ -1217,7 +1217,7 @@ float llama32_calculate_grad_norm(LLaMA32 *model, MultiGpuConfig *mgc) {
     unsigned int bad_cpu = 0;
     cudaCheck(cudaMemcpy(&bad_cpu, bad_count, sizeof(unsigned int), cudaMemcpyDeviceToHost));
     if (bad_cpu > 0) {
-        printf0("warning: sanitized %u non-finite gradients\n", bad_cpu);
+        printf0("warning: sanitized %u non-finite/extreme gradients\n", bad_cpu);
     }
 
     int num_slices[2] = {1, model->config.n_layers};
