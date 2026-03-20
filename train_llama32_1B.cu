@@ -1409,10 +1409,14 @@ int main(int argc, char *argv[]) {
         cudaCheck(cudaEventRecord(ev_start));
         for (int micro = 0; micro < grad_accum_steps; micro++) {
             if (overfit_single_batch) dataloader_reset(&train_loader);
+            if (step == 0) { printf0("  [dbg] dataloader_next_batch...\n"); fflush(stdout); }
             dataloader_next_batch(&train_loader);
+            if (step == 0) { printf0("  [dbg] llama32_forward...\n"); fflush(stdout); }
             llama32_forward(&model, train_loader.inputs, B, T);
+            if (step == 0) { printf0("  [dbg] llama32_backward...\n"); fflush(stdout); }
             llama32_backward_and_reduce(&model, train_loader.inputs,
                                         train_loader.targets, grad_accum_steps, micro);
+            if (step == 0) { printf0("  [dbg] micro step done\n"); fflush(stdout); }
         }
 
         norm = llama32_calculate_grad_norm(&model, &multi_gpu_config);
