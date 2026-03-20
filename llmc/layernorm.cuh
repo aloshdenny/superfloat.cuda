@@ -172,7 +172,8 @@ __global__ void layernorm_forward_kernel3(floatX* __restrict__ out, float* __res
     for (int c = lane_id; c < C; c += WARP_SIZE) {
         float val = q131_to_float(__ldcs(x + c));
         float normalized = (val - m) * s;
-        float result = normalized * q131_to_float(weight[c]) + q131_to_float(bias[c]);
+        float bias_val = (bias != nullptr) ? q131_to_float(bias[c]) : 0.0f;
+        float result = normalized * q131_to_float(weight[c]) + bias_val;
         __stcs(o + c, float_to_q131(result));
     }
 #elif defined(ENABLE_Q115)
@@ -213,7 +214,8 @@ __global__ void layernorm_forward_kernel3(floatX* __restrict__ out, float* __res
         float val = (float)__ldcs(x + c);
         float normalized = val * rms_inv;
         // Apply weight and bias
-        float result = normalized * (float)weight[c] + (float)bias[c];
+        float bias_val = (bias != nullptr) ? (float)bias[c] : 0.0f;
+        float result = normalized * (float)weight[c] + bias_val;
         // Clamp activations to Q1.15-safe range
         result = fmaxf(Q115_ACTIVATION_CLAMP_MIN, fminf(Q115_ACTIVATION_CLAMP_MAX, result));
         result = simulate_q115(result);
@@ -261,7 +263,8 @@ __global__ void layernorm_forward_kernel3(floatX* __restrict__ out, float* __res
         // indicating that this data will not be reused soon, and can be streamed through the caches
         // this allows the threads to get more cache-hits for the (shared) weight and bias parameters
         float n = s * ((float)__ldcs(x+c) - m);
-        float result = n * (float)weight[c] + (float)bias[c];
+        float bias_val = (bias != nullptr) ? (float)bias[c] : 0.0f;
+        float result = n * (float)weight[c] + bias_val;
         __stcs(o+c, (floatX)result);
     }
 #endif
@@ -284,7 +287,11 @@ __global__ void layernorm_forward_kernel6(floatX* __restrict__ out, float* __res
     int sidx = (threadIdx.x + WARP_SIZE * threadIdx.y) * x128::size;
     for(int i = sidx; i < C; i += blockDim.y * WARP_SIZE * x128::size) {
         s_weight[i/x128::size] = load128(weight + i);
-        s_bias[i/x128::size] = load128(bias + i);
+        if (bias != nullptr) {
+            s_bias[i/x128::size] = load128(bias + i);
+        } else {
+            s_bias[i/x128::size] = x128::zeros();
+        }
     }
     __syncthreads();
 
@@ -403,12 +410,16 @@ __global__ void fused_residual_forward_kernel5(floatX* residual, floatX* normed,
     int sidx = (threadIdx.x + WARP_SIZE * threadIdx.y) * x128::size;
     for(int i = sidx; i < C; i += blockDim.y * WARP_SIZE * x128::size) {
         s_weight[i/x128::size] = load128(weight + i);
-        s_bias[i/x128::size] = load128(bias + i);
+        if (bias != nullptr) {
+            s_bias[i/x128::size] = load128(bias + i);
+        } else {
+            s_bias[i/x128::size] = x128::zeros();
+        }
     }
     __syncthreads();
 
     int idx = blockIdx.x * blockDim.y + threadIdx.y;
-    if(idx > N) return;
+    if(idx >= N) return;
 
     // adjust pointers to current token
     residual += C * idx;
@@ -464,8 +475,8 @@ __global__ void fused_residual_forward_kernel5(floatX* residual, floatX* normed,
     }
     
     if(threadIdx.x == 0) {
-        mean[idx] = m;
-        rstd[idx] = s;
+        if (mean != nullptr) { mean[idx] = m; }
+        if (rstd != nullptr) { rstd[idx] = s; }
     }
 #elif defined(ENABLE_Q115)
     // RMSNorm for Q1.15: compute residual and RMS in one pass
@@ -509,8 +520,8 @@ __global__ void fused_residual_forward_kernel5(floatX* residual, floatX* normed,
     }
     
     if(threadIdx.x == 0) {
-        mean[idx] = 0.0f;  // Not used in RMSNorm
-        rstd[idx] = rms_inv;
+        if (mean != nullptr) { mean[idx] = 0.0f; }  // Not used in RMSNorm
+        if (rstd != nullptr) { rstd[idx] = rms_inv; }
     }
 #else
     // Original LayerNorm
@@ -556,8 +567,8 @@ __global__ void fused_residual_forward_kernel5(floatX* residual, floatX* normed,
     }
     
     if(threadIdx.x == 0) {
-        mean[idx] = m;
-        rstd[idx] = s;
+        if (mean != nullptr) { mean[idx] = m; }
+        if (rstd != nullptr) { rstd[idx] = s; }
     }
 #endif
 }
