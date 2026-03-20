@@ -359,31 +359,35 @@ __global__ void matmul_naive_kernel(
     floatX* __restrict__ out,        // [BT, OC]
     const floatX* __restrict__ inp,  // [BT, C]
     const floatX* __restrict__ wt,   // [OC, C]
-    int BT, int OC, int C
+    size_t BT, size_t OC, size_t C
 ) {
   size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-  size_t total = (size_t)BT * OC;
-  if (idx >= total) return;
-  int bt = (int)(idx / OC);
-  int oc = (int)(idx % OC);
-  float acc = 0.f;
-  const floatX* row_inp = inp + (size_t)bt * C;
-  const floatX* row_wt  = wt  + (size_t)oc * C;
-  for (int c = 0; c < C; c++) {
-    acc += (float)row_inp[c] * (float)row_wt[c];
+  const size_t total = BT * OC;
+  const size_t stride = (size_t)blockDim.x * gridDim.x;
+  for (; idx < total; idx += stride) {
+    size_t bt = idx / OC;
+    size_t oc = idx - bt * OC;
+    float acc = 0.f;
+    const floatX* row_inp = inp + bt * C;
+    const floatX* row_wt  = wt  + oc * C;
+    for (size_t c = 0; c < C; c++) {
+      acc += (float)row_inp[c] * (float)row_wt[c];
+    }
+    out[bt * OC + oc] = (floatX)acc;
   }
-  out[(size_t)bt * OC + oc] = (floatX)acc;
 }
 
 void matmul_forward_cublas(floatX *out, const floatX *inp, const floatX *weight,
                            int B, int T, int C, int OC, cudaStream_t stream) {
   NVTX_RANGE_FN();
-  size_t BT    = (size_t)B * T;
-  size_t total = BT * OC;                    // up to 2048*128256 = 262M; needs size_t
-  int block    = 256;
-  size_t grid  = (total + block - 1) / block; // up to ~1M blocks; fits in int but use size_t
-  matmul_naive_kernel<<<(unsigned int)grid, block, 0, stream>>>(
-      out, inp, weight, (int)BT, OC, C);
+  const size_t BT = (size_t)B * (size_t)T;
+  const size_t total = BT * (size_t)OC;
+  const int block = 256;
+  unsigned int grid = (unsigned int)((total + block - 1) / block);
+  if (grid > 65535u) grid = 65535u;
+  if (grid == 0u) grid = 1u;
+  matmul_naive_kernel<<<grid, block, 0, stream>>>(
+      out, inp, weight, BT, (size_t)OC, (size_t)C);
   cudaCheck(cudaGetLastError());
 }
 
@@ -394,17 +398,21 @@ __global__ void matmul_backward_dinp_kernel(
     floatX* __restrict__ dinp,
     const floatX* __restrict__ dout,
     const floatX* __restrict__ weight,
-    int BT, int OC, int C
+    size_t BT, size_t OC, size_t C
 ) {
   size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-  if (idx >= (size_t)BT * C) return;
-  int bt = (int)(idx / C);
-  int c  = (int)(idx % C);
-  float acc = 0.f;
-  for (int oc = 0; oc < OC; oc++) {
-    acc += (float)dout[(size_t)bt * OC + oc] * (float)weight[(size_t)oc * C + c];
+  const size_t total = BT * C;
+  const size_t stride = (size_t)blockDim.x * gridDim.x;
+
+  for (; idx < total; idx += stride) {
+    size_t bt = idx / C;
+    size_t c  = idx - bt * C;
+    float acc = 0.f;
+    for (size_t oc = 0; oc < OC; oc++) {
+      acc += (float)dout[bt * OC + oc] * (float)weight[oc * C + c];
+    }
+    dinp[idx] = (floatX)acc;
   }
-  dinp[idx] = (floatX)acc;
 }
 
 // ---------------------------------------------------------------------------
@@ -414,17 +422,21 @@ __global__ void matmul_backward_dweight_kernel(
     floatX* __restrict__ dweight,
     const floatX* __restrict__ dout,
     const floatX* __restrict__ inp,
-    int BT, int OC, int C
+    size_t BT, size_t OC, size_t C
 ) {
   size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-  if (idx >= (size_t)OC * C) return;
-  int oc = (int)(idx / C);
-  int c  = (int)(idx % C);
-  float acc = 0.f;
-  for (int bt = 0; bt < BT; bt++) {
-    acc += (float)dout[(size_t)bt * OC + oc] * (float)inp[(size_t)bt * C + c];
+  const size_t total = OC * C;
+  const size_t stride = (size_t)blockDim.x * gridDim.x;
+
+  for (; idx < total; idx += stride) {
+    size_t oc = idx / C;
+    size_t c  = idx - oc * C;
+    float acc = 0.f;
+    for (size_t bt = 0; bt < BT; bt++) {
+      acc += (float)dout[bt * OC + oc] * (float)inp[bt * C + c];
+    }
+    dweight[idx] = (floatX)((float)dweight[idx] + acc);
   }
-  dweight[idx] = (floatX)((float)dweight[idx] + acc);
 }
 
 // ---------------------------------------------------------------------------
@@ -436,24 +448,28 @@ void matmul_backward_naive(floatX *dinp, floatX *dweight, floatX *dout,
                            int B, int T, int C, int OC,
                            cudaStream_t stream) {
   NVTX_RANGE_FN();
-  int BT = B * T;
-  int block = 256;
+  const size_t BT = (size_t)B * (size_t)T;
+  const int block = 256;
 
   // 1. dinp = dout @ weight (set, not accumulate)
   if (dinp) {
-    size_t total = (size_t)BT * C;
+    size_t total = BT * (size_t)C;
     unsigned int grid = (unsigned int)((total + block - 1) / block);
+    if (grid > 65535u) grid = 65535u;
+    if (grid == 0u) grid = 1u;
     matmul_backward_dinp_kernel<<<grid, block, 0, stream>>>(
-        dinp, dout, weight, BT, OC, C);
+        dinp, dout, weight, BT, (size_t)OC, (size_t)C);
     cudaCheck(cudaGetLastError());
   }
 
   // 2. dweight += dout^T @ inp (accumulate)
   if (dweight) {
-    size_t total = (size_t)OC * C;
+    size_t total = (size_t)OC * (size_t)C;
     unsigned int grid = (unsigned int)((total + block - 1) / block);
+    if (grid > 65535u) grid = 65535u;
+    if (grid == 0u) grid = 1u;
     matmul_backward_dweight_kernel<<<grid, block, 0, stream>>>(
-        dweight, dout, inp, BT, OC, C);
+        dweight, dout, inp, BT, (size_t)OC, (size_t)C);
     cudaCheck(cudaGetLastError());
   }
 }
