@@ -352,13 +352,25 @@ void matmul_forward_cublaslt(floatX *out, floatX *inp, floatX *weight,
 }
 
 // ---------------------------------------------------------------------------
-// Forward GEMM for bias-free models (LLaMA).
-// Simply delegates to matmul_forward_cublaslt with NULL bias (EPILOGUE_DEFAULT).
-// The fallback chain in matmul_cublaslt tries multiple compute types.
+// Forward GEMM for LLaMA (no bias). cuBLASLt only has Tensor Core algorithms
+// for CUBLASLT_EPILOGUE_BIAS on this system — CUBLASLT_EPILOGUE_DEFAULT
+// returns 0 results for LLaMA's matrix dimensions. Workaround: pass a static
+// all-zero bias buffer. Adding zeros is mathematically a no-op.
 // ---------------------------------------------------------------------------
+static floatX *g_zero_bias = nullptr;
+static int     g_zero_bias_oc = 0;
+
 void matmul_forward_cublas(floatX *out, const floatX *inp, const floatX *weight,
                            int B, int T, int C, int OC, cudaStream_t stream) {
-  matmul_forward_cublaslt(out, (floatX*)inp, (floatX*)weight, NULL, B, T, C, OC, stream);
+  // Grow zero bias buffer on demand (never shrinks — amortised allocation)
+  if (OC > g_zero_bias_oc) {
+    if (g_zero_bias) cudaFree(g_zero_bias);
+    cudaCheck(cudaMalloc(&g_zero_bias, (size_t)OC * sizeof(floatX)));
+    cudaCheck(cudaMemset(g_zero_bias, 0, (size_t)OC * sizeof(floatX)));
+    g_zero_bias_oc = OC;
+  }
+  // Pass zero bias → CUBLASLT_EPILOGUE_BIAS → algorithms exist on this system
+  matmul_forward_cublaslt(out, (floatX*)inp, (floatX*)weight, g_zero_bias, B, T, C, OC, stream);
 }
 
 void matmul_backward(floatX *dinp, floatX *dweight, floatX *dbias, floatX *dout,
