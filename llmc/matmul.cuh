@@ -432,7 +432,7 @@ void matmul_forward_cublas(floatX *out, const floatX *inp, const floatX *weight,
       &beta,
       g_fp32_scratch, CUDA_R_32F, OC,  // FP32 output (always supported)
       CUBLAS_COMPUTE_32F,
-      CUBLAS_GEMM_DEFAULT_TENSOR_OP
+      CUBLAS_GEMM_DEFAULT           // let cuBLAS pick (not forced Tensor Ops)
   ));
   // Cast FP32 → BF16
   int nblocks = (int)((out_size + 255) / 256);
