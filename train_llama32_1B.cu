@@ -216,7 +216,7 @@ void *malloc_and_point_parameters(ParameterTensors *params,
 // Activation Tensors
 // ============================================================================
 
-constexpr int NUM_ACTIVATION_TENSORS = 18;
+constexpr int NUM_ACTIVATION_TENSORS = 19;
 typedef struct {
     floatX *encoded;     // (B, T, C) — embedding output
     floatX *rms1;        // (L, B, T, C) — pre-attn RMSNorm output
@@ -236,6 +236,7 @@ typedef struct {
     float  *losses;      // (B, T)
     floatX *output;      // (B, T, Vp)     — logits / gradient scratchpad
     floatX *scratch_btc; // (B, T, C)      — gradient scratchpad
+    floatX *scratch_btc2;// (B, T, C)      — gradient scratchpad 2
 } ActivationTensors;
 
 struct TensorSpec {
@@ -277,6 +278,7 @@ void fill_in_activation_sizes(const ActivationTensors *data,
     tensors[15] = TENSOR_SPEC(data->losses,     B * T);
     tensors[16] = TENSOR_SPEC(data->output,     B * T * max((NH + 2*NKV) * HD, max(NH * T, Vp)));
     tensors[17] = TENSOR_SPEC(data->scratch_btc, B * T * C);
+    tensors[18] = TENSOR_SPEC(data->scratch_btc2,B * T * C);
 }
 
 void *malloc_and_point_activations(TensorSpec (&tensors)[NUM_ACTIVATION_TENSORS]) {
@@ -1059,13 +1061,13 @@ void llama32_backward_and_reduce(LLaMA32 *model, int *inputs, const int *targets
     assert(att_scratch_elems + mlp_scratch_elems + qkv_expanded_elems <= output_total_elems);
 
     // Backward through lm_head (tied: grad goes to wte grads)
-    matmul_backward_naive(acts.scratch_btc, grads.wte, acts.output,
+    matmul_backward_naive(acts.scratch_btc2, grads.wte, acts.output,
                           acts.rms_f, params.wte, B, T, C, Vp, false, main_stream);
 
     // Backward through final RMSNorm
     floatX *residual_last = acts.residual3 + (size_t)(L-1) * B * T * C;
     rmsnorm_backward(dresidual, grads.rms_fw, scratchF,
-                     acts.scratch_btc, residual_last,
+                     acts.scratch_btc2, residual_last,
                      params.rms_fw, acts.rms_f_rstd, B, T, C, main_stream);
 
     floatX *dl_btc = residual_last; // reuse memory
