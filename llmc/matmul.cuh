@@ -508,14 +508,16 @@ void matmul_backward_naive(floatX *dinp, floatX *dweight, floatX *dout,
                            bool accumulate_dinp,
                            cudaStream_t stream) {
   NVTX_RANGE_FN();
-  // Keep API for callsite stability, but execute with cuBLASLt.
+  // Execute with cuBLASLt.  backward=false so that the Q115 post-quantization
+  // inside matmul_cublaslt fires (no GELU/bias epilogues here, so the flag
+  // only gates Q115 simulation -- matching the old naive-kernel behaviour).
   if (dinp) {
     matmul_cublaslt(dinp, weight, dout, NULL, C, B * T, OC, stream, false, false,
-                    0, 0, 0, 0, accumulate_dinp, NULL, true);
+                    0, 0, 0, 0, accumulate_dinp, NULL, false);
   }
   if (dweight) {
     matmul_cublaslt(dweight, inp, dout, NULL, C, OC, B * T, stream, false, true,
-                    0, 0, 0, 0, true, NULL, true);
+                    0, 0, 0, 0, true, NULL, false);
   }
 }
 
