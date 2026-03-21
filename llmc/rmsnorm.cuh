@@ -15,6 +15,27 @@ References:
 #include <assert.h>
 #include "cuda_utils.cuh"
 #include "cuda_common.h"
+#if defined(ENABLE_Q115)
+#include "q115_common.cuh"
+#if defined(SF16_TRUE_FORWARD)
+#include "q131_common.cuh"
+#endif
+#elif defined(ENABLE_Q131)
+#include "q131_common.cuh"
+#endif
+
+__device__ __forceinline__ float quantize_rmsnorm_backward(float x) {
+#if defined(ENABLE_Q131)
+    return simulate_q131(x);
+#elif defined(ENABLE_Q115)
+#if defined(SF16_TRUE_FORWARD)
+    x = simulate_q131(x);
+#endif
+    return simulate_q115(x);
+#else
+    return x;
+#endif
+}
 
 // ----------------------------------------------------------------------------
 // CUDA kernel: RMSNorm forward
@@ -131,7 +152,8 @@ __global__ void rmsnorm_backward_dinp_kernel(
         float xi  = (float)__ldcs(&x[i]);
         float dxi = r * wi * dyi - r * r * r * xi * dot_val / (float)C;
         float prev_dxi = (float)__ldcs(&dx[i]);
-        __stcs(&dx[i], (floatX)(prev_dxi + dxi));
+        float summed = quantize_rmsnorm_backward(prev_dxi + dxi);
+        __stcs(&dx[i], (floatX)summed);
     }
 }
 
@@ -152,7 +174,8 @@ __global__ void rmsnorm_backward_dweight_kernel(
             acc += rstd[bt] * xi * dyi;
         }
         float prev = (float)__ldcs(&dweight[i]);
-        __stcs(&dweight[i], (floatX)(prev + acc));
+        float summed = quantize_rmsnorm_backward(prev + acc);
+        __stcs(&dweight[i], (floatX)summed);
     }
 }
 

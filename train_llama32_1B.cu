@@ -531,7 +531,8 @@ __global__ void reduce_kv_grad_kernel(
         size_t in_base = bt * expanded_stride;
 
         if (o < q_span) {
-            out[idx] = inp[in_base + o];
+            float qv = (float)inp[in_base + o];
+            out[idx] = (floatX)quantize_sf16_forward(qv);
         } else if (o < q_span + k_span) {
             size_t kk = o - q_span;
             int kv_h = (int)(kk / HD);
@@ -541,7 +542,7 @@ __global__ void reduce_kv_grad_kernel(
                 int h = kv_h * n_rep + r;
                 acc += (float)inp[in_base + q_span + (size_t)h * HD + d];
             }
-            out[idx] = (floatX)acc;
+            out[idx] = (floatX)quantize_sf16_forward(acc);
         } else {
             size_t vv = o - (q_span + k_span);
             int kv_h = (int)(vv / HD);
@@ -551,7 +552,7 @@ __global__ void reduce_kv_grad_kernel(
                 int h = kv_h * n_rep + r;
                 acc += (float)inp[in_base + 2 * q_span + (size_t)h * HD + d];
             }
-            out[idx] = (floatX)acc;
+            out[idx] = (floatX)quantize_sf16_forward(acc);
         }
     }
 }
@@ -618,8 +619,10 @@ __global__ void swiglu_backward_kernel(
         float sig    = 1.0f / (1.0f + expf(-gi));
         float si     = gi * sig;
         float dsilu  = si + sig * (1.0f - si);
-        __stcs(&d_gate_in[i], (floatX)(dout_i * ui * dsilu));
-        __stcs(&d_up_in[i],   (floatX)(dout_i * si));
+        float d_gate = quantize_sf16_forward(dout_i * ui * dsilu);
+        float d_up   = quantize_sf16_forward(dout_i * si);
+        __stcs(&d_gate_in[i], (floatX)d_gate);
+        __stcs(&d_up_in[i],   (floatX)d_up);
     }
 }
 
@@ -1374,12 +1377,12 @@ int main(int argc, char *argv[]) {
     int num_iterations       = -1;       // -1 = auto
     int inference_only       = 0;
 #if defined(ENABLE_Q115)
-    float learning_rate      = 3e-4f;
-    int warmup_iters         = 0;
+    float learning_rate      = 5e-5f;
+    int warmup_iters         = 400;
     float grad_clip          = 0.5f;
 #else
-    float learning_rate      = 3e-4f;
-    int warmup_iters         = 0;
+    float learning_rate      = 5e-5f;
+    int warmup_iters         = 400;
     float grad_clip          = 1.0f;
 #endif
     float lr_decay_frac      = 1.0f;

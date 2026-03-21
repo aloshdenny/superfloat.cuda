@@ -36,6 +36,19 @@ Matrix Multiplication, with help from cuBLASLt
 #include "q131_common.cuh"
 #endif
 
+__device__ __forceinline__ float quantize_sf_backward(float x) {
+#if defined(ENABLE_Q131)
+  return simulate_q131(x);
+#elif defined(ENABLE_Q115)
+#if defined(SF16_TRUE_FORWARD)
+  x = simulate_q131(x);
+#endif
+  return simulate_q115(x);
+#else
+  return x;
+#endif
+}
+
 // ----------------------------------------------------------------------------
 // CUDA kernels
 
@@ -423,7 +436,7 @@ __global__ void matmul_backward_dinp_kernel(
     for (size_t oc = 0; oc < OC; oc++) {
       acc += (float)dout[bt * OC + oc] * (float)weight[oc * C + c];
     }
-    dinp[idx] = (floatX)acc;
+    dinp[idx] = (floatX)quantize_sf_backward(acc);
   }
 }
 
@@ -444,7 +457,8 @@ __global__ void matmul_backward_dinp_accum_kernel(
     for (size_t oc = 0; oc < OC; oc++) {
       acc += (float)dout[bt * OC + oc] * (float)weight[oc * C + c];
     }
-    dinp[idx] = (floatX)((float)dinp[idx] + acc);
+    float summed = (float)dinp[idx] + acc;
+    dinp[idx] = (floatX)quantize_sf_backward(summed);
   }
 }
 
@@ -468,7 +482,8 @@ __global__ void matmul_backward_dweight_kernel(
     for (size_t bt = 0; bt < BT; bt++) {
       acc += (float)dout[bt * OC + oc] * (float)inp[bt * C + c];
     }
-    dweight[idx] = (floatX)((float)dweight[idx] + acc);
+    float summed = (float)dweight[idx] + acc;
+    dweight[idx] = (floatX)quantize_sf_backward(summed);
   }
 }
 
