@@ -866,8 +866,11 @@ void llama32_forward(LLaMA32 *model, const int *inputs, size_t B, size_t T) {
     const int    V   = model->config.vocab_size;
     const int n_rep  = (int)(NH / NKV);
 
-    cudaCheck(cudaMemcpy(model->inputs, inputs, B * T * sizeof(int),
-                         cudaMemcpyHostToDevice));
+    {
+        NvtxRange h2d_inputs("H2DInputs");
+        cudaCheck(cudaMemcpy(model->inputs, inputs, B * T * sizeof(int),
+                             cudaMemcpyHostToDevice));
+    }
     tokenCheck(inputs, B * T, V);
 
     ParameterTensors params = model->params;
@@ -934,10 +937,9 @@ void llama32_forward(LLaMA32 *model, const int *inputs, size_t B, size_t T) {
         // --- Attention forward (uses expanded Q,K,V in l_qkvr) ---
         if (T != model->seq_len)
             cudaCheck(cudaMemset(l_att, 0, B * NH * T * T * sizeof(floatX)));
-        cudaCheck(cudaMemcpyAsync(scratch, l_qkvr,
-                                  (size_t)B * T * 3 * C * sizeof(floatX),
-                                  cudaMemcpyDeviceToDevice, main_stream));
-        attention_forward(l_atty, l_qkvr, l_att, scratch, B, T, C, NH, main_stream);
+        // Avoid redundant D2D copy: attention_forward can read directly from
+        // packed QKV in l_qkvr and write its unpacked/cache form in-place.
+        attention_forward(l_atty, l_qkvr, l_att, l_qkvr, B, T, C, NH, main_stream);
 
         // 3) Output projection
         matmul_forward_cublas(scratch, l_atty, l_attn_ow, B, T, C, C, main_stream);
@@ -986,8 +988,11 @@ float llama32_validate(LLaMA32 *model, const int *inputs, const int *targets,
     ActivationTensors acts = model->acts;
     const float dloss = 1.0f / (B * T);
     cudaCheck(cudaMemset(acts.losses, 0, B * T * sizeof(float)));
-    cudaCheck(cudaMemcpy(model->targets, targets, B * T * sizeof(int),
-                         cudaMemcpyHostToDevice));
+    {
+        NvtxRange h2d_targets("H2DTargetsValidate");
+        cudaCheck(cudaMemcpy(model->targets, targets, B * T * sizeof(int),
+                             cudaMemcpyHostToDevice));
+    }
     tokenCheck(targets, B * T, V);
     fused_classifier(acts.output, acts.losses, dloss, model->targets,
                      B, T, V, Vp, False, main_stream);
@@ -1036,8 +1041,11 @@ void llama32_backward_and_reduce(LLaMA32 *model, int *inputs, const int *targets
     ActivationTensors acts  = model->acts;
 
     const float dloss = 1.0f / (float)(B * T * grad_accum_steps);
-    cudaCheck(cudaMemcpy(model->targets, targets, B * T * sizeof(int),
-                         cudaMemcpyHostToDevice));
+    {
+        NvtxRange h2d_targets("H2DTargetsTrain");
+        cudaCheck(cudaMemcpy(model->targets, targets, B * T * sizeof(int),
+                             cudaMemcpyHostToDevice));
+    }
     tokenCheck(targets, B * T, V);
     fused_classifier(acts.output, acts.losses, dloss, model->targets,
                      B, T, V, Vp, True, main_stream);
@@ -1392,6 +1400,7 @@ int main(int argc, char *argv[]) {
     int compile              = 0;
     const char *dtype_str    = "bfloat16";
     int test_tokenizer       = 0;
+    const char *tokenizer_bin = "llama32_tokenizer_sf16.bin";
 
     for (int i = 1; i < argc; i++) {
 #define PARSE_STR(flag, var)  if (strcmp(argv[i], flag) == 0) { var = argv[++i]; continue; }
@@ -1420,11 +1429,23 @@ int main(int argc, char *argv[]) {
         PARSE_INT("--compile",               compile)
         PARSE_STR("--dtype",                dtype_str)
         PARSE_INT("--test_tokenizer",        test_tokenizer)
+        PARSE_STR("--tokenizer_bin",         tokenizer_bin)
         fprintf(stderr, "Unknown arg: %s\n", argv[i]); exit(EXIT_FAILURE);
     }
 
     // SF16 tokenizer self-test (optional)
     if (test_tokenizer) { sf16_tokenizer_self_test(); return 0; }
+
+    Tokenizer tokenizer = {};
+    if (tokenizer_bin != NULL && strlen(tokenizer_bin) > 0) {
+        tokenizer_init_sf16(&tokenizer, tokenizer_bin);
+        if (!tokenizer.init_ok) {
+            fprintf(stderr, "failed to initialize SF16 tokenizer from %s\n", tokenizer_bin);
+            exit(EXIT_FAILURE);
+        }
+        printf("Loaded SF16 tokenizer: vocab=%u eot=%d\n",
+               tokenizer.vocab_size, tokenizer.eot_token);
+    }
 
     // ---- DDP setup ----
     multi_gpu_config = multi_gpu_config_init(-1, -1, -1, (char *)"", (char *)"", (char *)"");
@@ -1619,6 +1640,7 @@ int main(int argc, char *argv[]) {
     cudaCheck(cudaFree(model.d_freqs_cis));
     cudaCheck(cudaFree(cublaslt_workspace));
     cudaCheck(cudaStreamDestroy(main_stream));
+    if (tokenizer.init_ok) tokenizer_free(&tokenizer);
     printf0("Training complete.\n");
     return 0;
 }
