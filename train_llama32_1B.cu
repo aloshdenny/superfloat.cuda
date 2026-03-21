@@ -659,10 +659,14 @@ void llama32_init_common(LLaMA32 *model) {
     model->master_weights = NULL;
     model->d_freqs_cis = NULL;
     model->rng_state = 13371337 + multi_gpu_config.process_rank;
-    // BF16 pretraining: no FP32 master copy needed.
-    // use_master_weights=0 saves 4714 MiB, keeping total < 24 GB VRAM.
-    // AdamW m/v states (FP32) already provide sufficient precision.
+    // Keep FP32 master weights for AdamW updates in Q115 mode. The forward pass
+    // still runs from BF16/SF16-backed parameter storage; the master copy is
+    // only used to avoid re-updating already-quantized weights every step.
+#if defined(ENABLE_Q115)
+    model->use_master_weights = 1;
+#else
     model->use_master_weights = 0;
+#endif
     model->init_state = true;
     model->recompute = 1;
 }
