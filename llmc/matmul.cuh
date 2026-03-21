@@ -508,16 +508,16 @@ void matmul_backward_naive(floatX *dinp, floatX *dweight, floatX *dout,
                            bool accumulate_dinp,
                            cudaStream_t stream) {
   NVTX_RANGE_FN();
-  // Execute with cuBLASLt.  backward=false so that the Q115 post-quantization
-  // inside matmul_cublaslt fires (no GELU/bias epilogues here, so the flag
-  // only gates Q115 simulation -- matching the old naive-kernel behaviour).
+  // Execute with cuBLASLt.  backward=true so that Q115 post-quantization is
+  // skipped -- matching GPT's matmul_backward and the design intent of
+  // "Q1.15 simulated inference with non-sf16 backprop" (cuda_common.h).
   if (dinp) {
     matmul_cublaslt(dinp, weight, dout, NULL, C, B * T, OC, stream, false, false,
-                    0, 0, 0, 0, accumulate_dinp, NULL, false);
+                    0, 0, 0, 0, accumulate_dinp, NULL, true);
   }
   if (dweight) {
     matmul_cublaslt(dweight, inp, dout, NULL, C, OC, B * T, stream, false, true,
-                    0, 0, 0, 0, true, NULL, false);
+                    0, 0, 0, 0, true, NULL, true);
   }
 }
 
