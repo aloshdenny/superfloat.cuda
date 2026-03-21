@@ -20,7 +20,14 @@ typedef struct {
   char **token_table;
   int init_ok;
   int eot_token; // <|endoftext|> token id
+  int contiguous_payload; // 1 when token strings share one allocation
 } Tokenizer;
+
+enum {
+  TOKENIZER_MAGIC_STD = 20240328,
+  TOKENIZER_MAGIC_Q15 = 2024,
+  TOKENIZER_MAGIC_SF16 = 20260321
+};
 
 void safe_printf(const char *piece) {
   // the tokens are raw bytes, and we we only want to print the printable ones
@@ -52,12 +59,13 @@ void tokenizer_init(Tokenizer *tokenizer, const char *filename) {
     printf("Re-run `python train_gpt2.py` to write it\n");
     printf("---\n");
     tokenizer->init_ok = 0;
+    tokenizer->contiguous_payload = 0;
     return;
   }
   // read in the header
   uint32_t header[256];
   freadCheck(header, sizeof(uint32_t), 256, file);
-  assert(header[0] == 20240328);
+  assert(header[0] == TOKENIZER_MAGIC_STD);
   int version = header[1];
   tokenizer->vocab_size = header[2];
   if (version == 1) {
@@ -87,6 +95,76 @@ void tokenizer_init(Tokenizer *tokenizer, const char *filename) {
   // cleanups
   fcloseCheck(file);
   tokenizer->init_ok = 1;
+  tokenizer->contiguous_payload = 0;
+}
+
+// SF16 tokenizer binary format:
+// header[0] = TOKENIZER_MAGIC_SF16
+// header[1] = version (1)
+// header[2] = vocab_size (uint32)
+// header[3] = eot_token (uint32)
+// header[4] = payload_bytes (uint32) including all token bytes plus nulls
+// data section:
+//   uint32 lengths[vocab_size]
+//   char payload[payload_bytes] as NUL-terminated token strings packed back-to-back
+void tokenizer_init_sf16(Tokenizer *tokenizer, const char *filename) {
+  FILE *file = fopen(filename, "rb");
+  if (file == NULL) {
+    fprintf(stderr, "Failed to open SF16 tokenizer file: %s\n", filename);
+    tokenizer->init_ok = 0;
+    tokenizer->contiguous_payload = 0;
+    return;
+  }
+
+  uint32_t header[256];
+  freadCheck(header, sizeof(uint32_t), 256, file);
+  if (header[0] != TOKENIZER_MAGIC_SF16) {
+    fprintf(stderr, "SF16 tokenizer %s has bad magic: %u\n", filename, header[0]);
+    exit(EXIT_FAILURE);
+  }
+  if (header[1] != 1u) {
+    fprintf(stderr, "SF16 tokenizer %s has bad version: %u\n", filename, header[1]);
+    exit(EXIT_FAILURE);
+  }
+
+  tokenizer->vocab_size = header[2];
+  tokenizer->eot_token = (int)header[3];
+  uint32_t payload_bytes = header[4];
+  if (tokenizer->vocab_size == 0 || payload_bytes == 0) {
+    fprintf(stderr, "SF16 tokenizer %s has invalid header sizes\n", filename);
+    exit(EXIT_FAILURE);
+  }
+
+  tokenizer->token_table =
+      (char **)mallocCheck(tokenizer->vocab_size * sizeof(char *));
+  uint32_t *lengths =
+      (uint32_t *)mallocCheck(tokenizer->vocab_size * sizeof(uint32_t));
+  freadCheck(lengths, sizeof(uint32_t), tokenizer->vocab_size, file);
+
+  char *payload = (char *)mallocCheck(payload_bytes);
+  freadCheck(payload, sizeof(char), payload_bytes, file);
+
+  uint64_t cursor = 0;
+  for (uint32_t i = 0; i < tokenizer->vocab_size; i++) {
+    uint32_t len = lengths[i];
+    if (len == 0 || cursor + (uint64_t)len + 1 > payload_bytes) {
+      fprintf(stderr, "SF16 tokenizer %s has invalid token payload at id=%u\n",
+              filename, i);
+      exit(EXIT_FAILURE);
+    }
+    tokenizer->token_table[i] = payload + cursor;
+    if (payload[cursor + len] != '\0') {
+      fprintf(stderr, "SF16 tokenizer %s token %u is missing terminator\n",
+              filename, i);
+      exit(EXIT_FAILURE);
+    }
+    cursor += (uint64_t)len + 1;
+  }
+
+  free(lengths);
+  fcloseCheck(file);
+  tokenizer->init_ok = 1;
+  tokenizer->contiguous_payload = 1;
 }
 
 const char *tokenizer_decode(Tokenizer *tokenizer, uint32_t token_id) {
@@ -103,8 +181,12 @@ const char *tokenizer_decode(Tokenizer *tokenizer, uint32_t token_id) {
 
 void tokenizer_free(Tokenizer *tokenizer) {
   if (tokenizer->init_ok) {
-    for (uint32_t i = 0; i < tokenizer->vocab_size; i++) {
-      free(tokenizer->token_table[i]);
+    if (tokenizer->contiguous_payload) {
+      free(tokenizer->token_table[0]);
+    } else {
+      for (uint32_t i = 0; i < tokenizer->vocab_size; i++) {
+        free(tokenizer->token_table[i]);
+      }
     }
     free(tokenizer->token_table);
   }
@@ -123,6 +205,7 @@ void tokenizer_init_q15(Tokenizer *tokenizer, const char *filename) {
              filename, fallback_filename);
       printf("---\n");
       tokenizer->init_ok = 0;
+      tokenizer->contiguous_payload = 0;
       return;
     }
 
@@ -182,6 +265,7 @@ void tokenizer_init_q15(Tokenizer *tokenizer, const char *filename) {
       printf("Successfully constructed %s\n", filename);
     }
     tokenizer->init_ok = 1;
+    tokenizer->contiguous_payload = 0;
     return;
   }
   // read in the header
@@ -221,6 +305,7 @@ void tokenizer_init_q15(Tokenizer *tokenizer, const char *filename) {
   // cleanups
   fcloseCheck(file);
   tokenizer->init_ok = 1;
+  tokenizer->contiguous_payload = 0;
 }
 
 const char *tokenizer_decode_q15(Tokenizer *tokenizer, uint16_t q1_15_id) {
