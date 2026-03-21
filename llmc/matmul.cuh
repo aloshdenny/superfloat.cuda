@@ -150,6 +150,8 @@ __global__ void reduce_add_sum_kernel(floatX *dst, const float *src, size_t n,
 // Quantize forward outputs to SF16 boundaries.
 // In SF16_TRUE_FORWARD mode, we first simulate an SF32 accumulator register
 // and then quantize to SF16 storage boundaries.
+constexpr float SF16_MIN = -1.0f;
+constexpr float SF16_MAX = 0.999969482421875f;
 __global__ void q115_simulate_kernel(floatX *d, size_t N) {
   size_t idx = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
   if (idx < N) {
@@ -160,6 +162,18 @@ __global__ void q115_simulate_kernel(floatX *d, size_t N) {
     d[idx] = (floatX)simulate_q115(v);
   }
 }
+
+#if defined(SF16_CLAMP_DEBUG)
+__global__ void sf16_clamp_check_kernel(const floatX *d, size_t N, unsigned int *violations) {
+  size_t idx = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+  if (idx < N) {
+    float v = (float)d[idx];
+    if (v < SF16_MIN || v > SF16_MAX) {
+      atomicAdd(violations, 1u);
+    }
+  }
+}
+#endif
 #endif
 
 // Wrapper around cublasLtMatmul that is meant to support everything we need in
@@ -334,6 +348,21 @@ void matmul_cublaslt(floatX *d, const floatX *a, const floatX *b,
   if (!backward && size_C > 0) {
     int num_blocks = (size_C + 255) / 256;
     q115_simulate_kernel<<<num_blocks, 256, 0, stream>>>(d, size_C);
+#if defined(SF16_CLAMP_DEBUG)
+    unsigned int *d_violations = nullptr;
+    unsigned int h_violations = 0;
+    cudaCheck(cudaMalloc(&d_violations, sizeof(unsigned int)));
+    cudaCheck(cudaMemsetAsync(d_violations, 0, sizeof(unsigned int), stream));
+    sf16_clamp_check_kernel<<<num_blocks, 256, 0, stream>>>(d, size_C, d_violations);
+    cudaCheck(cudaMemcpyAsync(&h_violations, d_violations, sizeof(unsigned int),
+                              cudaMemcpyDeviceToHost, stream));
+    cudaCheck(cudaStreamSynchronize(stream));
+    if (h_violations != 0) {
+      fprintf(stderr, "SF16 clamp check failed: %u out-of-range outputs\n", h_violations);
+      exit(EXIT_FAILURE);
+    }
+    cudaCheck(cudaFree(d_violations));
+#endif
   }
 #endif
   // cleanups
@@ -393,27 +422,9 @@ __global__ void matmul_naive_kernel(
 void matmul_forward_cublas(floatX *out, const floatX *inp, const floatX *weight,
                            int B, int T, int C, int OC, cudaStream_t stream) {
   NVTX_RANGE_FN();
-  const size_t BT = (size_t)B * (size_t)T;
-  const size_t total = BT * (size_t)OC;
-  const int block = 256;
-  unsigned int grid = (unsigned int)((total + block - 1) / block);
-  if (grid > 65535u) grid = 65535u;
-  if (grid == 0u) grid = 1u;
-  matmul_naive_kernel<<<grid, block, 0, stream>>>(
-      out, inp, weight, BT, (size_t)OC, (size_t)C);
-  cudaCheck(cudaGetLastError());
-
-#if defined(ENABLE_Q115)
-  // Keep naive forward aligned with the cuBLASLt forward path: quantize every
-  // matmul output element at SF16 boundaries (and SF32->SF16 in true-forward).
-  if (total > 0) {
-    unsigned int num_blocks = (unsigned int)((total + 255) / 256);
-    if (num_blocks == 0u)
-      num_blocks = 1u;
-    q115_simulate_kernel<<<num_blocks, 256, 0, stream>>>(out, total);
-    cudaCheck(cudaGetLastError());
-  }
-#endif
+  // Historical API name, now routed to cuBLASLt for throughput.
+  matmul_forward_cublaslt(out, (floatX *)inp, (floatX *)weight, nullptr,
+                          B, T, C, OC, stream, NULL, 1);
 }
 
 // ---------------------------------------------------------------------------
@@ -497,34 +508,14 @@ void matmul_backward_naive(floatX *dinp, floatX *dweight, floatX *dout,
                            bool accumulate_dinp,
                            cudaStream_t stream) {
   NVTX_RANGE_FN();
-  const size_t BT = (size_t)B * (size_t)T;
-  const int block = 256;
-
-  // 1. dinp = dout @ weight (set, not accumulate)
+  // Keep API for callsite stability, but execute with cuBLASLt.
   if (dinp) {
-    size_t total = BT * (size_t)C;
-    unsigned int grid = (unsigned int)((total + block - 1) / block);
-    if (grid > 65535u) grid = 65535u;
-    if (grid == 0u) grid = 1u;
-    if (accumulate_dinp) {
-      matmul_backward_dinp_accum_kernel<<<grid, block, 0, stream>>>(
-          dinp, dout, weight, BT, (size_t)OC, (size_t)C);
-    } else {
-      matmul_backward_dinp_kernel<<<grid, block, 0, stream>>>(
-          dinp, dout, weight, BT, (size_t)OC, (size_t)C);
-    }
-    cudaCheck(cudaGetLastError());
+    matmul_cublaslt(dinp, weight, dout, NULL, C, B * T, OC, stream, false, false,
+                    0, 0, 0, 0, accumulate_dinp, NULL, true);
   }
-
-  // 2. dweight += dout^T @ inp (accumulate)
   if (dweight) {
-    size_t total = (size_t)OC * (size_t)C;
-    unsigned int grid = (unsigned int)((total + block - 1) / block);
-    if (grid > 65535u) grid = 65535u;
-    if (grid == 0u) grid = 1u;
-    matmul_backward_dweight_kernel<<<grid, block, 0, stream>>>(
-        dweight, dout, inp, BT, (size_t)OC, (size_t)C);
-    cudaCheck(cudaGetLastError());
+    matmul_cublaslt(dweight, inp, dout, NULL, C, OC, B * T, stream, false, true,
+                    0, 0, 0, 0, true, NULL, true);
   }
 }
 
