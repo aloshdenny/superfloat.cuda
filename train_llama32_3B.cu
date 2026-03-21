@@ -1383,8 +1383,8 @@ int main(int argc, char *argv[]) {
 #endif
     float lr_decay_frac      = 1.0f;
     float weight_decay       = 0.0f;
-    int val_loss_every       = 0;
-    int val_max_steps        = 20;
+    int val_loss_every       = 100;
+    int val_max_steps        = 10;
     int overfit_single_batch = 0;
     int tensorcores          = 1;
     const char *device_str   = "";
