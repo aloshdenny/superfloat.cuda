@@ -25,16 +25,9 @@ References:
 #endif
 
 __device__ __forceinline__ float quantize_rmsnorm_backward(float x) {
-#if defined(ENABLE_Q131)
-    return simulate_q131(x);
-#elif defined(ENABLE_Q115)
-#if defined(SF16_TRUE_FORWARD)
-    x = simulate_q131(x);
-#endif
-    return simulate_q115(x);
-#else
+    // Backward runs in native BF16 precision -- no Q115/Q131 simulation.
+    // "Q1.15 simulated inference with non-sf16 backprop" (cuda_common.h).
     return x;
-#endif
 }
 
 // ----------------------------------------------------------------------------
