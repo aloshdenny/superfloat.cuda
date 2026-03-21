@@ -138,7 +138,8 @@ typedef struct {
   // file handle
   FILE *tokens_file;
   // data buffers
-  uint16_t *buffer; // we fread data from file into this buffer
+  uint16_t *buffer_u16; // fread staging buffer for uint16 token shards
+  uint32_t *buffer_u32; // fread staging buffer for uint32 token shards
   int *inputs;      // input tokens into transformer
   int *targets;     // target tokens for the transformer
   // random shuffle related variables
@@ -151,6 +152,9 @@ typedef struct {
   size_t local_batch_offset_bytes; // inner-sample offset for this process
   size_t header_bytes;             // header size in bytes
   int64_t file_size_bytes;
+  size_t token_size_bytes;         // 2 for GPT shards, 4 for LLaMA shards
+  int data_magic;
+  int data_version;
 } DataLoader;
 
 int64_t dataloader_load_shard_(DataLoader *loader, int shard_index) {
@@ -168,17 +172,29 @@ int64_t dataloader_load_shard_(DataLoader *loader, int shard_index) {
   // validate the header
   int header[HEADER_SIZE];
   freadCheck(header, sizeof(int), HEADER_SIZE, loader->tokens_file);
-  if (header[0] != 20240520) {
-    printf("Bad magic in the data file\n");
-    printf("---> HINT: Are you passing in a correct file?\n");
-    printf("---> HINT: The data encoding may have changed, re-run data prepro "
-           "or refer again to README.\n");
+  loader->data_magic = header[0];
+  loader->data_version = header[1];
+  if (loader->data_magic == 20240520) {
+    if (loader->data_version != 1) {
+      printf("Bad GPT data version in data file\n");
+      exit(EXIT_FAILURE);
+    }
+    loader->token_size_bytes = sizeof(uint16_t);
+  } else if (loader->data_magic == 20240801) {
+    if (loader->data_version != 7) {
+      printf("Bad LLaMA data version in data file\n");
+      exit(EXIT_FAILURE);
+    }
+    loader->token_size_bytes = sizeof(uint32_t);
+  } else {
+    printf("Bad magic in the data file: %d\n", loader->data_magic);
+    printf("---> HINT: Supported train shard magics are 20240520 (GPT) and 20240801 (LLaMA).\n");
     exit(EXIT_FAILURE);
   }
-  if (header[1] != 1) {
-    printf("Bad version in data file\n");
-    exit(EXIT_FAILURE);
-  }
+  loader->total_batch_size_bytes =
+      ((loader->num_processes * (loader->B * loader->T)) * loader->token_size_bytes);
+  loader->local_batch_offset_bytes =
+      loader->process_rank * loader->B * loader->T * loader->token_size_bytes;
   int64_t ntok = header[2]; // number of tokens in the file
   assert(
       ntok >
@@ -192,13 +208,14 @@ int64_t dataloader_load_shard_(DataLoader *loader, int shard_index) {
   // we expect ntok in the file to be consistent with filesize, assert that is
   // the case
   int64_t expected_file_size =
-      HEADER_SIZE * sizeof(int) + ntok * sizeof(uint16_t);
+      HEADER_SIZE * sizeof(int) + ntok * (int64_t)loader->token_size_bytes;
   if (loader->file_size_bytes != expected_file_size) {
     printf("Error: file size is not as expected\n");
     exit(EXIT_FAILURE);
   }
-  // -1 uint16_t due to us taking B*T+1 tokens but moving by B*T tokens
-  loader->shard_num_samples = (ntok * sizeof(uint16_t) - sizeof(uint16_t)) /
+  // -1 token due to us taking B*T+1 tokens but moving by B*T tokens
+  loader->shard_num_samples =
+                              (ntok * loader->token_size_bytes - loader->token_size_bytes) /
                               loader->total_batch_size_bytes;
   return ntok;
 }
@@ -262,10 +279,11 @@ void dataloader_init(DataLoader *loader, const char *filename_pattern, size_t B,
   loader->tokens_file = NULL;
   loader->should_shuffle = should_shuffle;
   loader->header_bytes = HEADER_SIZE * sizeof(int);
-  loader->total_batch_size_bytes =
-      ((loader->num_processes * (loader->B * loader->T)) * sizeof(uint16_t));
-  loader->local_batch_offset_bytes =
-      loader->process_rank * loader->B * loader->T * sizeof(uint16_t);
+  loader->total_batch_size_bytes = 0;
+  loader->local_batch_offset_bytes = 0;
+  loader->token_size_bytes = 0;
+  loader->data_magic = 0;
+  loader->data_version = 0;
 
   // glob to get the list of files matching the pattern, these are our data
   // shards
@@ -309,7 +327,8 @@ void dataloader_init(DataLoader *loader, const char *filename_pattern, size_t B,
   // loader->glob_result.gl_pathc);
 
   // allocate all the space we'll need
-  loader->buffer = (uint16_t *)mallocCheck((B * T + 1) * sizeof(uint16_t));
+  loader->buffer_u16 = (uint16_t *)mallocCheck((B * T + 1) * sizeof(uint16_t));
+  loader->buffer_u32 = (uint32_t *)mallocCheck((B * T + 1) * sizeof(uint32_t));
   // Use pinned (page-locked) host memory for inputs/targets so that
   // cudaMemcpyAsync can do true async DMA transfers without implicit staging.
   cudaMallocHost((void **)&loader->inputs, B * T * sizeof(int));
@@ -333,13 +352,23 @@ void dataloader_load_batch(DataLoader *loader) {
 
   size_t B = loader->B;
   size_t T = loader->T;
-  // read B*T+1 uint16_t tokens from the file into buffer
+  // read B*T+1 tokens from the file into a typed staging buffer
   fseekCheck(loader->tokens_file, (int)current_offset, SEEK_SET);
-  freadCheck(loader->buffer, sizeof(uint16_t), B * T + 1, loader->tokens_file);
-  // decode the buffer into inputs and targets (cast to int)
-  for (int i = 0; i < B * T; i++) {
-    loader->inputs[i] = (int)loader->buffer[i];
-    loader->targets[i] = (int)loader->buffer[i + 1];
+  if (loader->token_size_bytes == sizeof(uint16_t)) {
+    freadCheck(loader->buffer_u16, sizeof(uint16_t), B * T + 1, loader->tokens_file);
+    for (int i = 0; i < (int)(B * T); i++) {
+      loader->inputs[i] = (int)loader->buffer_u16[i];
+      loader->targets[i] = (int)loader->buffer_u16[i + 1];
+    }
+  } else if (loader->token_size_bytes == sizeof(uint32_t)) {
+    freadCheck(loader->buffer_u32, sizeof(uint32_t), B * T + 1, loader->tokens_file);
+    for (int i = 0; i < (int)(B * T); i++) {
+      loader->inputs[i] = (int)loader->buffer_u32[i];
+      loader->targets[i] = (int)loader->buffer_u32[i + 1];
+    }
+  } else {
+    printf("Unsupported token_size_bytes=%zu in dataloader\n", loader->token_size_bytes);
+    exit(EXIT_FAILURE);
   }
 }
 
@@ -361,7 +390,8 @@ void dataloader_resume(DataLoader *loader, size_t current_shard_idx,
 }
 
 void dataloader_free(DataLoader *loader) {
-  free(loader->buffer);
+  free(loader->buffer_u16);
+  free(loader->buffer_u32);
   cudaFreeHost(loader->inputs);
   cudaFreeHost(loader->targets);
   if (loader->should_shuffle) {
