@@ -65,9 +65,11 @@ __global__ void permute_kernel(floatX *q, floatX *k, floatX *v,
   int d_ = rest % d;
   int inp_idx =
       (b * N * 3 * NH * d) + (n * 3 * NH * d) + (0 * NH * d) + (nh_ * d) + d_;
-  q[idx] = __ldcs(&inp[inp_idx]);
-  k[idx] = __ldcs(&inp[inp_idx + NH * d]);
-  v[idx] = __ldcs(&inp[inp_idx + 2 * (NH * d)]);
+  q[idx] = (floatX)quantize_attention_output((float)__ldcs(&inp[inp_idx]));
+  k[idx] =
+      (floatX)quantize_attention_output((float)__ldcs(&inp[inp_idx + NH * d]));
+  v[idx] = (floatX)quantize_attention_output(
+      (float)__ldcs(&inp[inp_idx + 2 * (NH * d)]));
 }
 
 __global__ void permute_kernel_backward(floatX *dinp, const floatX *dq,
@@ -109,7 +111,7 @@ __global__ void unpermute_kernel(floatX *inp, floatX *out, int B, int N, int NH,
   int n = rest / d;
   int d_ = rest % d;
   int other_idx = (b * NH * N * d) + (n * NH * d) + (nh_ * d) + d_;
-  out[other_idx] = __ldcs(&inp[idx]);
+  out[other_idx] = (floatX)quantize_attention_output((float)__ldcs(&inp[idx]));
 }
 
 __global__ void unpermute_kernel_backward(floatX *dinp, const floatX *dout,
@@ -176,9 +178,11 @@ __global__ void flash_attention_tiled_forward_kernel(
       if (d < HS) {
         size_t h_offset = (size_t)h * HS + d;
         q_reg[i] = (float)__ldcs(inp + inp_token_base + h_offset);
-        q[q_base + d] = (floatX)q_reg[i];
-        k[q_base + d] = __ldcs(inp + inp_token_base + C + h_offset);
-        v[q_base + d] = __ldcs(inp + inp_token_base + 2 * C + h_offset);
+        q[q_base + d] = (floatX)quantize_attention_output(q_reg[i]);
+        k[q_base + d] = (floatX)quantize_attention_output(
+            (float)__ldcs(inp + inp_token_base + C + h_offset));
+        v[q_base + d] = (floatX)quantize_attention_output(
+            (float)__ldcs(inp + inp_token_base + 2 * C + h_offset));
       }
     }
   }
