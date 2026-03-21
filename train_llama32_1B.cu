@@ -122,6 +122,7 @@ cudaDeviceProp deviceProp;
 cudaStream_t main_stream;
 constexpr const size_t IO_BUF_SIZE = 32 * 1024 * 1024;
 static unsigned int g_last_sanitized_grad_count = 0;
+static bool g_log_val_only = true;
 
 // ============================================================================
 // LLaMA 3.2 Model Configuration
@@ -1228,7 +1229,7 @@ float llama32_calculate_grad_norm(LLaMA32 *model, MultiGpuConfig *mgc) {
     unsigned int bad_cpu = 0;
     cudaCheck(cudaMemcpy(&bad_cpu, bad_count, sizeof(unsigned int), cudaMemcpyDeviceToHost));
     g_last_sanitized_grad_count = bad_cpu;
-    if (bad_cpu > 0) {
+    if (bad_cpu > 0 && !g_log_val_only) {
         printf0("warning: sanitized %u non-finite/extreme gradients\n", bad_cpu);
     }
 
@@ -1526,7 +1527,11 @@ int main(int argc, char *argv[]) {
     cudaCheck(cudaEventCreate(&ev_end));
 
     // ---- Training loop ----
-    printf0("starting training loop...\n"); fflush(stdout);
+    const bool log_val_only = g_log_val_only;
+    if (!log_val_only) {
+        printf0("starting training loop...\n");
+        fflush(stdout);
+    }
     float norm = -1.0f;
     for (int step = 0; step <= num_iterations; step++) {
         bool last_step = (step == num_iterations);
@@ -1543,7 +1548,7 @@ int main(int argc, char *argv[]) {
             }
             model.mean_loss /= val_max_steps;
             float ppl = expf(model.mean_loss);
-            printf0("val loss %.4f | ppl %.2f\n", model.mean_loss, ppl);
+            printf0("val loss %f | val perplexity %f\n", model.mean_loss, ppl);
             if (master_process && logfile) {
                 FILE *lf = fopen(logfile, "a");
                 if (lf) { fprintf(lf, "s:%d tel:%f\n", step, model.mean_loss); fclose(lf); }
@@ -1553,17 +1558,17 @@ int main(int argc, char *argv[]) {
         if (last_step) break;
 
         // Training
-        cudaCheck(cudaEventRecord(ev_start));
+        if (!log_val_only) cudaCheck(cudaEventRecord(ev_start));
         for (int micro = 0; micro < grad_accum_steps; micro++) {
             if (overfit_single_batch) dataloader_reset(&train_loader);
-            if (step == 0) { printf0("  [dbg] dataloader_next_batch...\n"); fflush(stdout); }
+            if (!log_val_only && step == 0) { printf0("  [dbg] dataloader_next_batch...\n"); fflush(stdout); }
             dataloader_next_batch(&train_loader);
-            if (step == 0) { printf0("  [dbg] llama32_forward...\n"); fflush(stdout); }
+            if (!log_val_only && step == 0) { printf0("  [dbg] llama32_forward...\n"); fflush(stdout); }
             llama32_forward(&model, train_loader.inputs, B, T);
-            if (step == 0) { printf0("  [dbg] llama32_backward...\n"); fflush(stdout); }
+            if (!log_val_only && step == 0) { printf0("  [dbg] llama32_backward...\n"); fflush(stdout); }
             llama32_backward_and_reduce(&model, train_loader.inputs,
                                         train_loader.targets, grad_accum_steps, micro);
-            if (step == 0) { printf0("  [dbg] micro step done\n"); fflush(stdout); }
+            if (!log_val_only && step == 0) { printf0("  [dbg] micro step done\n"); fflush(stdout); }
         }
 
         norm = llama32_calculate_grad_norm(&model, &multi_gpu_config);
@@ -1575,10 +1580,14 @@ int main(int argc, char *argv[]) {
         bool excessive_sanitize =
             g_last_sanitized_grad_count > (unsigned int)(model.num_parameters / 1000);
         if (excessive_sanitize) {
-            printf0("warning: sanitized %u gradients at step %d, skipping update\n",
-                    g_last_sanitized_grad_count, step + 1);
+            if (!log_val_only) {
+                printf0("warning: sanitized %u gradients at step %d, skipping update\n",
+                        g_last_sanitized_grad_count, step + 1);
+            }
         } else if (!isfinite(norm)) {
-            printf0("warning: non-finite grad norm at step %d, skipping update\n", step + 1);
+            if (!log_val_only) {
+                printf0("warning: non-finite grad norm at step %d, skipping update\n", step + 1);
+            }
         } else {
             float grad_scale = (grad_clip > 0.0f && norm > grad_clip)
                                ? grad_clip / norm : 1.0f;
@@ -1586,15 +1595,17 @@ int main(int argc, char *argv[]) {
                            grad_scale, step+1, &multi_gpu_config);
         }
 
-        cudaCheck(cudaEventRecord(ev_end));
-        cudaCheck(cudaEventSynchronize(ev_end));
-        float time_elapsed_ms;
-        cudaCheck(cudaEventElapsedTime(&time_elapsed_ms, ev_start, ev_end));
-        float tok_s = (float)(grad_accum_steps * ddp_world_size * B * T) / (time_elapsed_ms * 1e-3f);
-        float mfu = llama32_estimate_mfu(&model, grad_accum_steps * B * T, time_elapsed_ms / 1000.0f);
-        printf0("step %4d/%d | loss %.6f | norm %.4f | lr %.2e | %.2f ms | %.0f tok/s | MFU %.2f%%\n",
-                step+1, num_iterations, model.mean_loss, norm, lr,
-                time_elapsed_ms, tok_s, mfu * 100.0f);
+        if (!log_val_only) {
+            cudaCheck(cudaEventRecord(ev_end));
+            cudaCheck(cudaEventSynchronize(ev_end));
+            float time_elapsed_ms;
+            cudaCheck(cudaEventElapsedTime(&time_elapsed_ms, ev_start, ev_end));
+            float tok_s = (float)(grad_accum_steps * ddp_world_size * B * T) / (time_elapsed_ms * 1e-3f);
+            float mfu = llama32_estimate_mfu(&model, grad_accum_steps * B * T, time_elapsed_ms / 1000.0f);
+            printf0("step %4d/%d | loss %.6f | norm %.4f | lr %.2e | %.2f ms | %.0f tok/s | MFU %.2f%%\n",
+                    step+1, num_iterations, model.mean_loss, norm, lr,
+                    time_elapsed_ms, tok_s, mfu * 100.0f);
+        }
 
         if (master_process && logfile) {
             FILE *lf = fopen(logfile, "a");
