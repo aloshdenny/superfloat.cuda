@@ -940,9 +940,13 @@ void llama32_forward(LLaMA32 *model, const int *inputs, size_t B, size_t T) {
         // --- Attention forward (uses expanded Q,K,V in l_qkvr) ---
         if (T != model->seq_len)
             cudaCheck(cudaMemset(l_att, 0, B * NH * T * T * sizeof(floatX)));
-        // Avoid redundant D2D copy: attention_forward can read directly from
-        // packed QKV in l_qkvr and write its unpacked/cache form in-place.
-        attention_forward(l_atty, l_qkvr, l_att, l_qkvr, B, T, C, NH, main_stream);
+        // Copy packed QKV to scratch so attention_forward can read from scratch
+        // (inp) while writing separated Q/K/V into l_qkvr -- they use different
+        // memory layouts and must not alias.
+        cudaCheck(cudaMemcpyAsync(scratch, l_qkvr,
+                                  (size_t)B * T * 3 * C * sizeof(floatX),
+                                  cudaMemcpyDeviceToDevice, main_stream));
+        attention_forward(l_atty, l_qkvr, l_att, scratch, B, T, C, NH, main_stream);
 
         // 3) Output projection
         matmul_forward_cublas(scratch, l_atty, l_attn_ow, B, T, C, C, main_stream);
