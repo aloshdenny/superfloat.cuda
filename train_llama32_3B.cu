@@ -487,29 +487,46 @@ static void rope_forward(floatX *qkv, const float2 *freqs,
 // GQA: repeat K,V from NKV heads to NH heads
 // ============================================================================
 
-__global__ void repeat_kv_kernel(
-    floatX *__restrict__ out,       // (BT, NH, HD)
-    const floatX *__restrict__ inp, // (BT, NKV, HD)
-    int BT, int NKV, int n_rep, int HD)
+// GQA expansion: convert compact interleaved QKV to full-width interleaved QKV.
+// Input  per token: [Q: NH*HD | K: NKV*HD | V: NKV*HD]  (compact_cols = (NH+2*NKV)*HD)
+// Output per token: [Q: NH*HD | K: NH*HD  | V: NH*HD ]  (expanded_cols = 3*NH*HD)
+// K and V heads are repeated n_rep times to fill NH heads.
+__global__ void expand_gqa_kernel(
+    floatX *__restrict__ out,       // (BT, 3*NH*HD)
+    const floatX *__restrict__ inp, // (BT, (NH+2*NKV)*HD)
+    int BT, int NH, int NKV, int n_rep, int HD)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int total = BT * NKV * n_rep * HD;
+    int expanded_cols = 3 * NH * HD;
+    int total = BT * expanded_cols;
     if (idx >= total) return;
-    int d    = idx % HD;
-    int h    = (idx / HD) % (NKV * n_rep);
-    int bt   = idx / (HD * NKV * n_rep);
-    int kv_h = h / n_rep;
-    float v = (float)inp[(size_t)bt * NKV * HD + kv_h * HD + d];
-    out[(size_t)bt * NKV * n_rep * HD + h * HD + d] =
-        (floatX)quantize_sf16_forward(v);
+
+    int compact_cols = (NH + 2 * NKV) * HD;
+    int bt  = idx / expanded_cols;
+    int col = idx % expanded_cols;
+    int d   = col % HD;
+    int h   = col / HD; // 0..3*NH-1
+
+    float v;
+    size_t src_base = (size_t)bt * compact_cols;
+    if (h < NH) {
+        v = (float)inp[src_base + h * HD + d];
+    } else if (h < 2 * NH) {
+        int kv_h = (h - NH) / n_rep;
+        v = (float)inp[src_base + NH * HD + kv_h * HD + d];
+    } else {
+        int kv_h = (h - 2 * NH) / n_rep;
+        v = (float)inp[src_base + (NH + NKV) * HD + kv_h * HD + d];
+    }
+    out[(size_t)idx] = (floatX)quantize_sf16_forward(v);
 }
 
-static void repeat_kv(floatX *out, const floatX *inp,
-                       int BT, int NKV, int n_rep, int HD,
+static void expand_gqa(floatX *out, const floatX *inp,
+                       int BT, int NH, int NKV, int n_rep, int HD,
                        cudaStream_t stream) {
-    int total = BT * NKV * n_rep * HD;
-    repeat_kv_kernel<<<CEIL_DIV(total, 256), 256, 0, stream>>>(
-        out, inp, BT, NKV, n_rep, HD);
+    int total = BT * 3 * NH * HD;
+    expand_gqa_kernel<<<CEIL_DIV(total, 256), 256, 0, stream>>>(
+        out, inp, BT, NH, NKV, n_rep, HD);
     cudaCheck(cudaGetLastError());
 }
 
@@ -531,8 +548,7 @@ __global__ void reduce_kv_grad_kernel(
         size_t in_base = bt * expanded_stride;
 
         if (o < q_span) {
-            float qv = (float)inp[in_base + o];
-            out[idx] = (floatX)quantize_sf16_forward(qv);
+            out[idx] = inp[in_base + o];
         } else if (o < q_span + k_span) {
             size_t kk = o - q_span;
             int kv_h = (int)(kk / HD);
@@ -542,7 +558,7 @@ __global__ void reduce_kv_grad_kernel(
                 int h = kv_h * n_rep + r;
                 acc += (float)inp[in_base + q_span + (size_t)h * HD + d];
             }
-            out[idx] = (floatX)quantize_sf16_forward(acc);
+            out[idx] = (floatX)acc;
         } else {
             size_t vv = o - (q_span + k_span);
             int kv_h = (int)(vv / HD);
@@ -552,7 +568,7 @@ __global__ void reduce_kv_grad_kernel(
                 int h = kv_h * n_rep + r;
                 acc += (float)inp[in_base + 2 * q_span + (size_t)h * HD + d];
             }
-            out[idx] = (floatX)quantize_sf16_forward(acc);
+            out[idx] = (floatX)acc;
         }
     }
 }
@@ -927,27 +943,14 @@ void llama32_forward(LLaMA32 *model, const int *inputs, size_t B, size_t T) {
         rope_forward(l_qkvr, model->d_freqs_cis,
                      B, T, NH, NKV, HD, main_stream);
 
-        // --- GQA: expand K,V to NH heads for standard attention ---
-        // Build expanded QKV in l_qkvr in-place: [Q(NH,HD) | K_exp(NH,HD) | V_exp(NH,HD)]
-        // We expand K,V backwards to avoid overwriting source data
-        floatX *k_src = l_qkvr + (size_t)B*T*NH*HD;
-        floatX *v_src = l_qkvr + (size_t)B*T*(NH+NKV)*HD;
-        floatX *k_dst = l_qkvr + (size_t)B*T*NH*HD;
-        floatX *v_dst = l_qkvr + (size_t)B*T*NH*HD*2;
-        // Expand V first (at end of buffer, safe), then K
-        repeat_kv(v_dst, v_src, B*T, NKV, n_rep, HD, main_stream);
-        repeat_kv(k_dst, k_src, B*T, NKV, n_rep, HD, main_stream);
-        // Q is already in place at the start of l_qkvr, no copy needed
+        // --- GQA: expand compact interleaved QKV to full-width 3*C in scratch ---
+        // l_qkvr has compact layout per token: [Q(NH*HD) | K(NKV*HD) | V(NKV*HD)]
+        // scratch receives expanded layout:    [Q(NH*HD) | K(NH*HD)  | V(NH*HD) ]
+        expand_gqa(scratch, l_qkvr, B*T, NH, NKV, n_rep, HD, main_stream);
 
-        // --- Attention forward (uses expanded Q,K,V in l_qkvr) ---
+        // --- Attention forward ---
         if (T != model->seq_len)
             cudaCheck(cudaMemset(l_att, 0, B * NH * T * T * sizeof(floatX)));
-        // Copy packed QKV to scratch so attention_forward can read from scratch
-        // (inp) while writing separated Q/K/V into l_qkvr -- they use different
-        // memory layouts and must not alias.
-        cudaCheck(cudaMemcpyAsync(scratch, l_qkvr,
-                                  (size_t)B * T * 3 * C * sizeof(floatX),
-                                  cudaMemcpyDeviceToDevice, main_stream));
         attention_forward(l_atty, l_qkvr, l_att, scratch, B, T, C, NH, main_stream);
 
         // 3) Output projection
