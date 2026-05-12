@@ -127,9 +127,13 @@ __global__ void rmsnorm_backward_dinp_kernel(
     // dot(dout * weight, x) for this row
     float thread_dot = 0.0f;
     for (int i = threadIdx.x; i < C; i += blockDim.x) {
-        float dyi = (float)__ldcs(&dy[i]);
         float wi  = (float)__ldcs(&weight[i]);
         float xi  = (float)__ldcs(&x[i]);
+        float dyi = (float)__ldcs(&dy[i]);
+#if defined(ENABLE_Q115)
+        float oi = xi * r * wi;
+        if (oi != simulate_q115(oi)) dyi = 0.0f;
+#endif
         thread_dot += dyi * wi * xi;
     }
     float block_dot = blockReduce<warpReduceSum>(thread_dot);
@@ -140,9 +144,13 @@ __global__ void rmsnorm_backward_dinp_kernel(
     float dot_val = s_dot;
 
     for (int i = threadIdx.x; i < C; i += blockDim.x) {
-        float dyi = (float)__ldcs(&dy[i]);
         float wi  = (float)__ldcs(&weight[i]);
         float xi  = (float)__ldcs(&x[i]);
+        float dyi = (float)__ldcs(&dy[i]);
+#if defined(ENABLE_Q115)
+        float oi = xi * r * wi;
+        if (oi != simulate_q115(oi)) dyi = 0.0f;
+#endif
         float dxi = r * wi * dyi - r * r * r * xi * dot_val / (float)C;
         float prev_dxi = (float)__ldcs(&dx[i]);
         float summed = quantize_rmsnorm_backward(prev_dxi + dxi);
@@ -154,6 +162,7 @@ __global__ void rmsnorm_backward_dweight_kernel(
     floatX *__restrict__ dweight,      // (C,) +=
     const floatX *__restrict__ dout,   // (B*T, C)
     const floatX *__restrict__ inp,    // (B*T, C)
+    const floatX *__restrict__ weight, // (C,)
     const float  *__restrict__ rstd,   // (B*T,)
     int BT, int C)
 {
@@ -161,10 +170,16 @@ __global__ void rmsnorm_backward_dweight_kernel(
     int stride = blockDim.x * gridDim.x;
     for (; i < C; i += stride) {
         float acc = 0.0f;
+        float wi = (float)__ldcs(&weight[i]);
         for (int bt = 0; bt < BT; bt++) {
             float xi = (float)__ldcs(&inp[(size_t)bt * C + i]);
             float dyi = (float)__ldcs(&dout[(size_t)bt * C + i]);
-            acc += rstd[bt] * xi * dyi;
+            float r = rstd[bt];
+#if defined(ENABLE_Q115)
+            float oi = xi * r * wi;
+            if (oi != simulate_q115(oi)) dyi = 0.0f;
+#endif
+            acc += r * xi * dyi;
         }
         float prev = (float)__ldcs(&dweight[i]);
         float summed = quantize_rmsnorm_backward(prev + acc);
@@ -195,7 +210,7 @@ void rmsnorm_backward(floatX *dinp, floatX *dweight, float *scratch,
     if (dw_grid > 65535u) dw_grid = 65535u;
     if (dw_grid == 0u) dw_grid = 1u;
     rmsnorm_backward_dweight_kernel<<<dw_grid, dw_block, 0, stream>>>(
-        dweight, dout, inp, rstd, BT, C);
+        dweight, dout, inp, weight, rstd, BT, C);
     cudaCheck(cudaGetLastError());
 }
 

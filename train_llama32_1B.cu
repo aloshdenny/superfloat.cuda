@@ -475,12 +475,55 @@ __global__ void rope_forward_kernel(
     }
 }
 
+__global__ void rope_backward_kernel(
+    floatX *__restrict__ dqkv,
+    const float2 *__restrict__ freqs, // (T, HD/2)
+    int B, int T, int NH, int NKV, int HD)
+{
+    int bt = blockIdx.x;
+    if (bt >= B * T) return;
+    int t = bt % T;
+    int total_qkv = (NH + 2 * NKV) * HD;
+    floatX *row = dqkv + (size_t)bt * total_qkv;
+    const float2 *f = freqs + (size_t)t * (HD / 2);
+
+    for (int h = threadIdx.x; h < NH * (HD / 2); h += blockDim.x) {
+        int head = h / (HD / 2), i = h % (HD / 2);
+        int base = head * HD + i * 2;
+        float dy0 = (float)row[base], dy1 = (float)row[base+1];
+        float cv = f[i].x, sv = f[i].y;
+        float dx0 = dy0 * cv + dy1 * sv;
+        float dx1 = -dy0 * sv + dy1 * cv;
+        row[base]   = (floatX)dx0;
+        row[base+1] = (floatX)dx1;
+    }
+    for (int h = threadIdx.x; h < NKV * (HD / 2); h += blockDim.x) {
+        int head = h / (HD / 2), i = h % (HD / 2);
+        int base = NH * HD + head * HD + i * 2;
+        float dy0 = (float)row[base], dy1 = (float)row[base+1];
+        float cv = f[i].x, sv = f[i].y;
+        float dx0 = dy0 * cv + dy1 * sv;
+        float dx1 = -dy0 * sv + dy1 * cv;
+        row[base]   = (floatX)dx0;
+        row[base+1] = (floatX)dx1;
+    }
+}
+
 static void rope_forward(floatX *qkv, const float2 *freqs,
                          int B, int T, int NH, int NKV, int HD,
                          cudaStream_t stream) {
     int threads = min(256, max(NH, NKV) * (HD / 2));
     threads = CEIL_DIV(threads, 32) * 32;
     rope_forward_kernel<<<B * T, threads, 0, stream>>>(qkv, freqs, B, T, NH, NKV, HD);
+    cudaCheck(cudaGetLastError());
+}
+
+static void rope_backward(floatX *dqkv, const float2 *freqs,
+                         int B, int T, int NH, int NKV, int HD,
+                         cudaStream_t stream) {
+    int threads = min(256, max(NH, NKV) * (HD / 2));
+    threads = CEIL_DIV(threads, 32) * 32;
+    rope_backward_kernel<<<B * T, threads, 0, stream>>>(dqkv, freqs, B, T, NH, NKV, HD);
     cudaCheck(cudaGetLastError());
 }
 
@@ -1180,8 +1223,11 @@ void llama32_backward_and_reduce(LLaMA32 *model, int *inputs, const int *targets
                            dl_btc, l_qkvr, l_att, B, T, C, NH, main_stream);
         reduce_kv_grad(dqkvr_tmp, dl_bt_ffn, B*T, NH, NKV, n_rep, HD, main_stream);
 
+        // un-rotate the reduced compact QKV grads
+        rope_backward(dl_bt_ffn, model->d_freqs_cis, B, T, NH, NKV, HD, main_stream);
+
         // --- Backward QKV proj ---
-        matmul_backward_naive(dl_btc, dl_qkvw, dqkvr_tmp,
+        matmul_backward_naive(dl_btc, dl_qkvw, dl_bt_ffn,
                       l_rms1, l_qkvw, B, T, C, (int)(NH+2*NKV)*HD,
                       false, main_stream);
 
