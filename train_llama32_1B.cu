@@ -1183,10 +1183,12 @@ void llama32_backward_and_reduce(LLaMA32 *model, int *inputs, const int *targets
         floatX *l_up_a  = (model->recompute < 1) ? acts.up_act    + (size_t)l*B*T*FFN : acts.up_act;
         floatX *l_swiglu= (model->recompute < 1) ? acts.swiglu_out+ (size_t)l*B*T*FFN : acts.swiglu_out;
         floatX *l_gate_in = l_gate_a; // pre-SwiGLU gate projection output
-        floatX *l_up_in   = l_swiglu; // pre-SwiGLU up projection output
+        floatX *l_up_in   = l_swiglu;   // swiglu_forward puts the output in l_up_a
 
         // Reserve disjoint regions inside acts.output for FFN and attention scratch.
         floatX *dl_bt_ffn = scratchX + att_scratch_elems;
+        // avoid aliasing d_gate_in/d_up_in with d_out in swiglu_backward
+        floatX *dl_dgate_in = scratchX + att_scratch_elems + mlp_scratch_elems + 3 * B * T * C;
         floatX *dqkvr_tmp = dl_bt_ffn + mlp_scratch_elems;
 
         if (model->recompute >= 1) {
@@ -1200,14 +1202,14 @@ void llama32_backward_and_reduce(LLaMA32 *model, int *inputs, const int *targets
         matmul_backward_naive(dl_bt_ffn, dl_down_w, dresidual,
                       l_up_a, l_down_w, B, T, FFN, C, false, main_stream);
         // d(swiglu pointwise): d_gate_in, d_up_in from d_swiglu
-        swiglu_backward(dl_bt_ffn, dl_bt_ffn + B*T*FFN,   // reuse; treat as d_gate_in,d_up_in
+        swiglu_backward(dl_dgate_in, dl_dgate_in + B*T*FFN,   
                 dl_bt_ffn, l_gate_in, l_up_in,
                         B*T*FFN, main_stream);
         // d(gate proj): dl_rms2 += dl_gate_in @ gate_w
-        matmul_backward_naive(dl_btc, dl_gate_w, dl_bt_ffn,
+        matmul_backward_naive(dl_btc, dl_gate_w, dl_dgate_in,
                       l_rms2, l_gate_w, B, T, C, FFN, false, main_stream);
         // d(up proj): dl_rms2 += dl_up_in @ up_w (accumulates)
-        matmul_backward_naive(dl_btc, dl_up_w, dl_bt_ffn + B*T*FFN,
+        matmul_backward_naive(dl_btc, dl_up_w, dl_dgate_in + B*T*FFN,
                       l_rms2, l_up_w, B, T, C, FFN, true, main_stream);
         // d(pre-FFN RMSNorm)
         rmsnorm_backward(dresidual, dl_rms2w, scratchF,
@@ -1696,10 +1698,16 @@ int main(int argc, char *argv[]) {
         // Save checkpoint every 500 steps
         if (master_process && output_dir && strlen(output_dir) > 0
             && step > 0 && step % 500 == 0) {
-            snprintf(filename_buffer, sizeof(filename_buffer),
+            char cp_filename_buffer[512];
+            snprintf(cp_filename_buffer, sizeof(cp_filename_buffer),
                      "%s/llama32_%s_step%05d.bin", output_dir,
                      PRECISION_MODE == PRECISION_BF16 ? "bf16" : "q115", step);
-            llama32_write_checkpoint(&model, filename_buffer);
+            llama32_write_checkpoint(&model, cp_filename_buffer);
+            
+            char state_filename[512];
+            snprintf(state_filename, sizeof(state_filename), 
+                     "%s/state_%08d_%05d.bin", output_dir, step, multi_gpu_config.process_rank);
+            // Optionally save dataloader state here
         }
     }
 
