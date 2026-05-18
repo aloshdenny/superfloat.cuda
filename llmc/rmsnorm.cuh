@@ -130,10 +130,6 @@ __global__ void rmsnorm_backward_dinp_kernel(
         float wi  = (float)__ldcs(&weight[i]);
         float xi  = (float)__ldcs(&x[i]);
         float dyi = (float)__ldcs(&dy[i]);
-#if defined(ENABLE_Q115)
-        float oi = xi * r * wi;
-        if (oi != simulate_q115(oi)) dyi = 0.0f;
-#endif
         thread_dot += dyi * wi * xi;
     }
     float block_dot = blockReduce<warpReduceSum>(thread_dot);
@@ -147,10 +143,6 @@ __global__ void rmsnorm_backward_dinp_kernel(
         float wi  = (float)__ldcs(&weight[i]);
         float xi  = (float)__ldcs(&x[i]);
         float dyi = (float)__ldcs(&dy[i]);
-#if defined(ENABLE_Q115)
-        float oi = xi * r * wi;
-        if (oi != simulate_q115(oi)) dyi = 0.0f;
-#endif
         float dxi = r * wi * dyi - r * r * r * xi * dot_val / (float)C;
         float prev_dxi = (float)__ldcs(&dx[i]);
         float summed = quantize_rmsnorm_backward(prev_dxi + dxi);
@@ -175,10 +167,6 @@ __global__ void rmsnorm_backward_dweight_kernel(
             float xi = (float)__ldcs(&inp[(size_t)bt * C + i]);
             float dyi = (float)__ldcs(&dout[(size_t)bt * C + i]);
             float r = rstd[bt];
-#if defined(ENABLE_Q115)
-            float oi = xi * r * wi;
-            if (oi != simulate_q115(oi)) dyi = 0.0f;
-#endif
             acc += r * xi * dyi;
         }
         float prev = (float)__ldcs(&dweight[i]);

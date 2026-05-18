@@ -60,10 +60,8 @@ __global__ void gelu_backward_inplace_kernel(floatX *d_in_out,
 #if defined(ENABLE_Q131)
     float x = q131_to_float(packed_inp[k]);
     float dout = q131_to_float(packed_dout[k]);
-#elif defined(ENABLE_Q115)
-    float x = simulate_q115((float)packed_inp[k]);
-    float dout = (float)packed_dout[k];
 #else
+    // Backward always runs in native BF16/FP32 -- no Q115 simulation.
     float x = (float)packed_inp[k];
     float dout = (float)packed_dout[k];
 #endif
@@ -78,8 +76,6 @@ __global__ void gelu_backward_inplace_kernel(floatX *d_in_out,
     float result = local_grad * dout;
 #if defined(ENABLE_Q131)
     packed_dinp[k] = float_to_q131(result);
-#elif defined(ENABLE_Q115)
-    packed_dinp[k] = (floatX)result;
 #else
     packed_dinp[k] = (floatX)result;
 #endif

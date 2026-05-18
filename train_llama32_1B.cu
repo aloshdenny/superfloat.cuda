@@ -679,19 +679,9 @@ __global__ void swiglu_backward_kernel(
         float sig    = 1.0f / (1.0f + expf(-gi));
         float si     = gi * sig;
         float dsilu  = si + sig * (1.0f - si);
-
-#if defined(ENABLE_Q115)
-        if (si >= 0.999969482421875f || si <= -1.0f) { dsilu = 0.0f; }
-        float d_ui = (ui >= 0.999969482421875f || ui <= -1.0f) ? 0.0f : 1.0f;
-        si = (float)simulate_q115((floatX)si);
-        ui = (float)simulate_q115((floatX)ui);
-        
-        __stcs(&d_gate_in[i], (floatX)(dout_i * ui * dsilu));
-        __stcs(&d_up_in[i],   (floatX)(dout_i * si * d_ui));
-#else
+        // Backward runs in native BF16 -- no Q115 forward quantization.
         __stcs(&d_gate_in[i], (floatX)(dout_i * ui * dsilu));
         __stcs(&d_up_in[i],   (floatX)(dout_i * si));
-#endif
     }
 }
 

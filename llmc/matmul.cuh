@@ -37,16 +37,9 @@ Matrix Multiplication, with help from cuBLASLt
 #endif
 
 __device__ __forceinline__ float quantize_sf_backward(float x) {
-#if defined(ENABLE_Q131)
-  return simulate_q131(x);
-#elif defined(ENABLE_Q115)
-#if defined(SF16_TRUE_FORWARD)
-  x = simulate_q131(x);
-#endif
-  return simulate_q115(x);
-#else
+  // Backward pass always runs in native BF16/FP32 precision.
+  // Forward activations are quantized to SF16 boundaries; gradients are not.
   return x;
-#endif
 }
 
 // ----------------------------------------------------------------------------
