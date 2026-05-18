@@ -1121,7 +1121,7 @@ void llama32_backward_and_reduce(LLaMA32 *model, int *inputs, const int *targets
     if (Vp > output_row) output_row = Vp;
     const size_t output_total_elems = bt * output_row;
     const size_t qkv_expanded_elems = bt * 3 * C;
-    const size_t ffn_grad_elems = 2 * bt * FFN;
+    const size_t ffn_grad_elems = 3 * bt * FFN;  // d_swiglu + d_gate_in + d_up_in
     const size_t mlp_scratch_elems = (ffn_grad_elems > qkv_expanded_elems) ? ffn_grad_elems : qkv_expanded_elems;
     assert(att_scratch_elems + mlp_scratch_elems + qkv_expanded_elems <= output_total_elems);
 
@@ -1176,10 +1176,17 @@ void llama32_backward_and_reduce(LLaMA32 *model, int *inputs, const int *targets
         floatX *l_up_in   = l_swiglu;   // swiglu_forward puts the output in l_up_a
 
         // Reserve disjoint regions inside acts.output for FFN and attention scratch.
-        floatX *dl_bt_ffn = scratchX + att_scratch_elems;
-        // avoid aliasing d_gate_in/d_up_in with d_out in swiglu_backward
-        floatX *dl_dgate_in = scratchX + att_scratch_elems + mlp_scratch_elems + 3 * B * T * C;
-        floatX *dqkvr_tmp = dl_bt_ffn + mlp_scratch_elems;
+        // acts.output layout (all within output_total_elems):
+        //   [0,              att_scratch_elems)                 <- attention scratch
+        //   [att_scratch_elems, att_scratch_elems+B*T*FFN)     <- dl_swiglu  (down matmul dinp)
+        //   [att_scratch_elems+B*T*FFN, att+2*B*T*FFN)         <- dl_gate_in
+        //   [att_scratch_elems+2*B*T*FFN, att+3*B*T*FFN)       <- dl_up_in
+        //   [att_scratch_elems+mlp_scratch_elems, ...+3C)      <- dqkvr_tmp (expanded QKV grads)
+        floatX *dl_bt_ffn   = scratchX + att_scratch_elems;              // d_swiglu
+        floatX *dl_dgate_in = dl_bt_ffn + (size_t)B*T*FFN;              // d_gate_in (within mlp_scratch_elems)
+        // dl_up_in immediately after dl_gate_in
+        // dl_dgate_in + B*T*FFN == dl_bt_ffn + 2*B*T*FFN  (within mlp_scratch_elems)
+        floatX *dqkvr_tmp   = scratchX + att_scratch_elems + mlp_scratch_elems;  // expanded QKV grads
 
         if (model->recompute >= 1) {
             matmul_forward_cublas(l_gate_a, l_rms2, l_gate_w, B, T, C, (int)FFN, main_stream);
@@ -1439,7 +1446,7 @@ int main(int argc, char *argv[]) {
     const char *input_val_bin= "dev/data/fineweb100B/fineweb_val_*.bin";
     const char *output_dir   = "";
     int batch_size           = 8;
-    int sequence_length      = 1024;
+    int sequence_length      = 128;
     int total_batch_size     = 0;        // 0 = auto (B*T*ddp_world)
     int num_iterations       = -1;       // -1 = auto
     int inference_only       = 0;

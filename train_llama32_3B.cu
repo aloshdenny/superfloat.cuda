@@ -1075,7 +1075,7 @@ void llama32_backward_and_reduce(LLaMA32 *model, int *inputs, const int *targets
     if (Vp > output_row) output_row = Vp;
     const size_t output_total_elems = bt * output_row;
     const size_t qkv_expanded_elems = bt * 3 * C;
-    const size_t ffn_grad_elems = 2 * bt * FFN;
+    const size_t ffn_grad_elems = 3 * bt * FFN;  // d_swiglu + d_gate_in + d_up_in
     const size_t mlp_scratch_elems = (ffn_grad_elems > qkv_expanded_elems) ? ffn_grad_elems : qkv_expanded_elems;
     assert(att_scratch_elems + mlp_scratch_elems + qkv_expanded_elems <= output_total_elems);
 
@@ -1130,8 +1130,15 @@ void llama32_backward_and_reduce(LLaMA32 *model, int *inputs, const int *targets
         floatX *l_up_in   = l_swiglu; // pre-SwiGLU up projection output
 
         // Reserve disjoint regions inside acts.output for FFN and attention scratch.
-        floatX *dl_bt_ffn = scratchX + att_scratch_elems;
-        floatX *dqkvr_tmp = dl_bt_ffn + mlp_scratch_elems;
+        // Layout within output_total_elems:
+        //   [0,              att_scratch_elems)               <- attention scratch
+        //   [att+0,          att+B*T*FFN)                     <- dl_swiglu (down matmul dinp)
+        //   [att+B*T*FFN,    att+2*B*T*FFN)                   <- dl_gate_in
+        //   [att+2*B*T*FFN,  att+3*B*T*FFN)                   <- dl_up_in
+        //   [att+mlp,        att+mlp+qkv_expanded_elems)      <- dqkvr_tmp
+        floatX *dl_bt_ffn   = scratchX + att_scratch_elems;          // d_swiglu
+        floatX *dl_dgate_in = dl_bt_ffn + (size_t)B*T*FFN;           // d_gate_in
+        floatX *dqkvr_tmp   = scratchX + att_scratch_elems + mlp_scratch_elems;
 
         if (model->recompute >= 1) {
             matmul_forward_cublas(l_gate_a, l_rms2, l_gate_w, B, T, C, (int)FFN, main_stream);
@@ -1140,18 +1147,18 @@ void llama32_backward_and_reduce(LLaMA32 *model, int *inputs, const int *targets
         }
 
         // --- Backward MLP ---
-        // d(down): dresidual += down_w^T @ d_swiglu
+        // d(down): dl_bt_ffn = d_swiglu = down_w^T @ dresidual
         matmul_backward_naive(dl_bt_ffn, dl_down_w, dresidual,
                       l_up_a, l_down_w, B, T, FFN, C, false, main_stream);
         // d(swiglu pointwise): d_gate_in, d_up_in from d_swiglu
-        swiglu_backward(dl_bt_ffn, dl_bt_ffn + B*T*FFN,   // reuse; treat as d_gate_in,d_up_in
+        swiglu_backward(dl_dgate_in, dl_dgate_in + B*T*FFN,
                 dl_bt_ffn, l_gate_in, l_up_in,
                         B*T*FFN, main_stream);
         // d(gate proj): dl_rms2 += dl_gate_in @ gate_w
-        matmul_backward_naive(dl_btc, dl_gate_w, dl_bt_ffn,
+        matmul_backward_naive(dl_btc, dl_gate_w, dl_dgate_in,
                       l_rms2, l_gate_w, B, T, C, FFN, false, main_stream);
         // d(up proj): dl_rms2 += dl_up_in @ up_w (accumulates)
-        matmul_backward_naive(dl_btc, dl_up_w, dl_bt_ffn + B*T*FFN,
+        matmul_backward_naive(dl_btc, dl_up_w, dl_dgate_in + B*T*FFN,
                       l_rms2, l_up_w, B, T, C, FFN, true, main_stream);
         // d(pre-FFN RMSNorm)
         rmsnorm_backward(dresidual, dl_rms2w, scratchF,
