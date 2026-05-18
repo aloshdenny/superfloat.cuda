@@ -23,7 +23,7 @@ __device__ __forceinline__ float quantize_attention_score(float x) {
 #if defined(ENABLE_Q131)
   return simulate_q131(x * 8.0f);
 #elif defined(ENABLE_Q115)
-  return simulate_q115(x);
+  return simulate_q115_scaled(x, Q115_ATTENTION_SCALE);
 #else
   return x;
 #endif
@@ -36,7 +36,7 @@ __device__ __forceinline__ float quantize_attention_output(float x) {
 #if defined(SF16_TRUE_FORWARD)
   x = simulate_q131(x);
 #endif
-  return simulate_q115(x);
+  return simulate_q115_scaled(x, Q115_ATTENTION_SCALE);
 #else
   return x;
 #endif

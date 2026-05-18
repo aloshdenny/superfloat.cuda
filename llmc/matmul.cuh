@@ -145,14 +145,14 @@ __global__ void reduce_add_sum_kernel(floatX *dst, const float *src, size_t n,
 // and then quantize to SF16 storage boundaries.
 constexpr float SF16_MIN = -1.0f;
 constexpr float SF16_MAX = 0.999969482421875f;
-__global__ void q115_simulate_kernel(floatX *d, size_t N) {
+__global__ void q115_simulate_kernel(floatX *d, size_t N, float scale) {
   size_t idx = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
   if (idx < N) {
     float v = (float)d[idx];
 #if defined(SF16_TRUE_FORWARD)
     v = simulate_q131(v);
 #endif
-    d[idx] = (floatX)simulate_q115(v);
+    d[idx] = (floatX)simulate_q115_scaled(v, scale);
   }
 }
 
@@ -177,7 +177,7 @@ void matmul_cublaslt(floatX *d, const floatX *a, const floatX *b,
                      bool transB = false, int batch_count = 0,
                      size_t strideA = 0, size_t strideB = 0,
                      size_t strideOut = 0, bool accumulate = false,
-                     floatX *pre_gelu = NULL, bool backward = false) {
+                     floatX *pre_gelu = NULL, bool backward = false, float q115_scale = 1.0f) {
   NVTX_RANGE_FN();
   bool has_bias = (bias != NULL);
   bool has_gelu = (pre_gelu != NULL);
@@ -340,7 +340,7 @@ void matmul_cublaslt(floatX *d, const floatX *a, const floatX *b,
   // before the SF16 write-back quantization.
   if (!backward && size_C > 0) {
     int num_blocks = (size_C + 255) / 256;
-    q115_simulate_kernel<<<num_blocks, 256, 0, stream>>>(d, size_C);
+    q115_simulate_kernel<<<num_blocks, 256, 0, stream>>>(d, size_C, q115_scale);
 #if defined(SF16_CLAMP_DEBUG)
     unsigned int *d_violations = nullptr;
     unsigned int h_violations = 0;
@@ -373,7 +373,7 @@ void matmul_cublaslt(floatX *d, const floatX *a, const floatX *b,
 void matmul_forward_cublaslt(floatX *out, floatX *inp, floatX *weight,
                              floatX *bias, int B, int T, int C, int OC,
                              cudaStream_t stream, floatX *pre_gelu = NULL,
-                             int gelu_fusion = 1) {
+                             int gelu_fusion = 1, float q115_scale = 1.0f) {
   // By default only fuse GELU for H100+ as cuBLAS seems to be inefficient for
   // fused GELU on Ada/Ampere (?)
   if (gelu_fusion < 1 && pre_gelu) {
@@ -382,7 +382,7 @@ void matmul_forward_cublaslt(floatX *out, floatX *inp, floatX *weight,
     gelu_forward(out, pre_gelu, B * T * OC, stream);
   } else {
     matmul_cublaslt(out, weight, inp, bias, OC, B * T, C, stream, true, false,
-                    0, 0, 0, 0, false, pre_gelu, false);
+                    0, 0, 0, 0, false, pre_gelu, false, q115_scale);
   }
 }
 
@@ -413,11 +413,11 @@ __global__ void matmul_naive_kernel(
 }
 
 void matmul_forward_cublas(floatX *out, const floatX *inp, const floatX *weight,
-                           int B, int T, int C, int OC, cudaStream_t stream) {
+                           int B, int T, int C, int OC, cudaStream_t stream, float q115_scale = 1.0f) {
   NVTX_RANGE_FN();
   // Historical API name, now routed to cuBLASLt for throughput.
   matmul_forward_cublaslt(out, (floatX *)inp, (floatX *)weight, nullptr,
-                          B, T, C, OC, stream, NULL, 1);
+                          B, T, C, OC, stream, NULL, 1, q115_scale);
 }
 
 // ---------------------------------------------------------------------------

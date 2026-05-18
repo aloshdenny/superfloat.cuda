@@ -146,6 +146,11 @@ __device__ __forceinline__ float q115_to_float(q115_t x) {
   return __int2float_rn(x) / Q115_SCALE;
 }
 
+// Simulaton of scaled Q1.15 in FP32
+__device__ __forceinline__ float simulate_q115_scaled(float x, float scale) {
+  return q115_to_float_scaled(float_to_q115_scaled(x, scale), scale);
+}
+
 // ----------------------------------------------------------------------------
 // Q1.15 Arithmetic Operations
 

@@ -427,12 +427,12 @@ static float2 *precompute_freqs_cis(int max_seq_len, int head_dim, float rope_th
 
 // GPU: apply RoPE in-place to the Q and K parts of packed QKV buffer.
 // qkv layout per (b,t): [Q: NH*HD | K: NKV*HD | V: NKV*HD]
-__device__ __forceinline__ float quantize_sf16_forward(float x) {
+__device__ __forceinline__ float quantize_sf16_forward(float x, float scale = 1.0f) {
 #if defined(ENABLE_Q115)
 #if defined(SF16_TRUE_FORWARD)
     x = simulate_q131(x);
 #endif
-    return simulate_q115(x);
+    return simulate_q115_scaled(x, scale);
 #else
     return x;
 #endif
@@ -603,10 +603,10 @@ __global__ void swiglu_forward_kernel(
         float u = (float)__ldcs(&up_in[i]);
         float sg = g / (1.0f + expf(-g));  // silu
 #if defined(ENABLE_Q115)
-        sg = (float)simulate_q115((floatX)sg);
-        u  = (float)simulate_q115((floatX)u);
+        sg = (float)simulate_q115_scaled(sg, Q115_FFN_SCALE);
+        u  = (float)simulate_q115_scaled(u, Q115_FFN_SCALE);
 #endif
-    float su = quantize_sf16_forward(sg * u);
+    float su = quantize_sf16_forward(sg * u, Q115_FFN_SCALE);
     __stcs(&swiglu_out[i],  (floatX)su);
     }
 }
@@ -937,7 +937,7 @@ void llama32_forward(LLaMA32 *model, const int *inputs, size_t B, size_t T) {
                         B, T, C, model->config.norm_eps, main_stream);
 
         // 1) QKV projection
-        matmul_forward_cublas(l_qkvr, l_rms1, l_qkvw, B, T, C, (int)((NH+2*NKV)*HD), main_stream);
+        matmul_forward_cublas(l_qkvr, l_rms1, l_qkvw, B, T, C, (int)((NH+2*NKV)*HD), main_stream, Q115_ATTENTION_SCALE);
 
         // --- RoPE ---
         rope_forward(l_qkvr, model->d_freqs_cis,
@@ -954,7 +954,7 @@ void llama32_forward(LLaMA32 *model, const int *inputs, size_t B, size_t T) {
         attention_forward(l_atty, l_qkvr, l_att, scratch, B, T, C, NH, main_stream);
 
         // 3) Output projection
-        matmul_forward_cublas(scratch, l_atty, l_attn_ow, B, T, C, C, main_stream);
+        matmul_forward_cublas(scratch, l_atty, l_attn_ow, B, T, C, C, main_stream, Q115_ATTENTION_SCALE);
 
         // residual2 = residual + attn_out; pre-FFN RMSNorm -> l_rms2
         fused_residual_forward5(l_res2, l_rms2, l_rms2_r, /*mean=*/nullptr,
@@ -962,13 +962,13 @@ void llama32_forward(LLaMA32 *model, const int *inputs, size_t B, size_t T) {
                                 B*T, C, main_stream);
 
         // 4) FFN
-        matmul_forward_cublas(l_gate_a, l_rms2, l_gate_w, B, T, C, (int)FFN, main_stream);
-        matmul_forward_cublas(l_swiglu, l_rms2, l_up_w,  B, T, C, (int)FFN, main_stream);
+        matmul_forward_cublas(l_gate_a, l_rms2, l_gate_w, B, T, C, (int)FFN, main_stream, Q115_FFN_SCALE);
+        matmul_forward_cublas(l_swiglu, l_rms2, l_up_w,  B, T, C, (int)FFN, main_stream, Q115_FFN_SCALE);
         // pointwise: gate_a = silu(gate_a), swiglu = gate_a * up
         swiglu_forward(l_up_a, l_gate_a, l_swiglu, B*T*FFN, main_stream);
 
         // Down projection
-        matmul_forward_cublas(scratch, l_up_a, l_down_w, B, T, (int)FFN, C, main_stream);
+        matmul_forward_cublas(scratch, l_up_a, l_down_w, B, T, (int)FFN, C, main_stream, 1.0f);
 
         // residual3 = residual2 + mlp_out; pre-next-layer RMSNorm fused in
         if (l + 1 != (int)L) {
@@ -987,7 +987,7 @@ void llama32_forward(LLaMA32 *model, const int *inputs, size_t B, size_t T) {
     } // end layer loop
 
     // Final matmul to logits (Vp output dimension)
-    matmul_forward_cublas(acts.output, acts.rms_f, params.wte, B, T, C, Vp, main_stream);
+    matmul_forward_cublas(acts.output, acts.rms_f, params.wte, B, T, C, Vp, main_stream, Q115_LOGITS_SCALE);
 }
 
 // Validation (forward + loss, no backward)
