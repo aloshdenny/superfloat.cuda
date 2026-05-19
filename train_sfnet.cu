@@ -147,27 +147,101 @@ constexpr const size_t IO_BUF_SIZE = 32 * 1024 * 1024;
 static unsigned int g_last_sanitized_grad_count = 0;
 
 // ============================================================================
-// Local matmul wrappers — thin shims over matmul_forward_cublaslt /
-// matmul_cublaslt (the shared, GPT-2-compatible cuBLASLt path).
+// Local matmul wrappers for SFNet.
 // ----------------------------------------------------------------------------
-// SFNet's hyperparameters are constrained so that every OC is one of
-// {C, 3*C, ffn_dim, Vp} — canonical dimensions cuBLASLt always has kernels for.
-// NKV is set equal to NH (full MHA), giving qkv_w = (NH + 2*NH)*HD = 3*C.
+// cuBLASLt's heuristic only returns algorithms for the specific (m, n, k)
+// triples pre-registered in its kernel library.  With B=4, T=1024 the token
+// batch is n=4096, and OC=3*C=2304 (qkv_w / ffn_dim) fails the lookup even
+// though the identical m=2304,n=8192 (GPT-2's B=8) succeeds.
 //
-// The LM-head matmul is issued with backward=true so that matmul_cublaslt
-// skips the Q1.15 forward-clamp kernel — clamping logits to ±1 would make
-// softmax uniform and lock the loss at ln(V).
+// Strategy:
+//  • OC == C (768): standard token-dim width → cuBLASLt always works.
+//  • OC  > C (2304 / ffn_dim): falls back to cublasSgemm with explicit
+//    BF16→FP32→BF16 casts; cublasSgemm is universally supported for any dims.
+//  • Backward: all backward slices have m=C, so cuBLASLt works for all of them.
+//  • LM-head: large Vp dim is canonical; stays on cuBLASLt (backward=true to
+//    skip the Q1.15 clamp on logits).
 // ============================================================================
-static inline void sfnet_matmul_forward(floatX *out,
-                                        const floatX *inp, const floatX *weight,
-                                        int B, int T, int C, int OC,
-                                        cudaStream_t stream) {
-    matmul_forward_cublaslt(out, (floatX *)inp, (floatX *)weight,
-                            /*bias=*/nullptr, B, T, C, OC, stream);
+
+// cublasSgemm handle — FP32 fallback for wide forward matmuls.
+// Allocated eagerly in main() alongside cublaslt_handle.
+static cublasHandle_t sfnet_sgemm_handle  = nullptr;
+// Pre-allocated FP32 scratch: [fp32_weight | fp32_inp | fp32_out] all in one block.
+// Sized for the worst-case wide matmul (OC=3*C, B*T=B*T) in main().
+static float         *sfnet_fp32_scratch  = nullptr;
+static size_t         sfnet_fp32_scratch_floats = 0;
+
+// BF16 ↔ FP32 element-wise casts (SFNet-local; avoids touching shared headers).
+__global__ void sfnet_bf16_to_fp32(float *dst, const floatX *src, size_t n) {
+    size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    if (i < n) dst[i] = (float)src[i];
 }
 
-// LM-head variant: backward=true disables q115_simulate_kernel so logits are
-// unconstrained and softmax can discriminate between classes.
+// Cast FP32 → BF16 with optional Q1.15 clamping (for forward activations).
+__global__ void sfnet_fp32_to_bf16(floatX *dst, const float *src, size_t n) {
+    size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    if (i < n) {
+        float v = src[i];
+#if defined(ENABLE_Q115)
+        v = simulate_q115(v);
+#endif
+        dst[i] = (floatX)v;
+    }
+}
+
+// Wide forward matmul via FP32 sgemm: out[B*T, OC] = inp[B*T, C] @ W[OC,C]^T
+// Used when cuBLASLt has no kernel for (m=OC, n=B*T, k=C).
+static void sfnet_sgemm_forward(floatX *out,
+                                const floatX *inp, const floatX *weight,
+                                int B, int T, int C, int OC,
+                                cudaStream_t stream) {
+    size_t nW = (size_t)OC * C;
+    size_t nI = (size_t)B * T * C;
+    size_t nO = (size_t)B * T * OC;
+    assert(sfnet_fp32_scratch != nullptr);
+    assert(nW + nI + nO <= sfnet_fp32_scratch_floats);
+
+    float *fw = sfnet_fp32_scratch;
+    float *fi = fw + nW;
+    float *fo = fi + nI;
+
+    int bW = (int)((nW + 255) / 256);
+    int bI = (int)((nI + 255) / 256);
+    int bO = (int)((nO + 255) / 256);
+    sfnet_bf16_to_fp32<<<bW, 256, 0, stream>>>(fw, weight, nW);
+    sfnet_bf16_to_fp32<<<bI, 256, 0, stream>>>(fi, inp,    nI);
+
+    const float alpha = 1.0f, beta = 0.0f;
+    cublasCheck(cublasSetStream(sfnet_sgemm_handle, stream));
+    // Column-major: out_CM[OC, B*T] = W_CM[C,OC]^T @ inp_CM[C, B*T]
+    cublasCheck(cublasSgemm(sfnet_sgemm_handle,
+                            CUBLAS_OP_T, CUBLAS_OP_N,
+                            OC, B * T, C,
+                            &alpha, fw, C, fi, C,
+                            &beta,  fo, OC));
+
+    sfnet_fp32_to_bf16<<<bO, 256, 0, stream>>>(out, fo, nO);
+    cudaCheck(cudaGetLastError());
+}
+
+// sfnet_matmul_forward: routes based on OC.
+//  OC == C  → cuBLASLt (known-good width, matches GPT-2 dims)
+//  OC  > C  → FP32 sgemm fallback (OC = 3*C or ffn_dim, cuBLASLt fails for B=4)
+static void sfnet_matmul_forward(floatX *out,
+                                 const floatX *inp, const floatX *weight,
+                                 int B, int T, int C, int OC,
+                                 cudaStream_t stream) {
+    if (OC <= C) {
+        matmul_forward_cublaslt(out, (floatX *)inp, (floatX *)weight,
+                                /*bias=*/nullptr, B, T, C, OC, stream);
+    } else {
+        sfnet_sgemm_forward(out, inp, weight, B, T, C, OC, stream);
+    }
+}
+
+// LM-head variant: backward=true in matmul_cublaslt disables q115_simulate_kernel
+// so logits are unconstrained and softmax can discriminate between classes.
+// Vp=50304 is a canonical dim that cuBLASLt always handles.
 static inline void sfnet_logits_forward(floatX *out,
                                         const floatX *inp, const floatX *weight,
                                         int B, int T, int C, int OC,
@@ -179,6 +253,8 @@ static inline void sfnet_logits_forward(floatX *out,
                     /*backward=*/true);
 }
 
+// Backward matmul: all slices have m=C=768 which cuBLASLt always supports.
+// backward=true skips q115_simulate_kernel (gradients stay in BF16).
 static inline void sfnet_matmul_backward(floatX *dinp, floatX *dweight,
                                          floatX *dout,  floatX *inp, floatX *weight,
                                          int B, int T, int C, int OC,
@@ -1432,6 +1508,22 @@ int main(int argc, char *argv[]) {
 
     sfnet_allocate_state(&model, B, T);
 
+    // FP32 sgemm handle + scratch for wide forward matmuls (OC > C).
+    // cuBLASLt fails for (m=3*C, n=B*T=4096, k=C) with B=4; cublasSgemm is
+    // guaranteed to succeed for any dimensions.
+    cublasCheck(cublasCreate(&sfnet_sgemm_handle));
+    {
+        const SFNetConfig &cfg = model.config;
+        int C_model  = cfg.dim;
+        int qkv_w    = (cfg.n_heads + 2 * cfg.n_kv_heads) * cfg.head_dim;
+        int max_OC   = (cfg.ffn_dim > qkv_w) ? cfg.ffn_dim : qkv_w;
+        sfnet_fp32_scratch_floats = (size_t)max_OC * C_model   // fp32_weight
+                                  + (size_t)B * T  * C_model   // fp32_inp
+                                  + (size_t)B * T  * max_OC;   // fp32_out
+        cudaCheck(cudaMalloc(&sfnet_fp32_scratch,
+                             sfnet_fp32_scratch_floats * sizeof(float)));
+    }
+
     LearningRateScheduler lr_sched;
     lr_scheduler_init(&lr_sched, "cosine", learning_rate, warmup_iters,
                       num_iterations, lr_decay_frac);
@@ -1528,6 +1620,8 @@ int main(int argc, char *argv[]) {
     cudaCheck(cudaFree(model.acts_memory));
     cudaCheck(cudaFree(model.d_freqs_cis));
     cudaCheck(cudaFree(cublaslt_workspace));
+    if (sfnet_sgemm_handle) { cublasCheck(cublasDestroy(sfnet_sgemm_handle)); sfnet_sgemm_handle = nullptr; }
+    if (sfnet_fp32_scratch)  { cudaCheck(cudaFree(sfnet_fp32_scratch)); sfnet_fp32_scratch = nullptr; }
     cudaCheck(cudaStreamDestroy(main_stream));
     if (tokenizer.init_ok) tokenizer_free(&tokenizer);
     printf0("Training complete.\n");
