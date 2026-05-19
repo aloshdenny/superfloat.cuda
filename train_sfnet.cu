@@ -147,41 +147,131 @@ constexpr const size_t IO_BUF_SIZE = 32 * 1024 * 1024;
 static unsigned int g_last_sanitized_grad_count = 0;
 
 // ============================================================================
-// Local matmul wrappers — thin shims over matmul_forward_cublaslt / matmul_cublaslt
+// Local matmul wrappers — SFNet-only, fully standalone.
 // ----------------------------------------------------------------------------
-// cuBLASLt requires a power-of-2 (or otherwise "canonical") OC for its
-// heuristic to return algorithms.  We enforce this via sfnet_set_hyperparameters
-// which rounds qkv_w up to the next power of 2.  All other OC values used by
-// SFNet (C=768, FFN=2048, Vp=50304) are already cuBLASLt-friendly.
+// SFNet uses GQA which produces "in-between" OC widths (e.g. qkv_w=1536 for
+// c=768/NH=12/NKV=6) that cuBLASLt's heuristic does not have kernels for.
+// To avoid touching the shared matmul_cublaslt path (used by GPT-2/GPT-3),
+// SFNet uses cuBLAS v2 (cublasGemmEx) directly, which has a separate kernel
+// registry with broader BF16 coverage.
 //
-// The accumulate_dinp flag in sfnet_matmul_backward is needed because gate, up,
-// and QKV all accumulate their dinp contribution into the same dl_rms1 buffer.
+// We also apply the Q1.15 forward-clamp ourselves so we can skip it for the
+// LM-head matmul (clamping logits to ±1 would saturate softmax).
 // ============================================================================
-static inline void sfnet_matmul_forward(floatX *out,
-                                        const floatX *inp, const floatX *weight,
-                                        int B, int T, int C, int OC,
-                                        cudaStream_t stream,
-                                        bool is_logits = false) {
-    matmul_forward_cublaslt(out, (floatX *)inp, (floatX *)weight, /*bias=*/nullptr,
-                            B, T, C, OC, stream, /*pre_gelu=*/nullptr,
-                            /*gelu_fusion=*/1, is_logits);
+
+// Created lazily on first use; destroyed at program exit (or never — the OS
+// reclaims).  All callers route their stream through it before each call.
+static cublasHandle_t sfnet_cublas_handle = nullptr;
+
+static inline void sfnet_ensure_cublas() {
+    if (sfnet_cublas_handle == nullptr) {
+        // Flush any benign pending device error from earlier work so that
+        // cublasCreate sees a clean device state.
+        cudaDeviceSynchronize();
+        (void)cudaGetLastError();
+        cublasCheck(cublasCreate(&sfnet_cublas_handle));
+        cublasCheck(cublasSetMathMode(sfnet_cublas_handle, CUBLAS_DEFAULT_MATH));
+    }
 }
 
-static inline void sfnet_matmul_backward(floatX *dinp, floatX *dweight,
-                                         floatX *dout,  floatX *inp, floatX *weight,
-                                         int B, int T, int C, int OC,
-                                         bool accumulate_dinp, cudaStream_t stream) {
+#if defined(ENABLE_Q115)
+// Local copy of the Q1.15 forward-clamp kernel.  matmul.cuh already defines
+// one in the global namespace; ours has a different name to avoid collision
+// when this header is included into a build that uses both.
+__global__ void sfnet_q115_clamp(floatX *d, size_t N) {
+    size_t idx = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    if (idx < N) {
+        float v = (float)d[idx];
+#if defined(SF16_TRUE_FORWARD)
+        v = simulate_q131(v);
+#endif
+        d[idx] = (floatX)simulate_q115(v);
+    }
+}
+#endif
+
+// Forward matmul: out[B*T, OC] = inp[B*T, C] @ weight[OC, C]^T
+// is_logits=true skips the Q1.15 forward clamp (use for the LM head).
+static void sfnet_matmul_forward(floatX *out,
+                                 const floatX *inp, const floatX *weight,
+                                 int B, int T, int C, int OC,
+                                 cudaStream_t stream,
+                                 bool is_logits = false) {
+    sfnet_ensure_cublas();
+    cublasCheck(cublasSetStream(sfnet_cublas_handle, stream));
+
+    // Row-major out[B*T, OC] = inp[B*T, C] @ weight[OC, C]^T
+    // In column-major (cuBLAS native):
+    //   out_CM[OC, B*T]  =  weight_CM[C, OC]^T  @  inp_CM[C, B*T]
+    //   A=weight (ld=C, transA=T → effective shape OC×C)
+    //   B=inp    (ld=C, transB=N → shape C×B*T)
+    //   D=out    (ld=OC, shape OC×B*T)
+    const float alpha = 1.0f, beta = 0.0f;
+    cublasCheck(cublasGemmEx(
+        sfnet_cublas_handle,
+        CUBLAS_OP_T, CUBLAS_OP_N,
+        OC, B * T, C,
+        &alpha,
+        weight, CUDA_R_16BF, C,
+        inp,    CUDA_R_16BF, C,
+        &beta,
+        out,    CUDA_R_16BF, OC,
+        CUBLAS_COMPUTE_32F,
+        CUBLAS_GEMM_DEFAULT));
+
+#if defined(ENABLE_Q115)
+    if (!is_logits) {
+        size_t n_elem = (size_t)OC * B * T;
+        int blocks = (int)((n_elem + 255) / 256);
+        sfnet_q115_clamp<<<blocks, 256, 0, stream>>>(out, n_elem);
+        cudaCheck(cudaGetLastError());
+    }
+#endif
+}
+
+// Backward matmul:
+//   dinp[B*T, C]    = dout[B*T, OC] @ weight[OC, C]        (optionally += )
+//   dweight[OC, C] += dout[B*T, OC]^T @ inp[B*T, C]        (always +=)
+// Backward never applies Q1.15 simulation (BF16 gradients are correct policy).
+static void sfnet_matmul_backward(floatX *dinp, floatX *dweight,
+                                  floatX *dout, floatX *inp, floatX *weight,
+                                  int B, int T, int C, int OC,
+                                  bool accumulate_dinp, cudaStream_t stream) {
+    sfnet_ensure_cublas();
+    cublasCheck(cublasSetStream(sfnet_cublas_handle, stream));
+
+    const float alpha = 1.0f;
     if (dinp) {
-        matmul_cublaslt(dinp, weight, dout, /*bias=*/nullptr,
-                        C, B * T, OC, stream,
-                        /*transA=*/false, /*transB=*/false,
-                        0, 0, 0, 0, accumulate_dinp, nullptr, /*backward=*/true);
+        // Row-major dinp[B*T, C] = dout[B*T, OC] @ weight[OC, C]
+        // Column-major: dinp_CM[C, B*T] = weight_CM[C, OC] @ dout_CM[OC, B*T]
+        const float beta = accumulate_dinp ? 1.0f : 0.0f;
+        cublasCheck(cublasGemmEx(
+            sfnet_cublas_handle,
+            CUBLAS_OP_N, CUBLAS_OP_N,
+            C, B * T, OC,
+            &alpha,
+            weight, CUDA_R_16BF, C,
+            dout,   CUDA_R_16BF, OC,
+            &beta,
+            dinp,   CUDA_R_16BF, C,
+            CUBLAS_COMPUTE_32F,
+            CUBLAS_GEMM_DEFAULT));
     }
     if (dweight) {
-        matmul_cublaslt(dweight, inp, dout, /*bias=*/nullptr,
-                        C, OC, B * T, stream,
-                        /*transA=*/false, /*transB=*/true,
-                        0, 0, 0, 0, /*accumulate=*/true, nullptr, /*backward=*/true);
+        // Row-major dweight[OC, C] += dout[B*T, OC]^T @ inp[B*T, C]
+        // Column-major: dweight_CM[C, OC] += inp_CM[C, B*T] @ dout_CM[OC, B*T]^T
+        const float beta_w = 1.0f;  // always accumulate gradient
+        cublasCheck(cublasGemmEx(
+            sfnet_cublas_handle,
+            CUBLAS_OP_N, CUBLAS_OP_T,
+            C, OC, B * T,
+            &alpha,
+            inp,     CUDA_R_16BF, C,
+            dout,    CUDA_R_16BF, OC,
+            &beta_w,
+            dweight, CUDA_R_16BF, C,
+            CUBLAS_COMPUTE_32F,
+            CUBLAS_GEMM_DEFAULT));
     }
 }
 
@@ -1516,6 +1606,10 @@ int main(int argc, char *argv[]) {
     cudaCheck(cudaFree(model.acts_memory));
     cudaCheck(cudaFree(model.d_freqs_cis));
     cudaCheck(cudaFree(cublaslt_workspace));
+    if (sfnet_cublas_handle != nullptr) {
+        cublasCheck(cublasDestroy(sfnet_cublas_handle));
+        sfnet_cublas_handle = nullptr;
+    }
     cudaCheck(cudaStreamDestroy(main_stream));
     if (tokenizer.init_ok) tokenizer_free(&tokenizer);
     printf0("Training complete.\n");

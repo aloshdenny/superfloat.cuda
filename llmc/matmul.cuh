@@ -32,6 +32,8 @@ Matrix Multiplication, with help from cuBLASLt
 #if defined(SF16_TRUE_FORWARD)
 #include "q131_common.cuh"
 #endif
+#elif defined(ENABLE_Q131)
+#include "q131_common.cuh"
 #endif
 
 // ----------------------------------------------------------------------------
