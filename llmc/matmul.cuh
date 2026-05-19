@@ -250,6 +250,26 @@ void matmul_cublaslt(floatX *d, const floatX *a, const floatX *b,
   cublasCheck(cublasLtMatmulPreferenceSetAttribute(
       preference, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
       &cublaslt_workspace_size, sizeof(cublaslt_workspace_size)));
+  // Relax the default 256-byte alignment requirement on A/B/C/D.  cuBLASLt's
+  // heuristic rejects all algorithms whose tile stride doesn't satisfy that
+  // alignment for *every* leading dimension, which silently filters out the
+  // entire algo pool for non-canonical OC widths (1024/1280/1536).  Our
+  // floatX tensors are guaranteed 16-byte aligned only, so use that.
+  {
+    uint32_t min_align = 16;
+    cublasCheck(cublasLtMatmulPreferenceSetAttribute(
+        preference, CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_A_BYTES, &min_align,
+        sizeof(min_align)));
+    cublasCheck(cublasLtMatmulPreferenceSetAttribute(
+        preference, CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_B_BYTES, &min_align,
+        sizeof(min_align)));
+    cublasCheck(cublasLtMatmulPreferenceSetAttribute(
+        preference, CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_C_BYTES, &min_align,
+        sizeof(min_align)));
+    cublasCheck(cublasLtMatmulPreferenceSetAttribute(
+        preference, CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_D_BYTES, &min_align,
+        sizeof(min_align)));
+  }
 
   // setup epilogue and associated pointers for bias & gelu
   cublasLtEpilogue_t epilogue;
@@ -303,31 +323,45 @@ void matmul_cublaslt(floatX *d, const floatX *a, const floatX *b,
                                  BLayout, CLayout, DLayout, preference, 1,
                                  &heuristic, &returnedResults);
   // The heuristic is conservative: it returns 0 results for any dimension
-  // triple that doesn't match a known tile-optimized kernel.  Fall back to
-  // exhaustive enumeration so that any mathematically valid configuration
-  // can still run (possibly at reduced throughput).
+  // triple that doesn't match a known tile-optimized kernel (e.g. GQA's
+  // qkv_w=1280 or non-canonical OC widths).  Fall back to enumerating the
+  // full algorithm registry for the given (compute, scale, A, B, C, D) tuple
+  // and pick the first one that survives algo-check.
   if (returnedResults == 0) {
-    for (int algo_id = 0; algo_id < 128 && returnedResults == 0; ++algo_id) {
-      cublasLtMatmulAlgo_t cand;
-      cublasStatus_t init_st = cublasLtMatmulAlgoInit(
-          cublaslt_handle, cublas_compute, CUDA_R_32F,
-          CUBLAS_LOWP, CUBLAS_LOWP, CUBLAS_LOWP, CUBLAS_LOWP, algo_id, &cand);
-      if (init_st != CUBLAS_STATUS_SUCCESS) continue;
-      cublasLtMatmulHeuristicResult_t res = {};
-      cublasStatus_t check_st = cublasLtMatmulAlgoCheck(
-          cublaslt_handle, operationDesc, ALayout, BLayout, CLayout, DLayout,
-          &cand, &res);
-      if (check_st == CUBLAS_STATUS_SUCCESS &&
-          res.state == CUBLAS_STATUS_SUCCESS &&
-          res.workspaceSize <= cublaslt_workspace_size) {
-        heuristic = res;
-        returnedResults = 1;
+    const cudaDataType_t io_type = CUBLAS_LOWP;
+    const cudaDataType_t c_type =
+        (sizeof(floatX) == 1) ? CUDA_R_16BF : CUBLAS_LOWP;
+    int algo_ids[64] = {0};
+    int num_ids = 0;
+    cublasStatus_t ids_st = cublasLtMatmulAlgoGetIds(
+        cublaslt_handle, cublas_compute, CUDA_R_32F, io_type, io_type, c_type,
+        io_type, 64, algo_ids, &num_ids);
+    if (ids_st == CUBLAS_STATUS_SUCCESS) {
+      for (int i = 0; i < num_ids && returnedResults == 0; ++i) {
+        cublasLtMatmulAlgo_t cand;
+        if (cublasLtMatmulAlgoInit(cublaslt_handle, cublas_compute, CUDA_R_32F,
+                                   io_type, io_type, c_type, io_type,
+                                   algo_ids[i],
+                                   &cand) != CUBLAS_STATUS_SUCCESS) {
+          continue;
+        }
+        cublasLtMatmulHeuristicResult_t res = {};
+        cublasStatus_t check_st = cublasLtMatmulAlgoCheck(
+            cublaslt_handle, operationDesc, ALayout, BLayout, CLayout, DLayout,
+            &cand, &res);
+        if (check_st == CUBLAS_STATUS_SUCCESS &&
+            res.state == CUBLAS_STATUS_SUCCESS &&
+            res.workspaceSize <= cublaslt_workspace_size) {
+          heuristic = res;
+          returnedResults = 1;
+        }
       }
     }
   }
   if (returnedResults == 0) {
-    printf("No cuBLASLt algorithm: m: %d, n: %d, k: %d, bias: %d\n", n, m, k,
-           has_bias);
+    printf("No cuBLASLt algorithm: m: %d, n: %d, k: %d, bias: %d, "
+           "transA: %d, transB: %d\n",
+           m, n, k, has_bias, transA, transB);
     exit(EXIT_FAILURE);
   }
 

@@ -1372,19 +1372,12 @@ int main(int argc, char *argv[]) {
     cublasCheck(cublasLtCreate(&cublaslt_handle));
     cudaCheck(cudaMalloc(&cublaslt_workspace, cublaslt_workspace_size));
 
-    // cublas_common.h defaults cublas_compute = CUBLAS_COMPUTE_32F for non-SF16_TRUE_FORWARD
-    // paths.  CUBLAS_COMPUTE_32F with BF16 I/O only has guaranteed kernel coverage for the
-    // "canonical" GPT-2 dimensions (768/2304/3072).  GQA-specific widths like 1280 hit
-    // "No cuBLASLt algorithm".  CUBLAS_COMPUTE_32F_FAST_16BF enables BF16 tensor-core kernels
-    // which cover any BF16-aligned dimension.  The SF16 clamping is applied *after* each
-    // matmul, so the intra-matmul accumulation precision doesn't need to be strict FP32.
-    //
-    // Exception: FP32 precision mode uses TF32 tensor cores on sm80+ instead.
-    if (PRECISION_MODE == PRECISION_FP32 && deviceProp.major >= 8) {
-        cublas_compute = CUBLAS_COMPUTE_32F_FAST_TF32;
-    } else {
-        cublas_compute = CUBLAS_COMPUTE_32F_FAST_16BF;
-    }
+    // Match train_gpt2: CUBLAS_COMPUTE_32F gives the widest algorithm coverage
+    // for cuBLASLt's heuristic with BF16 I/O.  CUBLAS_COMPUTE_32F_FAST_16BF
+    // restricts the search to a specific BF16 tensor-core kernel family which
+    // has poor coverage for non-canonical OC widths (e.g. GQA's 1536, 1280).
+    bool enable_tf32 = (PRECISION_MODE == PRECISION_FP32) && deviceProp.major >= 8;
+    cublas_compute = enable_tf32 ? CUBLAS_COMPUTE_32F_FAST_TF32 : CUBLAS_COMPUTE_32F;
 
     int B = batch_size;
     int T = sequence_length;
