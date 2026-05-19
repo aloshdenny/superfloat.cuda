@@ -160,9 +160,11 @@ static unsigned int g_last_sanitized_grad_count = 0;
 static inline void sfnet_matmul_forward(floatX *out,
                                         const floatX *inp, const floatX *weight,
                                         int B, int T, int C, int OC,
-                                        cudaStream_t stream) {
+                                        cudaStream_t stream,
+                                        bool is_logits = false) {
     matmul_forward_cublaslt(out, (floatX *)inp, (floatX *)weight, /*bias=*/nullptr,
-                            B, T, C, OC, stream, /*pre_gelu=*/nullptr, /*gelu_fusion=*/1);
+                            B, T, C, OC, stream, /*pre_gelu=*/nullptr,
+                            /*gelu_fusion=*/1, is_logits);
 }
 
 static inline void sfnet_matmul_backward(floatX *dinp, floatX *dweight,
@@ -892,8 +894,10 @@ void sfnet_forward(SFNet *model, const int *inputs, size_t B, size_t T) {
     rmsnorm_forward(acts.rms_f, acts.rms_f_rstd, x_final, params.rms_fw,
                     B, T, C, eps, main_stream);
 
-    // 4. Tied LM head
-    sfnet_matmul_forward(acts.output, acts.rms_f, params.wte, B, T, C, Vp, main_stream);
+    // 4. Tied LM head — is_logits=true so Q1.15 forward-clamp is NOT applied
+    // to logits (clamping would saturate softmax and lock loss at ln(V)).
+    sfnet_matmul_forward(acts.output, acts.rms_f, params.wte,
+                         B, T, C, Vp, main_stream, /*is_logits=*/true);
 }
 
 // ============================================================================
