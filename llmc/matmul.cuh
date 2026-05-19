@@ -358,6 +358,35 @@ void matmul_cublaslt(floatX *d, const floatX *a, const floatX *b,
       }
     }
   }
+  // Last-resort fallback: cuBLASLt has no kernel for this dim triple.  Use
+  // cublasGemmEx (cuBLAS v2 API), which has a separate kernel registry and
+  // works for GQA-style "in-between" widths (e.g. OC=1536 with K=768) that
+  // cuBLASLt rejects.  Only supported when there is no bias/gelu epilogue
+  // and no batched stride (i.e. the simple matmul case SFNet uses).
+  bool used_v2_fallback = false;
+  if (returnedResults == 0 && !has_bias && !has_gelu && batch_count == 0) {
+    static cublasHandle_t cublas_v2_handle = nullptr;
+    if (cublas_v2_handle == nullptr) {
+      cublasCheck(cublasCreate(&cublas_v2_handle));
+      cublasCheck(cublasSetMathMode(cublas_v2_handle, CUBLAS_DEFAULT_MATH));
+    }
+    cublasCheck(cublasSetStream(cublas_v2_handle, stream));
+    cublasOperation_t opA = transA ? CUBLAS_OP_T : CUBLAS_OP_N;
+    cublasOperation_t opB = transB ? CUBLAS_OP_T : CUBLAS_OP_N;
+    int lda = transA ? k : m;
+    int ldb = transB ? n : k;
+    int ldc = m;
+    const float alpha_v2 = 1.0f;
+    const float beta_v2 = accumulate ? 1.0f : 0.0f;
+    cublasStatus_t v2_st = cublasGemmEx(
+        cublas_v2_handle, opA, opB, m, n, k, &alpha_v2, a, CUBLAS_LOWP, lda, b,
+        CUBLAS_LOWP, ldb, &beta_v2, d, CUBLAS_LOWP, ldc, cublas_compute,
+        CUBLAS_GEMM_DEFAULT);
+    if (v2_st == CUBLAS_STATUS_SUCCESS) {
+      used_v2_fallback = true;
+      returnedResults = 1;  // signal success so we skip the Lt call below
+    }
+  }
   if (returnedResults == 0) {
     printf("No cuBLASLt algorithm: m: %d, n: %d, k: %d, bias: %d, "
            "transA: %d, transB: %d\n",
@@ -369,11 +398,13 @@ void matmul_cublaslt(floatX *d, const floatX *a, const floatX *b,
   // in algorithm selection (?!)
   const float alpha = 1.0f, beta = accumulate ? 1.0f : 0.0f;
 
-  // call the matmul natively on bfloat16
-  cublasCheck(cublasLtMatmul(cublaslt_handle, operationDesc, &alpha, a, ALayout,
-                             b, BLayout, &beta, d, CLayout, d, DLayout,
-                             &heuristic.algo, cublaslt_workspace,
-                             cublaslt_workspace_size, stream));
+  // call the matmul natively on bfloat16 (skip if v2 fallback already ran)
+  if (!used_v2_fallback) {
+    cublasCheck(cublasLtMatmul(cublaslt_handle, operationDesc, &alpha, a, ALayout,
+                               b, BLayout, &beta, d, CLayout, d, DLayout,
+                               &heuristic.algo, cublaslt_workspace,
+                               cublaslt_workspace_size, stream));
+  }
 
 #if defined(ENABLE_Q115)
   // For Q1.15 forward simulation, restrict outputs to valid SF16 bounds.

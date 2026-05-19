@@ -1368,7 +1368,7 @@ int main(int argc, char *argv[]) {
 #endif
 
     (void)inference_only;
-    if (tensorcores) cudaCheck(cudaDeviceSetLimit(cudaLimitDevRuntimeSyncDepth, 1));
+    (void)tensorcores;  // SFNet always uses tensor cores via cuBLASLt; flag kept for CLI compat
     cublasCheck(cublasLtCreate(&cublaslt_handle));
     cudaCheck(cudaMalloc(&cublaslt_workspace, cublaslt_workspace_size));
 
