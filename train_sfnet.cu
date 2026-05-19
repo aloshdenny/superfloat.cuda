@@ -1273,8 +1273,10 @@ float sfnet_estimate_mfu(SFNet *model, int num_tokens, float dt) {
 // ============================================================================
 int main(int argc, char *argv[]) {
     const char *model_str    = "sfnet:c768";
-    const char *input_bin    = "dev/data/tinyshakespeare/tiny_shakespeare_train.bin";
-    const char *input_val_bin= "dev/data/tinyshakespeare/tiny_shakespeare_val.bin";
+    // Default to the FineWeb 10B subset for pretraining (see dev/data/fineweb.py).
+    // Run `python dev/data/fineweb.py --version 10B` to materialize these shards.
+    const char *input_bin    = "dev/data/fineweb10B/fineweb_train_*.bin";
+    const char *input_val_bin= "dev/data/fineweb10B/fineweb_val_*.bin";
     const char *output_dir   = "";
     int batch_size           = 4;
     int sequence_length      = 1024;
