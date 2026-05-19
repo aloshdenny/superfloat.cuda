@@ -152,9 +152,10 @@ static unsigned int g_last_sanitized_grad_count = 0;
 // cuBLASLt's heuristic algorithm selector fails for non-canonical GQA matmul
 // output widths (e.g. qkv_w=1152, 1280) because those values produce a
 // leading-dimension stride that no registered cuBLASLt tile-kernel covers.
-// cublasGemmEx with CUBLAS_GEMM_DEFAULT_TENSOR_OP uses a separate kernel
-// registry (the classic BLAS path) that selects tensor-core kernels for any
-// BF16-aligned dimension (multiple of 8), regardless of the exact stride.
+// cublasGemmEx with CUBLAS_GEMM_DEFAULT uses the classic BLAS kernel registry
+// which selects tensor-core kernels for any BF16-aligned dimension (multiple
+// of 8), regardless of the exact stride.  (CUBLAS_GEMM_DEFAULT_TENSOR_OP is
+// deprecated in CUDA 12 and returns NOT_SUPPORTED with cublasComputeType_t.)
 //
 // All matrix layouts are described in column-major (cuBLAS native convention).
 // For a row-major [R, C] C array:  col-major view is [C, R] with ld=C.
@@ -184,8 +185,8 @@ static void sfnet_matmul_forward(floatX *out,
         inp,    CUDA_R_16BF, C,
         &beta,
         out,    CUDA_R_16BF, OC,
-        CUBLAS_COMPUTE_32F,
-        CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+        CUBLAS_COMPUTE_32F_FAST_16BF,
+        CUBLAS_GEMM_DEFAULT));
 #if defined(ENABLE_Q115)
     {
         size_t n_elem = (size_t)OC * B * T;
@@ -220,8 +221,8 @@ static void sfnet_matmul_backward(floatX *dinp, floatX *dweight,
             dout,   CUDA_R_16BF, OC,
             &beta,
             dinp,   CUDA_R_16BF, C,
-            CUBLAS_COMPUTE_32F,
-            CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+            CUBLAS_COMPUTE_32F_FAST_16BF,
+            CUBLAS_GEMM_DEFAULT));
     }
     if (dweight) {
         const float beta_w = 1.0f;  // always accumulate gradient
@@ -234,8 +235,8 @@ static void sfnet_matmul_backward(floatX *dinp, floatX *dweight,
             dout,    CUDA_R_16BF, OC,
             &beta_w,
             dweight, CUDA_R_16BF, C,
-            CUBLAS_COMPUTE_32F,
-            CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+            CUBLAS_COMPUTE_32F_FAST_16BF,
+            CUBLAS_GEMM_DEFAULT));
     }
 }
 
@@ -1420,6 +1421,7 @@ int main(int argc, char *argv[]) {
     cublasCheck(cublasLtCreate(&cublaslt_handle));
     cudaCheck(cudaMalloc(&cublaslt_workspace, cublaslt_workspace_size));
     cublasCheck(cublasCreate(&sfnet_cublas_handle));
+    cublasCheck(cublasSetMathMode(sfnet_cublas_handle, CUBLAS_DEFAULT_MATH));
 
     // cublas_common.h defaults cublas_compute = CUBLAS_COMPUTE_32F for non-SF16_TRUE_FORWARD
     // paths.  CUBLAS_COMPUTE_32F with BF16 I/O only has guaranteed kernel coverage for the
