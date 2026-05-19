@@ -431,7 +431,7 @@ void *malloc_and_point_parameters(ParameterTensors *params, size_t *param_elemen
 //     layer-by-layer so we don't need L copies
 //   * output is the big universal scratch / classifier buffer
 // ============================================================================
-constexpr int NUM_ACTIVATION_TENSORS = 23;
+constexpr int NUM_ACTIVATION_TENSORS = 24;
 typedef struct {
     floatX *encoded;        // (B, T, C)
     floatX *residual;       // (L, B, T, C)  — x after each block
@@ -456,6 +456,7 @@ typedef struct {
     floatX *scratch_btc;    // (B, T, C)
     floatX *scratch_btc2;   // (B, T, C)
     floatX *scratch_qkv3c;  // (B, T, 3*NH*HD) — expanded GQA input to attention
+    floatX *wpe_zeros;      // (T, C)  — all-zero positional embedding placeholder for encoder_forward
 } ActivationTensors;
 
 struct TensorSpec {
@@ -503,6 +504,8 @@ void fill_in_activation_sizes(const ActivationTensors *data,
     tensors[i++] = TENSOR_SPEC(data->scratch_btc,   B * T * C);
     tensors[i++] = TENSOR_SPEC(data->scratch_btc2,  B * T * C);
     tensors[i++] = TENSOR_SPEC(data->scratch_qkv3c, B * T * 3 * C);
+    // wpe_zeros is T*C zeros; never written, used so encoder_forward doesn't deref nullptr.
+    tensors[i++] = TENSOR_SPEC(data->wpe_zeros,     T * C);
     assert(i == NUM_ACTIVATION_TENSORS);
 }
 
@@ -938,7 +941,10 @@ void sfnet_forward(SFNet *model, const int *inputs, size_t B, size_t T) {
     pull_alpha(model, h_alpha);
 
     // 1. Token embedding (no positional table — RoPE inside attention handles position)
-    encoder_forward(acts.encoded, model->inputs, params.wte, /*wpe=*/nullptr,
+    // SFNet uses RoPE — no learned positional table.  encoder_forward_kernel3
+    // unconditionally reads wpe, so we supply a permanently-zero buffer instead
+    // of nullptr (which would cause an illegal memory access on the GPU).
+    encoder_forward(acts.encoded, model->inputs, params.wte, acts.wpe_zeros,
                     B, T, C, main_stream);
 
     // 2. Transformer blocks
