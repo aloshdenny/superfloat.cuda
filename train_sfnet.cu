@@ -161,18 +161,8 @@ static unsigned int g_last_sanitized_grad_count = 0;
 
 // Created lazily on first use; destroyed at program exit (or never — the OS
 // reclaims).  All callers route their stream through it before each call.
+// Created eagerly in main() right after cudaSetDevice, alongside cublaslt_handle.
 static cublasHandle_t sfnet_cublas_handle = nullptr;
-
-static inline void sfnet_ensure_cublas() {
-    if (sfnet_cublas_handle == nullptr) {
-        // Flush any benign pending device error from earlier work so that
-        // cublasCreate sees a clean device state.
-        cudaDeviceSynchronize();
-        (void)cudaGetLastError();
-        cublasCheck(cublasCreate(&sfnet_cublas_handle));
-        cublasCheck(cublasSetMathMode(sfnet_cublas_handle, CUBLAS_DEFAULT_MATH));
-    }
-}
 
 #if defined(ENABLE_Q115)
 // Local copy of the Q1.15 forward-clamp kernel.  matmul.cuh already defines
@@ -197,7 +187,7 @@ static void sfnet_matmul_forward(floatX *out,
                                  int B, int T, int C, int OC,
                                  cudaStream_t stream,
                                  bool is_logits = false) {
-    sfnet_ensure_cublas();
+    assert(sfnet_cublas_handle != nullptr);
     cublasCheck(cublasSetStream(sfnet_cublas_handle, stream));
 
     // Row-major out[B*T, OC] = inp[B*T, C] @ weight[OC, C]^T
@@ -237,7 +227,7 @@ static void sfnet_matmul_backward(floatX *dinp, floatX *dweight,
                                   floatX *dout, floatX *inp, floatX *weight,
                                   int B, int T, int C, int OC,
                                   bool accumulate_dinp, cudaStream_t stream) {
-    sfnet_ensure_cublas();
+    assert(sfnet_cublas_handle != nullptr);
     cublasCheck(cublasSetStream(sfnet_cublas_handle, stream));
 
     const float alpha = 1.0f;
@@ -1465,6 +1455,12 @@ int main(int argc, char *argv[]) {
     (void)tensorcores;  // SFNet always uses tensor cores via cuBLASLt; flag kept for CLI compat
     cublasCheck(cublasLtCreate(&cublaslt_handle));
     cudaCheck(cudaMalloc(&cublaslt_workspace, cublaslt_workspace_size));
+
+    // sfnet_cublas_handle: cuBLAS v2 handle for GQA matmuls whose OC widths
+    // (e.g. 1536) are not covered by the cuBLASLt heuristic.  Created here,
+    // during normal CUDA init, so there is no deferred-creation race.
+    cublasCheck(cublasCreate(&sfnet_cublas_handle));
+    cublasCheck(cublasSetMathMode(sfnet_cublas_handle, CUBLAS_DEFAULT_MATH));
 
     // Match train_gpt2: CUBLAS_COMPUTE_32F gives the widest algorithm coverage
     // for cuBLASLt's heuristic with BF16 I/O.  CUBLAS_COMPUTE_32F_FAST_16BF
