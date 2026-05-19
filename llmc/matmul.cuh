@@ -32,8 +32,6 @@ Matrix Multiplication, with help from cuBLASLt
 #if defined(SF16_TRUE_FORWARD)
 #include "q131_common.cuh"
 #endif
-#elif defined(ENABLE_Q131)
-#include "q131_common.cuh"
 #endif
 
 // ----------------------------------------------------------------------------
@@ -151,18 +149,13 @@ __global__ void q115_simulate_kernel(floatX *d, size_t N) {
 
 // Wrapper around cublasLtMatmul that is meant to support everything we need in
 // llm.c https://docs.nvidia.com/cuda/cublas/#cublasltmatmul
-//
-// skip_q115_sim: when true, the Q1.15 forward-clamp kernel is NOT applied to
-// the output.  Use for matmuls whose outputs are logits (LM head) — clamping
-// logits to ±1 saturates softmax and produces a uniform distribution.
 void matmul_cublaslt(floatX *d, const floatX *a, const floatX *b,
                      const floatX *bias, int m, int n, int k,
                      cudaStream_t stream = 0, bool transA = true,
                      bool transB = false, int batch_count = 0,
                      size_t strideA = 0, size_t strideB = 0,
                      size_t strideOut = 0, bool accumulate = false,
-                     floatX *pre_gelu = NULL, bool backward = false,
-                     bool skip_q115_sim = false) {
+                     floatX *pre_gelu = NULL, bool backward = false) {
   NVTX_RANGE_FN();
   bool has_bias = (bias != NULL);
   bool has_gelu = (pre_gelu != NULL);
@@ -255,26 +248,6 @@ void matmul_cublaslt(floatX *d, const floatX *a, const floatX *b,
   cublasCheck(cublasLtMatmulPreferenceSetAttribute(
       preference, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
       &cublaslt_workspace_size, sizeof(cublaslt_workspace_size)));
-  // Relax the default 256-byte alignment requirement on A/B/C/D.  cuBLASLt's
-  // heuristic rejects all algorithms whose tile stride doesn't satisfy that
-  // alignment for *every* leading dimension, which silently filters out the
-  // entire algo pool for non-canonical OC widths (1024/1280/1536).  Our
-  // floatX tensors are guaranteed 16-byte aligned only, so use that.
-  {
-    uint32_t min_align = 16;
-    cublasCheck(cublasLtMatmulPreferenceSetAttribute(
-        preference, CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_A_BYTES, &min_align,
-        sizeof(min_align)));
-    cublasCheck(cublasLtMatmulPreferenceSetAttribute(
-        preference, CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_B_BYTES, &min_align,
-        sizeof(min_align)));
-    cublasCheck(cublasLtMatmulPreferenceSetAttribute(
-        preference, CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_C_BYTES, &min_align,
-        sizeof(min_align)));
-    cublasCheck(cublasLtMatmulPreferenceSetAttribute(
-        preference, CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_D_BYTES, &min_align,
-        sizeof(min_align)));
-  }
 
   // setup epilogue and associated pointers for bias & gelu
   cublasLtEpilogue_t epilogue;
@@ -327,95 +300,9 @@ void matmul_cublaslt(floatX *d, const floatX *a, const floatX *b,
   cublasLtMatmulAlgoGetHeuristic(cublaslt_handle, operationDesc, ALayout,
                                  BLayout, CLayout, DLayout, preference, 1,
                                  &heuristic, &returnedResults);
-  // Heuristic may leave a benign device-error (e.g. cudaErrorNotSupported)
-  // pending when it returns 0 results.  Clear it so unrelated CUDA APIs
-  // (cublasCreate, cudaMalloc, etc.) don't fail spuriously.
-  (void)cudaGetLastError();
-  // The heuristic is conservative: it returns 0 results for any dimension
-  // triple that doesn't match a known tile-optimized kernel (e.g. GQA's
-  // qkv_w=1280 or non-canonical OC widths).  Fall back to enumerating the
-  // full algorithm registry for the given (compute, scale, A, B, C, D) tuple
-  // and pick the first one that survives algo-check.
   if (returnedResults == 0) {
-    const cudaDataType_t io_type = CUBLAS_LOWP;
-    const cudaDataType_t c_type =
-        (sizeof(floatX) == 1) ? CUDA_R_16BF : CUBLAS_LOWP;
-    int algo_ids[64] = {0};
-    int num_ids = 0;
-    cublasStatus_t ids_st = cublasLtMatmulAlgoGetIds(
-        cublaslt_handle, cublas_compute, CUDA_R_32F, io_type, io_type, c_type,
-        io_type, 64, algo_ids, &num_ids);
-    if (ids_st == CUBLAS_STATUS_SUCCESS) {
-      for (int i = 0; i < num_ids && returnedResults == 0; ++i) {
-        cublasLtMatmulAlgo_t cand;
-        if (cublasLtMatmulAlgoInit(cublaslt_handle, cublas_compute, CUDA_R_32F,
-                                   io_type, io_type, c_type, io_type,
-                                   algo_ids[i],
-                                   &cand) != CUBLAS_STATUS_SUCCESS) {
-          continue;
-        }
-        cublasLtMatmulHeuristicResult_t res = {};
-        cublasStatus_t check_st = cublasLtMatmulAlgoCheck(
-            cublaslt_handle, operationDesc, ALayout, BLayout, CLayout, DLayout,
-            &cand, &res);
-        if (check_st == CUBLAS_STATUS_SUCCESS &&
-            res.state == CUBLAS_STATUS_SUCCESS &&
-            res.workspaceSize <= cublaslt_workspace_size) {
-          heuristic = res;
-          returnedResults = 1;
-        }
-      }
-    }
-  }
-  // Last-resort fallback: cuBLASLt has no kernel for this dim triple.  Use
-  // cublasGemmEx (cuBLAS v2 API), which has a separate kernel registry and
-  // works for GQA-style "in-between" widths (e.g. OC=1536 with K=768) that
-  // cuBLASLt rejects.  Only supported when there is no bias/gelu epilogue
-  // and no batched stride (i.e. the simple matmul case SFNet uses).
-  bool used_v2_fallback = false;
-  if (returnedResults == 0 && !has_bias && !has_gelu && batch_count == 0) {
-    static cublasHandle_t cublas_v2_handle = nullptr;
-    if (cublas_v2_handle == nullptr) {
-      // The algo-probing loop above can leave a benign CUDA error pending
-      // (cudaErrorNotSupported / NotInitialized from probing).  Clear all
-      // pending state and flush in-flight work BEFORE the first cublasCreate
-      // call so it sees a clean device.
-      cudaDeviceSynchronize();
-      (void)cudaGetLastError();
-      cublasStatus_t cr_st = cublasCreate(&cublas_v2_handle);
-      if (cr_st != CUBLAS_STATUS_SUCCESS) {
-        cudaError_t cuda_err = cudaGetLastError();
-        printf("[cuBLAS v2 init failed]: cublas_status=%d cuda_err=%d (%s)\n",
-               (int)cr_st, (int)cuda_err,
-               cuda_err != cudaSuccess ? cudaGetErrorString(cuda_err) : "ok");
-        cublas_v2_handle = nullptr;  // leave NULL so we exit via fall-through
-      } else {
-        cublasCheck(cublasSetMathMode(cublas_v2_handle, CUBLAS_DEFAULT_MATH));
-      }
-    }
-    if (cublas_v2_handle != nullptr) {
-      cublasCheck(cublasSetStream(cublas_v2_handle, stream));
-      cublasOperation_t opA = transA ? CUBLAS_OP_T : CUBLAS_OP_N;
-      cublasOperation_t opB = transB ? CUBLAS_OP_T : CUBLAS_OP_N;
-      int lda = transA ? k : m;
-      int ldb = transB ? n : k;
-      int ldc = m;
-      const float alpha_v2 = 1.0f;
-      const float beta_v2 = accumulate ? 1.0f : 0.0f;
-      cublasStatus_t v2_st = cublasGemmEx(
-          cublas_v2_handle, opA, opB, m, n, k, &alpha_v2, a, CUBLAS_LOWP, lda,
-          b, CUBLAS_LOWP, ldb, &beta_v2, d, CUBLAS_LOWP, ldc, cublas_compute,
-          CUBLAS_GEMM_DEFAULT);
-      if (v2_st == CUBLAS_STATUS_SUCCESS) {
-        used_v2_fallback = true;
-        returnedResults = 1;  // signal success so we skip the Lt call below
-      }
-    }
-  }
-  if (returnedResults == 0) {
-    printf("No cuBLASLt algorithm: m: %d, n: %d, k: %d, bias: %d, "
-           "transA: %d, transB: %d\n",
-           m, n, k, has_bias, transA, transB);
+    printf("No cuBLASLt algorithm: m: %d, n: %d, k: %d, bias: %d\n", n, m, k,
+           has_bias);
     exit(EXIT_FAILURE);
   }
 
@@ -423,20 +310,17 @@ void matmul_cublaslt(floatX *d, const floatX *a, const floatX *b,
   // in algorithm selection (?!)
   const float alpha = 1.0f, beta = accumulate ? 1.0f : 0.0f;
 
-  // call the matmul natively on bfloat16 (skip if v2 fallback already ran)
-  if (!used_v2_fallback) {
-    cublasCheck(cublasLtMatmul(cublaslt_handle, operationDesc, &alpha, a, ALayout,
-                               b, BLayout, &beta, d, CLayout, d, DLayout,
-                               &heuristic.algo, cublaslt_workspace,
-                               cublaslt_workspace_size, stream));
-  }
+  // call the matmul natively on bfloat16
+  cublasCheck(cublasLtMatmul(cublaslt_handle, operationDesc, &alpha, a, ALayout,
+                             b, BLayout, &beta, d, CLayout, d, DLayout,
+                             &heuristic.algo, cublaslt_workspace,
+                             cublaslt_workspace_size, stream));
 
 #if defined(ENABLE_Q115)
   // For Q1.15 forward simulation, restrict outputs to valid SF16 bounds.
   // In SF16_TRUE_FORWARD mode this also injects an SF32 register simulation
-  // before the SF16 write-back quantization.  Skipped for LM-head logits
-  // (skip_q115_sim=true): clamping logits to ±1 would saturate softmax.
-  if (!backward && !skip_q115_sim && size_C > 0) {
+  // before the SF16 write-back quantization.
+  if (!backward && size_C > 0) {
     int num_blocks = (size_C + 255) / 256;
     q115_simulate_kernel<<<num_blocks, 256, 0, stream>>>(d, size_C);
   }
@@ -452,22 +336,20 @@ void matmul_cublaslt(floatX *d, const floatX *a, const floatX *b,
 }
 
 // small wrapper around matmul_cublaslt for the forward pass (keeping historical
-// order of arguments).
-// is_logits: pass true for the LM-head matmul so that Q1.15 forward clamping
-// is NOT applied to the logits.
+// order of arguments)
 void matmul_forward_cublaslt(floatX *out, floatX *inp, floatX *weight,
                              floatX *bias, int B, int T, int C, int OC,
                              cudaStream_t stream, floatX *pre_gelu = NULL,
-                             int gelu_fusion = 1, bool is_logits = false) {
+                             int gelu_fusion = 1) {
   // By default only fuse GELU for H100+ as cuBLAS seems to be inefficient for
   // fused GELU on Ada/Ampere (?)
   if (gelu_fusion < 1 && pre_gelu) {
     matmul_cublaslt(pre_gelu, weight, inp, bias, OC, B * T, C, stream, true,
-                    false, 0, 0, 0, 0, false, NULL, false, is_logits);
+                    false, 0, 0, 0, 0, false, NULL, false);
     gelu_forward(out, pre_gelu, B * T * OC, stream);
   } else {
     matmul_cublaslt(out, weight, inp, bias, OC, B * T, C, stream, true, false,
-                    0, 0, 0, 0, false, pre_gelu, false, is_logits);
+                    0, 0, 0, 0, false, pre_gelu, false);
   }
 }
 

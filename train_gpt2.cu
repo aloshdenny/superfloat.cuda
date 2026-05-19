@@ -1518,11 +1518,8 @@ void gpt2_forward(GPT2 *model, const int *inputs, size_t B, size_t T) {
     }
   }
 
-  // LM head: pass is_logits=true so logits are NOT clamped to Q1.15 range —
-  // otherwise softmax saturates and loss locks at ln(V).
   matmul_forward_cublaslt(acts.output, acts.lnf, params.wte, NULL, B, T, C, Vp,
-                          main_stream, /*pre_gelu=*/nullptr, /*gelu_fusion=*/1,
-                          /*is_logits=*/true);
+                          main_stream);
   // Removed full device sync — stream-ordered deps are sufficient for training.
   // Validation path (gpt2_validate) does its own sync before reading results.
 }

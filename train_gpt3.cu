@@ -1096,10 +1096,8 @@ void gpt3_forward(GPT3 *model, const int *inputs, size_t B, size_t T) {
     }
   }
 
-  // LM head: is_logits=true keeps logits unclamped (Q1.15 ±1 would saturate softmax)
   matmul_forward_cublaslt(acts.output, acts.lnf, params.wte, NULL, B, T, C, Vp,
-                          main_stream, /*pre_gelu=*/nullptr, /*gelu_fusion=*/1,
-                          /*is_logits=*/true);
+                          main_stream);
   cudaCheck(cudaDeviceSynchronize());
 }
 
