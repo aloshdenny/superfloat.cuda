@@ -586,7 +586,9 @@ void sfnet_set_hyperparameters(SFNetConfig *cfg, const char *model_str) {
     cfg->dim = 768;
     cfg->n_layers = 12;
     cfg->n_heads = 12;
-    cfg->n_kv_heads = 3;
+    // NKV=4 → qkv_w=(12+8)*64=1280=5*256, which cuBLASLt tile-algorithms accept.
+    // NKV=3 gives 1152 (not a multiple of 256) and hits "No cuBLASLt algorithm".
+    cfg->n_kv_heads = 4;
     cfg->ffn_dim = 2048;
     cfg->head_dim = 64;
     cfg->vocab_size = 50257;
@@ -601,7 +603,16 @@ void sfnet_set_hyperparameters(SFNetConfig *cfg, const char *model_str) {
             cfg->dim = c;
             cfg->head_dim = 64;
             cfg->n_heads = c / 64;
-            cfg->n_kv_heads = std::max(1, cfg->n_heads / 4);
+            // Start at a ~4x GQA ratio, then nudge NKV upward until
+            // qkv_w = (NH + 2*NKV)*HD is divisible by 256. This satisfies
+            // the cuBLASLt tile-alignment requirement for all standard configs.
+            // e.g. NH=12, HD=64 → NKV starts at 3 (not aligned), bumps to 4 → qkv_w=1280=5*256 ✓
+            //      NH=16, HD=64 → NKV=4 → qkv_w=1536=6*256 ✓
+            {
+                int nkv = std::max(1, cfg->n_heads / 4);
+                while (((cfg->n_heads + 2 * nkv) * cfg->head_dim) % 256 != 0) nkv++;
+                cfg->n_kv_heads = nkv;
+            }
             cfg->ffn_dim = (8 * c) / 3;
             cfg->ffn_dim = (cfg->ffn_dim + 127) & ~127;
         }
@@ -614,6 +625,19 @@ void sfnet_set_hyperparameters(SFNetConfig *cfg, const char *model_str) {
         }
     }
     cfg->alpha_init = 1.0f / sqrtf(2.0f * (float)cfg->n_layers);
+
+    // cuBLASLt tile algorithms require the QKV projection output dim
+    // qkv_w = (n_heads + 2*n_kv_heads)*head_dim to be a multiple of 256.
+    int qkv_w = (cfg->n_heads + 2 * cfg->n_kv_heads) * cfg->head_dim;
+    if (qkv_w % 256 != 0) {
+        fprintf(stderr,
+            "SFNet config error: qkv_w=%d is not a multiple of 256 "
+            "(n_heads=%d, n_kv_heads=%d, head_dim=%d). "
+            "cuBLASLt cannot find a tile algorithm for this dimension. "
+            "Adjust n_kv_heads so that (n_heads+2*n_kv_heads)*head_dim is divisible by 256.\n",
+            qkv_w, cfg->n_heads, cfg->n_kv_heads, cfg->head_dim);
+        exit(EXIT_FAILURE);
+    }
 }
 
 void sfnet_allocate_weights(SFNet *model) {
