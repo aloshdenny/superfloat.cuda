@@ -586,9 +586,8 @@ void sfnet_set_hyperparameters(SFNetConfig *cfg, const char *model_str) {
     cfg->dim = 768;
     cfg->n_layers = 12;
     cfg->n_heads = 12;
-    // NKV=4 → qkv_w=(12+8)*64=1280=5*256, which cuBLASLt tile-algorithms accept.
-    // NKV=3 gives 1152 (not a multiple of 256) and hits "No cuBLASLt algorithm".
-    cfg->n_kv_heads = 4;
+    // Overwritten below if model_str matches "sfnet:c"; keep 3 as a placeholder.
+    cfg->n_kv_heads = 3;
     cfg->ffn_dim = 2048;
     cfg->head_dim = 64;
     cfg->vocab_size = 50257;
