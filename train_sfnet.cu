@@ -147,121 +147,53 @@ constexpr const size_t IO_BUF_SIZE = 32 * 1024 * 1024;
 static unsigned int g_last_sanitized_grad_count = 0;
 
 // ============================================================================
-// Local matmul wrappers — SFNet-only, fully standalone.
+// Local matmul wrappers — thin shims over matmul_forward_cublaslt /
+// matmul_cublaslt (the shared, GPT-2-compatible cuBLASLt path).
 // ----------------------------------------------------------------------------
-// SFNet uses GQA which produces "in-between" OC widths (e.g. qkv_w=1536 for
-// c=768/NH=12/NKV=6) that cuBLASLt's heuristic does not have kernels for.
-// To avoid touching the shared matmul_cublaslt path (used by GPT-2/GPT-3),
-// SFNet uses cuBLAS v2 (cublasGemmEx) directly, which has a separate kernel
-// registry with broader BF16 coverage.
+// SFNet's hyperparameters are constrained so that every OC is one of
+// {C, 3*C, ffn_dim, Vp} — canonical dimensions cuBLASLt always has kernels for.
+// NKV is set equal to NH (full MHA), giving qkv_w = (NH + 2*NH)*HD = 3*C.
 //
-// We also apply the Q1.15 forward-clamp ourselves so we can skip it for the
-// LM-head matmul (clamping logits to ±1 would saturate softmax).
+// The LM-head matmul is issued with backward=true so that matmul_cublaslt
+// skips the Q1.15 forward-clamp kernel — clamping logits to ±1 would make
+// softmax uniform and lock the loss at ln(V).
 // ============================================================================
-
-// Created lazily on first use; destroyed at program exit (or never — the OS
-// reclaims).  All callers route their stream through it before each call.
-// Created eagerly in main() right after cudaSetDevice, alongside cublaslt_handle.
-static cublasHandle_t sfnet_cublas_handle = nullptr;
-
-#if defined(ENABLE_Q115)
-// Local copy of the Q1.15 forward-clamp kernel.  matmul.cuh already defines
-// one in the global namespace; ours has a different name to avoid collision
-// when this header is included into a build that uses both.
-__global__ void sfnet_q115_clamp(floatX *d, size_t N) {
-    size_t idx = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
-    if (idx < N) {
-        float v = (float)d[idx];
-#if defined(SF16_TRUE_FORWARD)
-        v = simulate_q131(v);
-#endif
-        d[idx] = (floatX)simulate_q115(v);
-    }
-}
-#endif
-
-// Forward matmul: out[B*T, OC] = inp[B*T, C] @ weight[OC, C]^T
-// is_logits=true skips the Q1.15 forward clamp (use for the LM head).
-static void sfnet_matmul_forward(floatX *out,
-                                 const floatX *inp, const floatX *weight,
-                                 int B, int T, int C, int OC,
-                                 cudaStream_t stream,
-                                 bool is_logits = false) {
-    assert(sfnet_cublas_handle != nullptr);
-    cublasCheck(cublasSetStream(sfnet_cublas_handle, stream));
-
-    // Row-major out[B*T, OC] = inp[B*T, C] @ weight[OC, C]^T
-    // In column-major (cuBLAS native):
-    //   out_CM[OC, B*T]  =  weight_CM[C, OC]^T  @  inp_CM[C, B*T]
-    //   A=weight (ld=C, transA=T → effective shape OC×C)
-    //   B=inp    (ld=C, transB=N → shape C×B*T)
-    //   D=out    (ld=OC, shape OC×B*T)
-    const float alpha = 1.0f, beta = 0.0f;
-    cublasCheck(cublasGemmEx(
-        sfnet_cublas_handle,
-        CUBLAS_OP_T, CUBLAS_OP_N,
-        OC, B * T, C,
-        &alpha,
-        weight, CUDA_R_16BF, C,
-        inp,    CUDA_R_16BF, C,
-        &beta,
-        out,    CUDA_R_16BF, OC,
-        CUBLAS_COMPUTE_32F,
-        CUBLAS_GEMM_DEFAULT));
-
-#if defined(ENABLE_Q115)
-    if (!is_logits) {
-        size_t n_elem = (size_t)OC * B * T;
-        int blocks = (int)((n_elem + 255) / 256);
-        sfnet_q115_clamp<<<blocks, 256, 0, stream>>>(out, n_elem);
-        cudaCheck(cudaGetLastError());
-    }
-#endif
+static inline void sfnet_matmul_forward(floatX *out,
+                                        const floatX *inp, const floatX *weight,
+                                        int B, int T, int C, int OC,
+                                        cudaStream_t stream) {
+    matmul_forward_cublaslt(out, (floatX *)inp, (floatX *)weight,
+                            /*bias=*/nullptr, B, T, C, OC, stream);
 }
 
-// Backward matmul:
-//   dinp[B*T, C]    = dout[B*T, OC] @ weight[OC, C]        (optionally += )
-//   dweight[OC, C] += dout[B*T, OC]^T @ inp[B*T, C]        (always +=)
-// Backward never applies Q1.15 simulation (BF16 gradients are correct policy).
-static void sfnet_matmul_backward(floatX *dinp, floatX *dweight,
-                                  floatX *dout, floatX *inp, floatX *weight,
-                                  int B, int T, int C, int OC,
-                                  bool accumulate_dinp, cudaStream_t stream) {
-    assert(sfnet_cublas_handle != nullptr);
-    cublasCheck(cublasSetStream(sfnet_cublas_handle, stream));
+// LM-head variant: backward=true disables q115_simulate_kernel so logits are
+// unconstrained and softmax can discriminate between classes.
+static inline void sfnet_logits_forward(floatX *out,
+                                        const floatX *inp, const floatX *weight,
+                                        int B, int T, int C, int OC,
+                                        cudaStream_t stream) {
+    matmul_cublaslt(out, (floatX *)weight, (floatX *)inp,
+                    /*bias=*/nullptr, OC, B * T, C, stream,
+                    /*transA=*/true, /*transB=*/false,
+                    0, 0, 0, 0, /*accumulate=*/false, /*pre_gelu=*/nullptr,
+                    /*backward=*/true);
+}
 
-    const float alpha = 1.0f;
+static inline void sfnet_matmul_backward(floatX *dinp, floatX *dweight,
+                                         floatX *dout,  floatX *inp, floatX *weight,
+                                         int B, int T, int C, int OC,
+                                         bool accumulate_dinp, cudaStream_t stream) {
     if (dinp) {
-        // Row-major dinp[B*T, C] = dout[B*T, OC] @ weight[OC, C]
-        // Column-major: dinp_CM[C, B*T] = weight_CM[C, OC] @ dout_CM[OC, B*T]
-        const float beta = accumulate_dinp ? 1.0f : 0.0f;
-        cublasCheck(cublasGemmEx(
-            sfnet_cublas_handle,
-            CUBLAS_OP_N, CUBLAS_OP_N,
-            C, B * T, OC,
-            &alpha,
-            weight, CUDA_R_16BF, C,
-            dout,   CUDA_R_16BF, OC,
-            &beta,
-            dinp,   CUDA_R_16BF, C,
-            CUBLAS_COMPUTE_32F,
-            CUBLAS_GEMM_DEFAULT));
+        matmul_cublaslt(dinp, weight, dout, /*bias=*/nullptr,
+                        C, B * T, OC, stream,
+                        /*transA=*/false, /*transB=*/false,
+                        0, 0, 0, 0, accumulate_dinp, nullptr, /*backward=*/true);
     }
     if (dweight) {
-        // Row-major dweight[OC, C] += dout[B*T, OC]^T @ inp[B*T, C]
-        // Column-major: dweight_CM[C, OC] += inp_CM[C, B*T] @ dout_CM[OC, B*T]^T
-        const float beta_w = 1.0f;  // always accumulate gradient
-        cublasCheck(cublasGemmEx(
-            sfnet_cublas_handle,
-            CUBLAS_OP_N, CUBLAS_OP_T,
-            C, OC, B * T,
-            &alpha,
-            inp,     CUDA_R_16BF, C,
-            dout,    CUDA_R_16BF, OC,
-            &beta_w,
-            dweight, CUDA_R_16BF, C,
-            CUBLAS_COMPUTE_32F,
-            CUBLAS_GEMM_DEFAULT));
+        matmul_cublaslt(dweight, inp, dout, /*bias=*/nullptr,
+                        C, OC, B * T, stream,
+                        /*transA=*/false, /*transB=*/true,
+                        0, 0, 0, 0, /*accumulate=*/true, nullptr, /*backward=*/true);
     }
 }
 
@@ -660,7 +592,7 @@ void sfnet_set_hyperparameters(SFNetConfig *cfg, const char *model_str) {
     cfg->dim = 768;
     cfg->n_layers = 12;
     cfg->n_heads = 12;
-    cfg->n_kv_heads = 6;  // default for sfnet:c768 (NH=12/2); overwritten by sfnet:c parser
+    cfg->n_kv_heads = 12;  // default for sfnet:c768 — full MHA (NKV=NH) so qkv_w=3*C
     cfg->ffn_dim = 2048;
     cfg->head_dim = 64;
     cfg->vocab_size = 50257;
@@ -675,10 +607,9 @@ void sfnet_set_hyperparameters(SFNetConfig *cfg, const char *model_str) {
             cfg->dim = c;
             cfg->head_dim = 64;
             cfg->n_heads = c / 64;
-            // qkv_w = (n_heads + 2*n_kv_heads)*head_dim must be a multiple of C
-            // so that cuBLASLt can find a kernel for the (OC, B*T, C) GEMM.
-            // The smallest such value with ≥1 KV head is 2*C (NKV = n_heads/2).
-            cfg->n_kv_heads = cfg->n_heads / 2;  // qkv_w = 2*C, ratio 2:1 GQA
+            // NKV=NH gives qkv_w = (NH + 2*NH)*HD = 3*C — the same canonical
+            // dimension GPT-2 uses, so cuBLASLt always has a kernel for it.
+            cfg->n_kv_heads = cfg->n_heads;  // full MHA; qkv_w = 3*C
 
             // ffn_dim must also be a multiple of C for the up/gate/down GEMMs.
             // Round (8/3)*C up to the next multiple of C.
@@ -974,10 +905,11 @@ void sfnet_forward(SFNet *model, const int *inputs, size_t B, size_t T) {
     rmsnorm_forward(acts.rms_f, acts.rms_f_rstd, x_final, params.rms_fw,
                     B, T, C, eps, main_stream);
 
-    // 4. Tied LM head — is_logits=true so Q1.15 forward-clamp is NOT applied
-    // to logits (clamping would saturate softmax and lock loss at ln(V)).
-    sfnet_matmul_forward(acts.output, acts.rms_f, params.wte,
-                         B, T, C, Vp, main_stream, /*is_logits=*/true);
+    // 4. Tied LM head — use sfnet_logits_forward (backward=true) so the
+    // Q1.15 forward-clamp is skipped; clamping logits to ±1 would saturate
+    // softmax and lock the loss at ln(V).
+    sfnet_logits_forward(acts.output, acts.rms_f, params.wte,
+                         B, T, C, Vp, main_stream);
 }
 
 // ============================================================================
@@ -1456,12 +1388,6 @@ int main(int argc, char *argv[]) {
     cublasCheck(cublasLtCreate(&cublaslt_handle));
     cudaCheck(cudaMalloc(&cublaslt_workspace, cublaslt_workspace_size));
 
-    // sfnet_cublas_handle: cuBLAS v2 handle for GQA matmuls whose OC widths
-    // (e.g. 1536) are not covered by the cuBLASLt heuristic.  Created here,
-    // during normal CUDA init, so there is no deferred-creation race.
-    cublasCheck(cublasCreate(&sfnet_cublas_handle));
-    cublasCheck(cublasSetMathMode(sfnet_cublas_handle, CUBLAS_DEFAULT_MATH));
-
     // Match train_gpt2: CUBLAS_COMPUTE_32F gives the widest algorithm coverage
     // for cuBLASLt's heuristic with BF16 I/O.  CUBLAS_COMPUTE_32F_FAST_16BF
     // restricts the search to a specific BF16 tensor-core kernel family which
@@ -1602,10 +1528,6 @@ int main(int argc, char *argv[]) {
     cudaCheck(cudaFree(model.acts_memory));
     cudaCheck(cudaFree(model.d_freqs_cis));
     cudaCheck(cudaFree(cublaslt_workspace));
-    if (sfnet_cublas_handle != nullptr) {
-        cublasCheck(cublasDestroy(sfnet_cublas_handle));
-        sfnet_cublas_handle = nullptr;
-    }
     cudaCheck(cudaStreamDestroy(main_stream));
     if (tokenizer.init_ok) tokenizer_free(&tokenizer);
     printf0("Training complete.\n");
