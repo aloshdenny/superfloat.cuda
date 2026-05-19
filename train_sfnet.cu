@@ -578,7 +578,7 @@ void sfnet_set_hyperparameters(SFNetConfig *cfg, const char *model_str) {
     cfg->dim = 768;
     cfg->n_layers = 12;
     cfg->n_heads = 12;
-    cfg->n_kv_heads = 2;  // overwritten below by sfnet:c parser
+    cfg->n_kv_heads = 6;  // default for sfnet:c768 (NH=12/2); overwritten by sfnet:c parser
     cfg->ffn_dim = 2048;
     cfg->head_dim = 64;
     cfg->vocab_size = 50257;
@@ -593,20 +593,17 @@ void sfnet_set_hyperparameters(SFNetConfig *cfg, const char *model_str) {
             cfg->dim = c;
             cfg->head_dim = 64;
             cfg->n_heads = c / 64;
-            // Pick NKV so qkv_w = (n_heads + 2*n_kv_heads)*head_dim is the
-            // next power of 2 >= the minimum (1 KV head).
-            // Power-of-2 OC dimensions are universally accepted by cuBLASLt.
-            // e.g. NH=12,HD=64: min=896 → next_pow2=1024 → NKV=2 (ratio 6:1)
-            //      NH=16,HD=64: min=1152 → next_pow2=2048 → NKV=8 (ratio 2:1)
+            // qkv_w = (n_heads + 2*n_kv_heads)*head_dim must be a multiple of C
+            // so that cuBLASLt can find a kernel for the (OC, B*T, C) GEMM.
+            // The smallest such value with ≥1 KV head is 2*C (NKV = n_heads/2).
+            cfg->n_kv_heads = cfg->n_heads / 2;  // qkv_w = 2*C, ratio 2:1 GQA
+
+            // ffn_dim must also be a multiple of C for the up/gate/down GEMMs.
+            // Round (8/3)*C up to the next multiple of C.
             {
-                int min_heads = cfg->n_heads + 2;  // ≥1 KV head
-                int min_w = min_heads * cfg->head_dim;
-                int p2 = 1;
-                while (p2 < min_w) p2 <<= 1;
-                cfg->n_kv_heads = (p2 / cfg->head_dim - cfg->n_heads) / 2;
+                int ffn_raw = (8 * c) / 3;
+                cfg->ffn_dim = ((ffn_raw + c - 1) / c) * c;
             }
-            cfg->ffn_dim = (8 * c) / 3;
-            cfg->ffn_dim = (cfg->ffn_dim + 127) & ~127;
         }
     }
     if (model_str) {

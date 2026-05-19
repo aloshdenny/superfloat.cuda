@@ -302,6 +302,29 @@ void matmul_cublaslt(floatX *d, const floatX *a, const floatX *b,
   cublasLtMatmulAlgoGetHeuristic(cublaslt_handle, operationDesc, ALayout,
                                  BLayout, CLayout, DLayout, preference, 1,
                                  &heuristic, &returnedResults);
+  // The heuristic is conservative: it returns 0 results for any dimension
+  // triple that doesn't match a known tile-optimized kernel.  Fall back to
+  // exhaustive enumeration so that any mathematically valid configuration
+  // can still run (possibly at reduced throughput).
+  if (returnedResults == 0) {
+    for (int algo_id = 0; algo_id < 128 && returnedResults == 0; ++algo_id) {
+      cublasLtMatmulAlgo_t cand;
+      cublasStatus_t init_st = cublasLtMatmulAlgoInit(
+          cublaslt_handle, cublas_compute, CUDA_R_32F,
+          CUBLAS_LOWP, CUBLAS_LOWP, CUBLAS_LOWP, CUBLAS_LOWP, algo_id, &cand);
+      if (init_st != CUBLAS_STATUS_SUCCESS) continue;
+      cublasLtMatmulHeuristicResult_t res = {};
+      cublasStatus_t check_st = cublasLtMatmulAlgoCheck(
+          cublaslt_handle, operationDesc, ALayout, BLayout, CLayout, DLayout,
+          &cand, &res);
+      if (check_st == CUBLAS_STATUS_SUCCESS &&
+          res.state == CUBLAS_STATUS_SUCCESS &&
+          res.workspaceSize <= cublaslt_workspace_size) {
+        heuristic = res;
+        returnedResults = 1;
+      }
+    }
+  }
   if (returnedResults == 0) {
     printf("No cuBLASLt algorithm: m: %d, n: %d, k: %d, bias: %d\n", n, m, k,
            has_bias);
