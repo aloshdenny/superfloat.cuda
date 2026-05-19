@@ -117,10 +117,14 @@ else
 endif
 
 # ===============================
-# SF16 / Q1.15 — always on
-# Every model is trained in strict SF16 forward / BF16 backward mode.
+# Precision flags
+# BF16 baseline (used by GPT-2, GPT-3 — architectures not designed for SF16).
+# SF16 = BF16 storage with strict Q1.15 forward clamp (used by SFNet only,
+# which is purpose-built with scaled residuals, QK-norm, tanh-GLU, etc. to
+# keep all activations in [-0.999969, +0.999969]).
 # ===============================
-SF16FLAGS = -DENABLE_BF16 -DENABLE_Q115 -DSF16_TRUE_FORWARD=1
+BF16FLAGS  = -DENABLE_BF16
+SF16FLAGS  = -DENABLE_BF16 -DENABLE_Q115 -DSF16_TRUE_FORWARD=1
 
 # ===============================
 # Phony targets
@@ -165,19 +169,19 @@ $(NVCC_CUDNN): llmc/cudnn_att.cpp
 # Model targets — all SF16
 # ===============================
 train_gpt2: train_gpt2.cu libsyms $(NVCC_CUDNN)
-	$(NVCC) $(NVCC_FLAGS) $(SF16FLAGS) $(NVCC_INCLUDES) $< $(NVCC_CUDNN) $(NVCC_LDFLAGS) $(NVCC_LDLIBS) $(CUDA_OUTPUT_FILE)
+	$(NVCC) $(NVCC_FLAGS) $(BF16FLAGS) $(NVCC_INCLUDES) $< $(NVCC_CUDNN) $(NVCC_LDFLAGS) $(NVCC_LDLIBS) $(CUDA_OUTPUT_FILE)
 
 train_gpt3: train_gpt3.cu libsyms $(NVCC_CUDNN)
-	$(NVCC) $(NVCC_FLAGS) $(SF16FLAGS) $(NVCC_INCLUDES) $< $(NVCC_CUDNN) $(NVCC_LDFLAGS) $(NVCC_LDLIBS) $(CUDA_OUTPUT_FILE)
+	$(NVCC) $(NVCC_FLAGS) $(BF16FLAGS) $(NVCC_INCLUDES) $< $(NVCC_CUDNN) $(NVCC_LDFLAGS) $(NVCC_LDLIBS) $(CUDA_OUTPUT_FILE)
 
 train_sfnet: train_sfnet.cu libsyms
 	$(NVCC) $(NVCC_FLAGS) $(SF16FLAGS) $(NVCC_INCLUDES) $< $(NVCC_LDFLAGS) $(NVCC_LDLIBS) $(CUDA_OUTPUT_FILE)
 
 train_llama32_1B: train_llama32_1B.cu libsyms
-	$(NVCC) $(NVCC_FLAGS) $(SF16FLAGS) $(NVCC_INCLUDES) $< $(NVCC_LDFLAGS) $(NVCC_LDLIBS) $(CUDA_OUTPUT_FILE)
+	$(NVCC) $(NVCC_FLAGS) $(BF16FLAGS) $(NVCC_INCLUDES) $< $(NVCC_LDFLAGS) $(NVCC_LDLIBS) $(CUDA_OUTPUT_FILE)
 
 train_llama32_3B: train_llama32_3B.cu libsyms
-	$(NVCC) $(NVCC_FLAGS) $(SF16FLAGS) $(NVCC_INCLUDES) $< $(NVCC_LDFLAGS) $(NVCC_LDLIBS) $(CUDA_OUTPUT_FILE)
+	$(NVCC) $(NVCC_FLAGS) $(BF16FLAGS) $(NVCC_INCLUDES) $< $(NVCC_LDFLAGS) $(NVCC_LDLIBS) $(CUDA_OUTPUT_FILE)
 
 # ===============================
 # Clean
