@@ -586,8 +586,7 @@ void sfnet_set_hyperparameters(SFNetConfig *cfg, const char *model_str) {
     cfg->dim = 768;
     cfg->n_layers = 12;
     cfg->n_heads = 12;
-    // Overwritten below if model_str matches "sfnet:c"; keep 3 as a placeholder.
-    cfg->n_kv_heads = 3;
+    cfg->n_kv_heads = 3;  // overwritten below by sfnet:c parser
     cfg->ffn_dim = 2048;
     cfg->head_dim = 64;
     cfg->vocab_size = 50257;
@@ -602,16 +601,7 @@ void sfnet_set_hyperparameters(SFNetConfig *cfg, const char *model_str) {
             cfg->dim = c;
             cfg->head_dim = 64;
             cfg->n_heads = c / 64;
-            // Start at a ~4x GQA ratio, then nudge NKV upward until
-            // qkv_w = (NH + 2*NKV)*HD is divisible by 256. This satisfies
-            // the cuBLASLt tile-alignment requirement for all standard configs.
-            // e.g. NH=12, HD=64 → NKV starts at 3 (not aligned), bumps to 4 → qkv_w=1280=5*256 ✓
-            //      NH=16, HD=64 → NKV=4 → qkv_w=1536=6*256 ✓
-            {
-                int nkv = std::max(1, cfg->n_heads / 4);
-                while (((cfg->n_heads + 2 * nkv) * cfg->head_dim) % 256 != 0) nkv++;
-                cfg->n_kv_heads = nkv;
-            }
+            cfg->n_kv_heads = std::max(1, cfg->n_heads / 4);
             cfg->ffn_dim = (8 * c) / 3;
             cfg->ffn_dim = (cfg->ffn_dim + 127) & ~127;
         }
@@ -624,19 +614,6 @@ void sfnet_set_hyperparameters(SFNetConfig *cfg, const char *model_str) {
         }
     }
     cfg->alpha_init = 1.0f / sqrtf(2.0f * (float)cfg->n_layers);
-
-    // cuBLASLt tile algorithms require the QKV projection output dim
-    // qkv_w = (n_heads + 2*n_kv_heads)*head_dim to be a multiple of 256.
-    int qkv_w = (cfg->n_heads + 2 * cfg->n_kv_heads) * cfg->head_dim;
-    if (qkv_w % 256 != 0) {
-        fprintf(stderr,
-            "SFNet config error: qkv_w=%d is not a multiple of 256 "
-            "(n_heads=%d, n_kv_heads=%d, head_dim=%d). "
-            "cuBLASLt cannot find a tile algorithm for this dimension. "
-            "Adjust n_kv_heads so that (n_heads+2*n_kv_heads)*head_dim is divisible by 256.\n",
-            qkv_w, cfg->n_heads, cfg->n_kv_heads, cfg->head_dim);
-        exit(EXIT_FAILURE);
-    }
 }
 
 void sfnet_allocate_weights(SFNet *model) {
@@ -1395,8 +1372,19 @@ int main(int argc, char *argv[]) {
     cublasCheck(cublasLtCreate(&cublaslt_handle));
     cudaCheck(cudaMalloc(&cublaslt_workspace, cublaslt_workspace_size));
 
-    bool enable_tf32 = PRECISION_MODE == PRECISION_FP32 && deviceProp.major >= 8;
-    cublas_compute = enable_tf32 ? CUBLAS_COMPUTE_32F_FAST_TF32 : cublas_compute;
+    // cublas_common.h defaults cublas_compute = CUBLAS_COMPUTE_32F for non-SF16_TRUE_FORWARD
+    // paths.  CUBLAS_COMPUTE_32F with BF16 I/O only has guaranteed kernel coverage for the
+    // "canonical" GPT-2 dimensions (768/2304/3072).  GQA-specific widths like 1280 hit
+    // "No cuBLASLt algorithm".  CUBLAS_COMPUTE_32F_FAST_16BF enables BF16 tensor-core kernels
+    // which cover any BF16-aligned dimension.  The SF16 clamping is applied *after* each
+    // matmul, so the intra-matmul accumulation precision doesn't need to be strict FP32.
+    //
+    // Exception: FP32 precision mode uses TF32 tensor cores on sm80+ instead.
+    if (PRECISION_MODE == PRECISION_FP32 && deviceProp.major >= 8) {
+        cublas_compute = CUBLAS_COMPUTE_32F_FAST_TF32;
+    } else {
+        cublas_compute = CUBLAS_COMPUTE_32F_FAST_16BF;
+    }
 
     int B = batch_size;
     int T = sequence_length;
