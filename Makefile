@@ -47,11 +47,19 @@ ifeq ($(OS),Windows_NT)
   NVCC_LDLIBS  = -lcublas -lcublasLt -lnvml
   NVCC_INCLUDES =
 else
-  NVCC ?= $(shell which nvcc 2>/dev/null || echo /usr/local/cuda/bin/nvcc)
+  # Prefer the nvcc that ships with the toolkit at /usr/local/cuda so that
+  # nvcc, libcudart, libcudadevrt, cublas, etc. all come from the SAME CUDA
+  # version.  Falls back to whatever is on PATH only if that doesn't exist.
+  # (The system PATH often points at an older nvcc, which mismatches with a
+  # newly installed /usr/local/cuda and causes "size does not match -m64"
+  # nvlink errors when linking libcudadevrt.a.)
+  ifneq ($(wildcard /usr/local/cuda/bin/nvcc),)
+    NVCC ?= /usr/local/cuda/bin/nvcc
+  else
+    NVCC ?= $(shell which nvcc 2>/dev/null || echo nvcc)
+  endif
   # -cudart=shared : link the CUDA runtime dynamically (libcudart.so) instead
-  #   of statically.  Avoids static-archive corruption issues in some toolkit
-  #   installs and reduces binary size.  Does NOT bypass libcudadevrt.a — if
-  #   that file is corrupt you still need to reinstall cuda-cudart-dev.
+  #   of statically.  Reduces sensitivity to static-archive ABI mismatches.
   NVCC_FLAGS = --threads=0 -t=0 --use_fast_math -std=c++17 -O3 -arch=sm_89 -cudart=shared
   # System CUDA headers FIRST (full BF16 support), then pip as fallback
   NVCC_INCLUDES = -I/usr/local/cuda/include \
