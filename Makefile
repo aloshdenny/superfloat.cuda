@@ -48,7 +48,11 @@ ifeq ($(OS),Windows_NT)
   NVCC_INCLUDES =
 else
   NVCC ?= $(shell which nvcc 2>/dev/null || echo /usr/local/cuda/bin/nvcc)
-  NVCC_FLAGS = --threads=0 -t=0 --use_fast_math -std=c++17 -O3 -arch=sm_89
+  # -cudart=shared : link the CUDA runtime dynamically (libcudart.so) instead
+  #   of statically.  Avoids static-archive corruption issues in some toolkit
+  #   installs and reduces binary size.  Does NOT bypass libcudadevrt.a — if
+  #   that file is corrupt you still need to reinstall cuda-cudart-dev.
+  NVCC_FLAGS = --threads=0 -t=0 --use_fast_math -std=c++17 -O3 -arch=sm_89 -cudart=shared
   # System CUDA headers FIRST (full BF16 support), then pip as fallback
   NVCC_INCLUDES = -I/usr/local/cuda/include \
                   -I/usr/include \
