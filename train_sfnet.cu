@@ -147,6 +147,51 @@ constexpr const size_t IO_BUF_SIZE = 32 * 1024 * 1024;
 static unsigned int g_last_sanitized_grad_count = 0;
 
 // ============================================================================
+// Local matmul wrappers
+// ----------------------------------------------------------------------------
+// The project's matmul.cuh no longer exposes the GPT-2-era matmul_forward_cublas
+// and matmul_backward_naive helpers; only matmul_forward_cublaslt and
+// matmul_backward exist now.  We need an accumulating-dinp variant for the
+// parallel-block backward path (gate/up/qkv all accumulate into the same
+// dl_rms1), so we wrap matmul_cublaslt directly with the same semantics as
+// the old matmul_backward_naive.
+// ============================================================================
+static inline void sfnet_matmul_forward(floatX *out,
+                                        const floatX *inp, const floatX *weight,
+                                        int B, int T, int C, int OC,
+                                        cudaStream_t stream) {
+    matmul_forward_cublaslt(out, (floatX *)inp, (floatX *)weight, /*bias=*/NULL,
+                            B, T, C, OC, stream, /*pre_gelu=*/NULL,
+                            /*gelu_fusion=*/1);
+}
+
+// Backward equivalent of matmul_forward_cublaslt:
+//   dinp[B,T,C]    = dout[B,T,OC] @ weight[OC,C]            (accumulate optional)
+//   dweight[OC,C] += dout[B,T,OC]^T @ inp[B,T,C]            (always accumulates)
+static inline void sfnet_matmul_backward(floatX *dinp, floatX *dweight,
+                                         floatX *dout, floatX *inp, floatX *weight,
+                                         int B, int T, int C, int OC,
+                                         bool accumulate_dinp,
+                                         cudaStream_t stream) {
+    if (dinp) {
+        matmul_cublaslt(dinp, weight, dout, /*bias=*/NULL,
+                        C, B * T, OC, stream,
+                        /*transA=*/false, /*transB=*/false,
+                        /*batch_count=*/0, 0, 0, 0,
+                        /*accumulate=*/accumulate_dinp,
+                        /*pre_gelu=*/NULL, /*backward=*/true);
+    }
+    if (dweight) {
+        matmul_cublaslt(dweight, inp, dout, /*bias=*/NULL,
+                        C, OC, B * T, stream,
+                        /*transA=*/false, /*transB=*/true,
+                        /*batch_count=*/0, 0, 0, 0,
+                        /*accumulate=*/true,
+                        /*pre_gelu=*/NULL, /*backward=*/true);
+    }
+}
+
+// ============================================================================
 // Config
 // ============================================================================
 typedef struct {
@@ -797,7 +842,7 @@ void sfnet_forward(SFNet *model, const int *inputs, size_t B, size_t T) {
         rmsnorm_forward(l_rms1, l_rms1r, x, l_rms1w, B, T, C, eps, main_stream);
 
         // 2b. Fused QKV projection
-        matmul_forward_cublas(l_qkv_pre, l_rms1, l_qkvw, B, T, C, (int)qkv_w, main_stream);
+        sfnet_matmul_forward(l_qkv_pre, l_rms1, l_qkvw, B, T, C, (int)qkv_w, main_stream);
 
         // 2c. Copy qkv_pre -> qkv_post so we can do in-place QK-Norm+RoPE on
         //     qkv_post while preserving qkv_pre for backward.
@@ -825,17 +870,17 @@ void sfnet_forward(SFNet *model, const int *inputs, size_t B, size_t T) {
                           B, T, C, NH, main_stream);
 
         // 2h. Attention output projection
-        matmul_forward_cublas(acts.attn_out, l_atty, l_attn_ow, B, T, C, C, main_stream);
+        sfnet_matmul_forward(acts.attn_out, l_atty, l_attn_ow, B, T, C, C, main_stream);
 
         // 2i. MLP gate & up projections (parallel branch — same x_norm)
-        matmul_forward_cublas(l_gate, l_rms1, l_gate_w, B, T, C, (int)FFN, main_stream);
-        matmul_forward_cublas(l_up,   l_rms1, l_up_w,   B, T, C, (int)FFN, main_stream);
+        sfnet_matmul_forward(l_gate, l_rms1, l_gate_w, B, T, C, (int)FFN, main_stream);
+        sfnet_matmul_forward(l_up,   l_rms1, l_up_w,   B, T, C, (int)FFN, main_stream);
 
         // 2j. Tanh-GLU
         tanh_glu_forward(l_glu, l_gate, l_up, B * T * FFN, main_stream);
 
         // 2k. MLP down projection
-        matmul_forward_cublas(acts.mlp_out, l_glu, l_down_w, B, T, (int)FFN, C, main_stream);
+        sfnet_matmul_forward(acts.mlp_out, l_glu, l_down_w, B, T, (int)FFN, C, main_stream);
 
         // 2l. Single norm-preserving scaled residual
         scaled_residual_3way_forward(x_next, x, acts.attn_out, acts.mlp_out,
@@ -848,7 +893,7 @@ void sfnet_forward(SFNet *model, const int *inputs, size_t B, size_t T) {
                     B, T, C, eps, main_stream);
 
     // 4. Tied LM head
-    matmul_forward_cublas(acts.output, acts.rms_f, params.wte, B, T, C, Vp, main_stream);
+    sfnet_matmul_forward(acts.output, acts.rms_f, params.wte, B, T, C, Vp, main_stream);
 }
 
 // ============================================================================
@@ -924,7 +969,7 @@ void sfnet_backward_and_reduce(SFNet *model, int *inputs, const int *targets,
     cudaCheck(cudaMemset(dresidual, 0, B * T * C * sizeof(floatX)));
 
     floatX *dl_rmsf = (floatX *)acts.scratch_btc2;      // (B,T,C)
-    matmul_backward_naive(dl_rmsf, grads.wte, acts.output, acts.rms_f, params.wte,
+    sfnet_matmul_backward(dl_rmsf, grads.wte, acts.output, acts.rms_f, params.wte,
                           B, T, C, Vp, false, main_stream);
 
     // 2. Backward through final RMSNorm
@@ -1013,21 +1058,21 @@ void sfnet_backward_and_reduce(SFNet *model, int *inputs, const int *targets,
 
         // ---- Backward MLP branch ----
         // d(down):   d_glu = d_mlp_branch @ down_w  ;  dl_down_w += d_mlp_branch^T @ glu
-        matmul_backward_naive(d_glu, dl_down_w, d_mlp_branch, l_glu, l_down_w,
+        sfnet_matmul_backward(d_glu, dl_down_w, d_mlp_branch, l_glu, l_down_w,
                               B, T, FFN, C, false, main_stream);
         // tanh-GLU backward → d_gate, d_up
         tanh_glu_backward(d_gate, d_up, d_glu, l_gate, l_up, B * T * FFN, main_stream);
 
         // d(gate proj): dl_rms1  = d_gate @ gate_w ; dl_gate_w += d_gate^T @ rms1
-        matmul_backward_naive(dl_rms1, dl_gate_w, d_gate, l_rms1, l_gate_w,
+        sfnet_matmul_backward(dl_rms1, dl_gate_w, d_gate, l_rms1, l_gate_w,
                               B, T, C, FFN, false, main_stream);
         // d(up   proj): dl_rms1 += d_up   @ up_w   ; dl_up_w   += d_up^T   @ rms1
-        matmul_backward_naive(dl_rms1, dl_up_w,   d_up,   l_rms1, l_up_w,
+        sfnet_matmul_backward(dl_rms1, dl_up_w,   d_up,   l_rms1, l_up_w,
                               B, T, C, FFN, true,  main_stream);
 
         // ---- Backward attention branch ----
         // d(attn output proj): d_atty = d_attn_branch @ attn_ow ; dl_attn_ow += d_attn_branch^T @ atty
-        matmul_backward_naive(d_atty, dl_attn_ow, d_attn_branch, l_atty, l_attn_ow,
+        sfnet_matmul_backward(d_atty, dl_attn_ow, d_attn_branch, l_atty, l_attn_ow,
                               B, T, C, C, false, main_stream);
 
         // attention backward:
@@ -1067,7 +1112,7 @@ void sfnet_backward_and_reduce(SFNet *model, int *inputs, const int *targets,
                                (int)NH, (int)HD, main_stream);
 
         // QKV proj backward:  dl_rms1 += d_qkv_compact @ qkvw  ;  dl_qkvw += d_qkv_compact^T @ rms1
-        matmul_backward_naive(dl_rms1, dl_qkvw, d_qkv_compact, l_rms1, l_qkvw,
+        sfnet_matmul_backward(dl_rms1, dl_qkvw, d_qkv_compact, l_rms1, l_qkvw,
                               B, T, C, (int)qkv_w, true, main_stream);
 
         // ---- Backward pre-block RMSNorm ----
@@ -1323,7 +1368,6 @@ int main(int argc, char *argv[]) {
     (void)inference_only;
     if (tensorcores) cudaCheck(cudaDeviceSetLimit(cudaLimitDevRuntimeSyncDepth, 1));
     cublasCheck(cublasLtCreate(&cublaslt_handle));
-    cublasCheck(cublasCreate(&cublas_handle));
     cudaCheck(cudaMalloc(&cublaslt_workspace, cublaslt_workspace_size));
 
     bool enable_tf32 = PRECISION_MODE == PRECISION_FP32 && deviceProp.major >= 8;
