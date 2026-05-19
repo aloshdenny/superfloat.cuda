@@ -1,5 +1,5 @@
 # ===============================
-# Compiler settings
+# Compiler settings (CPU / Windows legacy)
 # ===============================
 CC ?= cl
 CFLAGS = /Idev /Zi /nologo /W4 /WX- /diagnostics:column /sdl /O2 /Oi /Ot /GL /D _DEBUG /D _CONSOLE /D _UNICODE /D UNICODE /Gm- /EHsc /MD /GS /Gy /fp:fast /Zc:wchar_t /Zc:forScope /Zc:inline /permissive- \
@@ -7,16 +7,12 @@ CFLAGS = /Idev /Zi /nologo /W4 /WX- /diagnostics:column /sdl /O2 /Oi /Ot /GL /D 
 LDFLAGS =
 LDLIBS =
 INCLUDES =
-CFLAGS_COND =
 
 # ===============================
 # CUDA / NVCC settings
 # ===============================
-FORCE_NVCC_O ?= 3
-NVCC_CUDNN =
-
 USE_CUDNN ?= 0
-BUILD_DIR = build
+BUILD_DIR  = build
 
 # ===============================
 # Windows / Linux setup
@@ -24,15 +20,15 @@ BUILD_DIR = build
 ifeq ($(OS),Windows_NT)
   $(shell if not exist $(BUILD_DIR) mkdir $(BUILD_DIR))
   REMOVE_BUILD_OBJECT_FILES := del $(BUILD_DIR)\*.obj
-  REMOVE_FILES = del *.exe *.obj *.lib *.exp *.pdb
-  OUTPUT_FILE = /link /OUT:$@
+  REMOVE_FILES    = del *.exe *.obj *.lib *.exp *.pdb
+  OUTPUT_FILE     = /link /OUT:$@
   CUDA_OUTPUT_FILE = -o $@ && copy /Y $@.exe $@
   OBJ_EXT = obj
 else
   $(shell mkdir -p $(BUILD_DIR))
   REMOVE_BUILD_OBJECT_FILES := rm -f $(BUILD_DIR)/*.o
-  REMOVE_FILES = rm -f
-  OUTPUT_FILE = -o $@
+  REMOVE_FILES    = rm -f
+  OUTPUT_FILE     = -o $@
   CUDA_OUTPUT_FILE = -o $@
   OBJ_EXT = o
 endif
@@ -41,48 +37,42 @@ endif
 # NVCC path (Windows / Linux)
 # ===============================
 ifeq ($(OS),Windows_NT)
-  NVCC ?= "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.1\bin\nvcc.exe"
-  NVCC_FLAGS = --threads=0 -t=0 --use_fast_math -std=c++17 -O$(FORCE_NVCC_O) -arch=sm_89
-  NVCC_LDFLAGS =
-  NVCC_LDLIBS  = -lcublas -lcublasLt -lnvml
+  NVCC         := "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.1\bin\nvcc.exe"
+  NVCC_FLAGS    = --threads=0 -t=0 --use_fast_math -std=c++17 -O3 -arch=sm_89
+  NVCC_LDFLAGS  =
+  NVCC_LDLIBS   = -lcublas -lcublasLt -lnvml
   NVCC_INCLUDES =
 else
-  # Prefer the nvcc that ships with the toolkit at /usr/local/cuda so that
-  # nvcc, libcudart, libcudadevrt, cublas, etc. all come from the SAME CUDA
-  # version.  Falls back to whatever is on PATH only if that doesn't exist.
-  # (The system PATH often points at an older nvcc, which mismatches with a
-  # newly installed /usr/local/cuda and causes "size does not match -m64"
-  # nvlink errors when linking libcudadevrt.a.)
-  ifneq ($(wildcard /usr/local/cuda/bin/nvcc),)
-    NVCC ?= /usr/local/cuda/bin/nvcc
-  else
-    NVCC ?= $(shell which nvcc 2>/dev/null || echo nvcc)
-  endif
-  # -cudart=shared : link the CUDA runtime dynamically (libcudart.so) instead
-  #   of statically.  Reduces sensitivity to static-archive ABI mismatches.
-  NVCC_FLAGS = --threads=0 -t=0 --use_fast_math -std=c++17 -O3 -arch=sm_89 -cudart=shared
-  # System CUDA headers FIRST (full BF16 support), then pip as fallback
-  NVCC_INCLUDES = -I/usr/local/cuda/include \
+  # Pin to the CUDA 13.0 toolkit so nvcc, nvlink, libcudadevrt, cublas, etc.
+  # all come from the same release — avoids "size does not match -m64" errors
+  # when the system PATH nvcc is a different version.
+  NVCC := /usr/local/cuda-13.0/bin/nvcc
+
+  # -cudart=shared: dynamic CUDA runtime linkage, avoids static-archive ABI issues.
+  NVCC_FLAGS    = --threads=0 -t=0 --use_fast_math -std=c++17 -O3 -arch=sm_89 -cudart=shared
+
+  NVCC_INCLUDES = -I/usr/local/cuda-13.0/include \
                   -I/usr/include \
                   -I/usr/local/lib/python3.12/site-packages/nvidia/cublas/include \
                   -I/usr/local/lib/python3.12/site-packages/nvidia/cudart/include \
                   -I/usr/local/lib/python3.12/site-packages/nvidia/nvtx/include \
                   -I/usr/local/lib/python3.12/site-packages/nvidia/cudnn/include
-  # Link against local shim directory first.
-  # Pass rpath via -Xlinker (NOT -Wl,...) so runtime can find libs next to the binary.
-  NVCC_LDFLAGS = -L. -Xlinker -rpath -Xlinker \$$ORIGIN
-  # On Linux architectures like x86_64, common lib paths are needed
-  NVCC_LDFLAGS += -L/usr/local/cuda/lib64 -L/usr/local/lib -L/usr/lib/x86_64-linux-gnu -L/usr/local/lib/python3.12/site-packages/nvidia/cudnn/lib
-  NVCC_LDLIBS  = -lcublas -lcublasLt -lnvml
+
+  NVCC_LDFLAGS  = -L. -Xlinker -rpath -Xlinker \$$ORIGIN
+  NVCC_LDFLAGS += -L/usr/local/cuda-13.0/lib64 -L/usr/local/lib \
+                  -L/usr/lib/x86_64-linux-gnu \
+                  -L/usr/local/lib/python3.12/site-packages/nvidia/cudnn/lib
+
+  NVCC_LDLIBS   = -lcublas -lcublasLt -lnvml
 endif
 
 # ===============================
-# cuDNN (Windows / Linux)
+# cuDNN (optional, USE_CUDNN=1)
 # ===============================
+NVCC_CUDNN =
 ifeq ($(USE_CUDNN),1)
 
 ifeq ($(OS),Windows_NT)
-
   ifeq ($(shell if exist "$(HOMEDRIVE)$(HOMEPATH)\cudnn-frontend\include" (echo exists)),exists)
     CUDNN_FRONTEND_PATH = $(HOMEDRIVE)$(HOMEPATH)\cudnn-frontend\include
   else ifeq ($(shell if exist "cudnn-frontend\include" (echo exists)),exists)
@@ -90,12 +80,9 @@ ifeq ($(OS),Windows_NT)
   else
     $(error [ERROR] cuDNN frontend not found. See README)
   endif
-
   CUDNN_INCLUDE_PATH = -I"C:\Program Files\NVIDIA\CUDNN\v9.17\include\13.1"
   CUDNN_LIB_PATH     = -L"C:\Program Files\NVIDIA\CUDNN\v9.17\lib\13.1\x64"
-
-else  # ===== Linux =====
-
+else
   ifeq ($(shell test -d $$HOME/cudnn-frontend/include && echo exists),exists)
     CUDNN_FRONTEND_PATH = $(HOME)/cudnn-frontend/include
   else ifeq ($(shell test -d cudnn-frontend/include && echo exists),exists)
@@ -103,211 +90,100 @@ else  # ===== Linux =====
   else
     $(error [ERROR] cuDNN frontend not found. See README)
   endif
-
-  # Check common locations for cuDNN headers
   ifneq ($(wildcard /usr/include/cudnn.h),)
     CUDNN_INCLUDE_PATH = -I/usr/include
-  else ifneq ($(wildcard /usr/local/cuda/include/cudnn.h),)
-    CUDNN_INCLUDE_PATH = -I/usr/local/cuda/include
+  else ifneq ($(wildcard /usr/local/cuda-13.0/include/cudnn.h),)
+    CUDNN_INCLUDE_PATH = -I/usr/local/cuda-13.0/include
   else ifneq ($(wildcard /usr/local/lib/python3.12/site-packages/nvidia/cudnn/include/cudnn.h),)
     CUDNN_INCLUDE_PATH = -I/usr/local/lib/python3.12/site-packages/nvidia/cudnn/include
-  else ifneq ($(wildcard /usr/local/lib/python3.11/site-packages/nvidia/cudnn/include/cudnn.h),)
-    CUDNN_INCLUDE_PATH = -I/usr/local/lib/python3.11/site-packages/nvidia/cudnn/include
-  else ifneq ($(wildcard /usr/local/lib/python3.10/site-packages/nvidia/cudnn/include/cudnn.h),)
-    CUDNN_INCLUDE_PATH = -I/usr/local/lib/python3.10/site-packages/nvidia/cudnn/include
-  else ifneq ($(wildcard /usr/local/lib/python3.12/site-packages/nvidia/cudnn_cu12/include/cudnn.h),)
-    CUDNN_INCLUDE_PATH = -I/usr/local/lib/python3.12/site-packages/nvidia/cudnn_cu12/include
   else
-    # Fallback to general include path; compiler might still find it if in standard paths
     CUDNN_INCLUDE_PATH = -I/usr/local/include
   endif
-
-  # Check common locations for cuDNN libraries
   ifneq ($(wildcard /usr/lib/x86_64-linux-gnu/libcudnn.so),)
     CUDNN_LIB_PATH = -L/usr/lib/x86_64-linux-gnu
-  else ifneq ($(wildcard /usr/local/cuda/lib64/libcudnn.so),)
-    CUDNN_LIB_PATH = -L/usr/local/cuda/lib64
   else ifneq ($(wildcard /usr/local/lib/python3.12/site-packages/nvidia/cudnn/lib/libcudnn.so.9),)
     CUDNN_LIB_PATH = -L/usr/local/lib/python3.12/site-packages/nvidia/cudnn/lib
-  else ifneq ($(wildcard /usr/local/lib/python3.12/site-packages/nvidia/cudnn/lib/libcudnn.so.8),)
-    CUDNN_LIB_PATH = -L/usr/local/lib/python3.12/site-packages/nvidia/cudnn/lib
   endif
-
 endif
 
   NVCC_INCLUDES += -I$(CUDNN_FRONTEND_PATH) $(CUDNN_INCLUDE_PATH)
   NVCC_LDFLAGS  += $(CUDNN_LIB_PATH)
   NVCC_LDLIBS   += -lcudnn
   NVCC_FLAGS    += -DENABLE_CUDNN
-
-  NVCC_CUDNN = $(BUILD_DIR)/cudnn_att.$(OBJ_EXT)
+  NVCC_CUDNN     = $(BUILD_DIR)/cudnn_att.$(OBJ_EXT)
 
 else
-  $(info → cuDNN disabled by default. Run make USE_CUDNN=1 to enable)
+  $(info → cuDNN disabled. Run make USE_CUDNN=1 to enable.)
 endif
 
 # ===============================
-# Precision settings
+# SF16 / Q1.15 — always on
+# Every model is trained in strict SF16 forward / BF16 backward mode.
 # ===============================
-PRECISION ?= BF16
-VALID_PRECISIONS := FP32 FP16 BF16
-ifeq ($(filter $(PRECISION),$(VALID_PRECISIONS)),)
-  $(error Invalid precision $(PRECISION), valid precisions are $(VALID_PRECISIONS))
-endif
-
-ifeq ($(PRECISION),FP32)
-  PFLAGS = -DENABLE_FP32
-else ifeq ($(PRECISION),FP16)
-  PFLAGS = -DENABLE_FP16
-else
-  PFLAGS = -DENABLE_BF16
-endif
+SF16FLAGS = -DENABLE_BF16 -DENABLE_Q115 -DSF16_TRUE_FORWARD=1
 
 # ===============================
-# Targets
+# Phony targets
 # ===============================
-TARGETS = train_gpt2 test_gpt2 train_gpt2cu train_gpt2rawcu train_gpt3cu test_gpt2cu train_gpt2fp32cu test_gpt2fp32cu $(NVCC_CUDNN)
+.PHONY: all clean libsyms \
+        train_gpt2 train_gpt3 train_sfnet train_llama32_1B train_llama32_3B
 
-TARGETS_Q131 = train_gpt2q131cu train_gpt3q131cu
-TARGETS_Q115 = train_gpt2q115cu train_gpt3q115cu
-TARGETS_Q115_CONSTRAINED = train_gpt2q115_constrainedcu
-TARGETS_LLAMA32 = train_llama32_1Bcu train_llama32_3Bcu train_llama32_1Bq115cu train_llama32_3Bq115cu
-TARGETS_SFNET = train_sfnetcu train_sfnetq115cu
-
-.PHONY: all clean libsyms run q131 q115 q115_constrained llama32 sfnet
-all: $(TARGETS)
-q131: $(TARGETS_Q131)
-q115: $(TARGETS_Q115)
-q115_constrained: $(TARGETS_Q115_CONSTRAINED)
-llama32: $(TARGETS_LLAMA32)
-sfnet: $(TARGETS_SFNET)
+all: train_gpt2 train_gpt3 train_sfnet train_llama32_1B train_llama32_3B
 
 # ===============================
-# Linux library symlinks
-# (no-op on Windows)
+# Linux library symlinks (no-op on Windows)
 # ===============================
 ifneq ($(OS),Windows_NT)
 libsyms:
-	@# Prefer system CUDA toolkit cuBLAS (full algorithm support for BF16 Tensor Cores).
-	@# Fall back to pip-installed cuBLAS if system libs don't exist.
-	@if [ -f /usr/local/cuda/lib64/libcublas.so.12 ]; then \
-		ln -sf /usr/local/cuda/lib64/libcublas.so.12    ./libcublas.so.12; \
-		echo "Linked system cuBLAS (full BF16 support)"; \
+	@if [ -f /usr/local/cuda-13.0/lib64/libcublas.so.12 ]; then \
+		ln -sf /usr/local/cuda-13.0/lib64/libcublas.so.12    ./libcublas.so.12; \
+		echo "Linked CUDA 13.0 cuBLAS"; \
 	else \
 		ln -sf /usr/local/lib/python3.12/site-packages/nvidia/cublas/lib/libcublas.so.12 ./libcublas.so.12; \
-		echo "Linked pip cuBLAS (limited BF16 support)"; \
+		echo "Linked pip cuBLAS (fallback)"; \
 	fi
-	ln -sf ./libcublas.so.12                                                            ./libcublas.so
-	@if [ -f /usr/local/cuda/lib64/libcublasLt.so.12 ]; then \
-		ln -sf /usr/local/cuda/lib64/libcublasLt.so.12  ./libcublasLt.so.12; \
+	ln -sf ./libcublas.so.12 ./libcublas.so
+	@if [ -f /usr/local/cuda-13.0/lib64/libcublasLt.so.12 ]; then \
+		ln -sf /usr/local/cuda-13.0/lib64/libcublasLt.so.12  ./libcublasLt.so.12; \
 	else \
 		ln -sf /usr/local/lib/python3.12/site-packages/nvidia/cublas/lib/libcublasLt.so.12 ./libcublasLt.so.12; \
 	fi
-	ln -sf ./libcublasLt.so.12                                                          ./libcublasLt.so
-	ln -sf /usr/lib/x86_64-linux-gnu/libnvidia-ml.so.1                                   ./libnvml.so.1
-	ln -sf ./libnvml.so.1                                                               ./libnvml.so
+	ln -sf ./libcublasLt.so.12 ./libcublasLt.so
+	ln -sf /usr/lib/x86_64-linux-gnu/libnvidia-ml.so.1 ./libnvml.so.1
+	ln -sf ./libnvml.so.1 ./libnvml.so
 else
 libsyms: ;
 endif
 
 # ===============================
-# CPU targets
-# ===============================
-train_gpt2: train_gpt2.c
-	$(CC) $(CFLAGS) $(INCLUDES) $(LDFLAGS) $^ $(LDLIBS) $(OUTPUT_FILE)
-
-test_gpt2: test_gpt2.c
-	$(CC) $(CFLAGS) $(INCLUDES) $(LDFLAGS) $^ $(LDLIBS) $(OUTPUT_FILE)
-
-# ===============================
-# CUDA targets
+# cuDNN object (built only when USE_CUDNN=1)
 # ===============================
 $(NVCC_CUDNN): llmc/cudnn_att.cpp
-	$(NVCC) -c $(NVCC_FLAGS) $(PFLAGS) $< $(NVCC_INCLUDES) -o $@
-
-train_gpt2cu: train_gpt2.cu libsyms $(NVCC_CUDNN)
-	$(NVCC) $(NVCC_FLAGS) $(PFLAGS) $(NVCC_INCLUDES) $< $(NVCC_CUDNN) $(NVCC_LDFLAGS) $(NVCC_LDLIBS) $(CUDA_OUTPUT_FILE)
-
-train_gpt2rawcu: train_gpt2_raw.cu libsyms $(NVCC_CUDNN)
-	$(NVCC) $(NVCC_FLAGS) $(PFLAGS) $(NVCC_INCLUDES) $< $(NVCC_CUDNN) $(NVCC_LDFLAGS) $(NVCC_LDLIBS) $(CUDA_OUTPUT_FILE)
-
-train_gpt3cu: train_gpt3.cu libsyms $(NVCC_CUDNN)
-	$(NVCC) $(NVCC_FLAGS) $(PFLAGS) $(NVCC_INCLUDES) $< $(NVCC_CUDNN) $(NVCC_LDFLAGS) $(NVCC_LDLIBS) $(CUDA_OUTPUT_FILE)
-
-train_gpt2fp32cu: train_gpt2_fp32.cu libsyms
-	$(NVCC) $(NVCC_FLAGS) $(NVCC_INCLUDES) $< $(NVCC_LDFLAGS) $(NVCC_LDLIBS) $(CUDA_OUTPUT_FILE)
-
-test_gpt2cu: test_gpt2.cu libsyms $(NVCC_CUDNN)
-	$(NVCC) $(NVCC_FLAGS) $(PFLAGS) $(NVCC_INCLUDES) $< $(NVCC_CUDNN) $(NVCC_LDFLAGS) $(NVCC_LDLIBS) $(CUDA_OUTPUT_FILE)
-
-test_gpt2fp32cu: test_gpt2_fp32.cu libsyms
-	$(NVCC) $(NVCC_FLAGS) $(NVCC_INCLUDES) $< $(NVCC_LDFLAGS) $(NVCC_LDLIBS) $(CUDA_OUTPUT_FILE)
-
-profile_gpt2cu: profile_gpt2.cu libsyms $(NVCC_CUDNN)
-	$(NVCC) $(NVCC_FLAGS) $(PFLAGS) -lineinfo $(NVCC_INCLUDES) $< $(NVCC_CUDNN) $(NVCC_LDFLAGS) $(NVCC_LDLIBS) $(CUDA_OUTPUT_FILE)
+	$(NVCC) -c $(NVCC_FLAGS) $(SF16FLAGS) $< $(NVCC_INCLUDES) -o $@
 
 # ===============================
-# Quantized CUDA targets (Q1.31)
+# Model targets — all SF16
 # ===============================
-train_gpt2q131cu: train_gpt2.cu libsyms $(NVCC_CUDNN)
-	$(NVCC) $(NVCC_FLAGS) $(PFLAGS) -DENABLE_Q131 -DFIXED_POINT_Q31 $(NVCC_INCLUDES) $< $(NVCC_CUDNN) $(NVCC_LDFLAGS) $(NVCC_LDLIBS) $(CUDA_OUTPUT_FILE)
+train_gpt2: train_gpt2.cu libsyms $(NVCC_CUDNN)
+	$(NVCC) $(NVCC_FLAGS) $(SF16FLAGS) $(NVCC_INCLUDES) $< $(NVCC_CUDNN) $(NVCC_LDFLAGS) $(NVCC_LDLIBS) $(CUDA_OUTPUT_FILE)
 
-train_gpt3q131cu: train_gpt3.cu libsyms $(NVCC_CUDNN)
-	$(NVCC) $(NVCC_FLAGS) $(PFLAGS) -DENABLE_Q131 -DFIXED_POINT_Q31 $(NVCC_INCLUDES) $< $(NVCC_CUDNN) $(NVCC_LDFLAGS) $(NVCC_LDLIBS) $(CUDA_OUTPUT_FILE)
+train_gpt3: train_gpt3.cu libsyms $(NVCC_CUDNN)
+	$(NVCC) $(NVCC_FLAGS) $(SF16FLAGS) $(NVCC_INCLUDES) $< $(NVCC_CUDNN) $(NVCC_LDFLAGS) $(NVCC_LDLIBS) $(CUDA_OUTPUT_FILE)
 
-# ===============================
-# Quantized CUDA targets (Q1.15)
-# ===============================
-train_gpt2q115cu: train_gpt2.cu libsyms $(NVCC_CUDNN)
-	$(NVCC) $(NVCC_FLAGS) $(PFLAGS) -DENABLE_Q115 -DSF16_TRUE_FORWARD=1 $(NVCC_INCLUDES) $< $(NVCC_CUDNN) $(NVCC_LDFLAGS) $(NVCC_LDLIBS) $(CUDA_OUTPUT_FILE)
+train_sfnet: train_sfnet.cu libsyms
+	$(NVCC) $(NVCC_FLAGS) $(SF16FLAGS) $(NVCC_INCLUDES) $< $(NVCC_LDFLAGS) $(NVCC_LDLIBS) $(CUDA_OUTPUT_FILE)
 
-train_gpt3q115cu: train_gpt3.cu libsyms $(NVCC_CUDNN)
-	$(NVCC) $(NVCC_FLAGS) $(PFLAGS) -DENABLE_Q115 -DSF16_TRUE_FORWARD=1 $(NVCC_INCLUDES) $< $(NVCC_CUDNN) $(NVCC_LDFLAGS) $(NVCC_LDLIBS) $(CUDA_OUTPUT_FILE)
+train_llama32_1B: train_llama32_1B.cu libsyms
+	$(NVCC) $(NVCC_FLAGS) $(SF16FLAGS) $(NVCC_INCLUDES) $< $(NVCC_LDFLAGS) $(NVCC_LDLIBS) $(CUDA_OUTPUT_FILE)
 
-# ===============================
-# Q1.15 Weight-Constrained CUDA
-# ===============================
-train_gpt2q115_constrainedcu: train_gpt2.cu libsyms $(NVCC_CUDNN)
-	$(NVCC) $(NVCC_FLAGS) $(PFLAGS) -DENABLE_Q115 -DENABLE_Q115_WEIGHT_CONSTRAINT -DSF16_TRUE_FORWARD=1 $(NVCC_INCLUDES) $< $(NVCC_CUDNN) $(NVCC_LDFLAGS) $(NVCC_LDLIBS) $(CUDA_OUTPUT_FILE)
-
-# ===============================
-# LLaMA 3.2 CUDA targets
-# ===============================
-train_llama32_1Bcu: train_llama32_1B.cu libsyms
-	$(NVCC) $(NVCC_FLAGS) $(PFLAGS) $(NVCC_INCLUDES) $< $(NVCC_LDFLAGS) $(NVCC_LDLIBS) $(CUDA_OUTPUT_FILE)
-
-train_llama32_1Bq115cu: train_llama32_1B.cu libsyms
-	$(NVCC) $(NVCC_FLAGS) $(PFLAGS) -DENABLE_Q115 -DSF16_TRUE_FORWARD=1 $(NVCC_INCLUDES) $< $(NVCC_LDFLAGS) $(NVCC_LDLIBS) $(CUDA_OUTPUT_FILE)
-
-train_llama32_3Bcu: train_llama32_3B.cu libsyms
-	$(NVCC) $(NVCC_FLAGS) $(PFLAGS) $(NVCC_INCLUDES) $< $(NVCC_LDFLAGS) $(NVCC_LDLIBS) $(CUDA_OUTPUT_FILE)
-
-train_llama32_3Bq115cu: train_llama32_3B.cu libsyms
-	$(NVCC) $(NVCC_FLAGS) $(PFLAGS) -DENABLE_Q115 -DSF16_TRUE_FORWARD=1 $(NVCC_INCLUDES) $< $(NVCC_LDFLAGS) $(NVCC_LDLIBS) $(CUDA_OUTPUT_FILE)
-
-# ===============================
-# SFNet CUDA targets
-#   train_sfnetcu       : BF16 baseline
-#   train_sfnetq115cu   : strict SF16 forward / BF16 backward (Q1.15 true-forward)
-# ===============================
-train_sfnetcu: train_sfnet.cu libsyms
-	$(NVCC) $(NVCC_FLAGS) $(PFLAGS) $(NVCC_INCLUDES) $< $(NVCC_LDFLAGS) $(NVCC_LDLIBS) $(CUDA_OUTPUT_FILE)
-
-train_sfnetq115cu: train_sfnet.cu libsyms
-	$(NVCC) $(NVCC_FLAGS) $(PFLAGS) -DENABLE_Q115 -DSF16_TRUE_FORWARD=1 $(NVCC_INCLUDES) $< $(NVCC_LDFLAGS) $(NVCC_LDLIBS) $(CUDA_OUTPUT_FILE)
-
-# ===============================
-# Convenience run (Linux only)
-# ===============================
-run: train_gpt2cu
-	./train_gpt2cu --help
+train_llama32_3B: train_llama32_3B.cu libsyms
+	$(NVCC) $(NVCC_FLAGS) $(SF16FLAGS) $(NVCC_INCLUDES) $< $(NVCC_LDFLAGS) $(NVCC_LDLIBS) $(CUDA_OUTPUT_FILE)
 
 # ===============================
 # Clean
 # ===============================
 clean:
-	$(REMOVE_FILES) train_gpt2cu train_gpt3cu train_gpt2fp32cu train_gpt2q131cu train_gpt2q115cu \
-	      train_llama32_1Bcu train_llama32_1Bq115cu train_llama32_3Bcu train_llama32_3Bq115cu \
-	      train_sfnetcu train_sfnetq115cu *.o \
-	      libcublas.so libcublas.so.12 libcublasLt.so libcublasLt.so.12 libnvml.so libnvml.so.1
+	$(REMOVE_FILES) train_gpt2 train_gpt3 train_sfnet train_llama32_1B train_llama32_3B \
+	                libcublas.so libcublas.so.12 libcublasLt.so libcublasLt.so.12 \
+	                libnvml.so libnvml.so.1 *.o
 	$(REMOVE_BUILD_OBJECT_FILES)
