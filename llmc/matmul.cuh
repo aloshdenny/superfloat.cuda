@@ -32,6 +32,8 @@ Matrix Multiplication, with help from cuBLASLt
 #if defined(SF16_TRUE_FORWARD)
 #include "q131_common.cuh"
 #endif
+#elif defined(ENABLE_Q131)
+#include "q131_common.cuh"
 #endif
 
 // ----------------------------------------------------------------------------
@@ -248,6 +250,26 @@ void matmul_cublaslt(floatX *d, const floatX *a, const floatX *b,
   cublasCheck(cublasLtMatmulPreferenceSetAttribute(
       preference, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
       &cublaslt_workspace_size, sizeof(cublaslt_workspace_size)));
+  // Relax the default 256-byte alignment requirement on A/B/C/D.  cuBLASLt's
+  // heuristic rejects all algorithms whose tile stride doesn't satisfy that
+  // alignment for *every* leading dimension, which silently filters out the
+  // entire algo pool for non-canonical OC widths (1024/1280/1536).  Our
+  // floatX tensors are guaranteed 16-byte aligned only, so use that.
+  {
+    uint32_t min_align = 16;
+    cublasCheck(cublasLtMatmulPreferenceSetAttribute(
+        preference, CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_A_BYTES, &min_align,
+        sizeof(min_align)));
+    cublasCheck(cublasLtMatmulPreferenceSetAttribute(
+        preference, CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_B_BYTES, &min_align,
+        sizeof(min_align)));
+    cublasCheck(cublasLtMatmulPreferenceSetAttribute(
+        preference, CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_C_BYTES, &min_align,
+        sizeof(min_align)));
+    cublasCheck(cublasLtMatmulPreferenceSetAttribute(
+        preference, CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_D_BYTES, &min_align,
+        sizeof(min_align)));
+  }
 
   // setup epilogue and associated pointers for bias & gelu
   cublasLtEpilogue_t epilogue;
@@ -300,9 +322,75 @@ void matmul_cublaslt(floatX *d, const floatX *a, const floatX *b,
   cublasLtMatmulAlgoGetHeuristic(cublaslt_handle, operationDesc, ALayout,
                                  BLayout, CLayout, DLayout, preference, 1,
                                  &heuristic, &returnedResults);
+  // The heuristic is conservative: it returns 0 results for any dimension
+  // triple that doesn't match a known tile-optimized kernel (e.g. GQA's
+  // qkv_w=1280 or non-canonical OC widths).  Fall back to enumerating the
+  // full algorithm registry for the given (compute, scale, A, B, C, D) tuple
+  // and pick the first one that survives algo-check.
   if (returnedResults == 0) {
-    printf("No cuBLASLt algorithm: m: %d, n: %d, k: %d, bias: %d\n", n, m, k,
-           has_bias);
+    const cudaDataType_t io_type = CUBLAS_LOWP;
+    const cudaDataType_t c_type =
+        (sizeof(floatX) == 1) ? CUDA_R_16BF : CUBLAS_LOWP;
+    int algo_ids[64] = {0};
+    int num_ids = 0;
+    cublasStatus_t ids_st = cublasLtMatmulAlgoGetIds(
+        cublaslt_handle, cublas_compute, CUDA_R_32F, io_type, io_type, c_type,
+        io_type, 64, algo_ids, &num_ids);
+    if (ids_st == CUBLAS_STATUS_SUCCESS) {
+      for (int i = 0; i < num_ids && returnedResults == 0; ++i) {
+        cublasLtMatmulAlgo_t cand;
+        if (cublasLtMatmulAlgoInit(cublaslt_handle, cublas_compute, CUDA_R_32F,
+                                   io_type, io_type, c_type, io_type,
+                                   algo_ids[i],
+                                   &cand) != CUBLAS_STATUS_SUCCESS) {
+          continue;
+        }
+        cublasLtMatmulHeuristicResult_t res = {};
+        cublasStatus_t check_st = cublasLtMatmulAlgoCheck(
+            cublaslt_handle, operationDesc, ALayout, BLayout, CLayout, DLayout,
+            &cand, &res);
+        if (check_st == CUBLAS_STATUS_SUCCESS &&
+            res.state == CUBLAS_STATUS_SUCCESS &&
+            res.workspaceSize <= cublaslt_workspace_size) {
+          heuristic = res;
+          returnedResults = 1;
+        }
+      }
+    }
+  }
+  // Last-resort fallback: cuBLASLt has no kernel for this dim triple.  Use
+  // cublasGemmEx (cuBLAS v2 API), which has a separate kernel registry and
+  // works for GQA-style "in-between" widths (e.g. OC=1536 with K=768) that
+  // cuBLASLt rejects.  Only supported when there is no bias/gelu epilogue
+  // and no batched stride (i.e. the simple matmul case SFNet uses).
+  bool used_v2_fallback = false;
+  if (returnedResults == 0 && !has_bias && !has_gelu && batch_count == 0) {
+    static cublasHandle_t cublas_v2_handle = nullptr;
+    if (cublas_v2_handle == nullptr) {
+      cublasCheck(cublasCreate(&cublas_v2_handle));
+      cublasCheck(cublasSetMathMode(cublas_v2_handle, CUBLAS_DEFAULT_MATH));
+    }
+    cublasCheck(cublasSetStream(cublas_v2_handle, stream));
+    cublasOperation_t opA = transA ? CUBLAS_OP_T : CUBLAS_OP_N;
+    cublasOperation_t opB = transB ? CUBLAS_OP_T : CUBLAS_OP_N;
+    int lda = transA ? k : m;
+    int ldb = transB ? n : k;
+    int ldc = m;
+    const float alpha_v2 = 1.0f;
+    const float beta_v2 = accumulate ? 1.0f : 0.0f;
+    cublasStatus_t v2_st = cublasGemmEx(
+        cublas_v2_handle, opA, opB, m, n, k, &alpha_v2, a, CUBLAS_LOWP, lda, b,
+        CUBLAS_LOWP, ldb, &beta_v2, d, CUBLAS_LOWP, ldc, cublas_compute,
+        CUBLAS_GEMM_DEFAULT);
+    if (v2_st == CUBLAS_STATUS_SUCCESS) {
+      used_v2_fallback = true;
+      returnedResults = 1;  // signal success so we skip the Lt call below
+    }
+  }
+  if (returnedResults == 0) {
+    printf("No cuBLASLt algorithm: m: %d, n: %d, k: %d, bias: %d, "
+           "transA: %d, transB: %d\n",
+           m, n, k, has_bias, transA, transB);
     exit(EXIT_FAILURE);
   }
 
@@ -310,11 +398,13 @@ void matmul_cublaslt(floatX *d, const floatX *a, const floatX *b,
   // in algorithm selection (?!)
   const float alpha = 1.0f, beta = accumulate ? 1.0f : 0.0f;
 
-  // call the matmul natively on bfloat16
-  cublasCheck(cublasLtMatmul(cublaslt_handle, operationDesc, &alpha, a, ALayout,
-                             b, BLayout, &beta, d, CLayout, d, DLayout,
-                             &heuristic.algo, cublaslt_workspace,
-                             cublaslt_workspace_size, stream));
+  // call the matmul natively on bfloat16 (skip if v2 fallback already ran)
+  if (!used_v2_fallback) {
+    cublasCheck(cublasLtMatmul(cublaslt_handle, operationDesc, &alpha, a, ALayout,
+                               b, BLayout, &beta, d, CLayout, d, DLayout,
+                               &heuristic.algo, cublaslt_workspace,
+                               cublaslt_workspace_size, stream));
+  }
 
 #if defined(ENABLE_Q115)
   // For Q1.15 forward simulation, restrict outputs to valid SF16 bounds.
