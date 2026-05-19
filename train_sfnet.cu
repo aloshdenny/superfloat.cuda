@@ -147,113 +147,173 @@ constexpr const size_t IO_BUF_SIZE = 32 * 1024 * 1024;
 static unsigned int g_last_sanitized_grad_count = 0;
 
 // ============================================================================
-// Local matmul wrappers for SFNet.
+// Local matmul wrappers for SFNet — fully cuBLAS-free.
 // ----------------------------------------------------------------------------
-// cuBLASLt only has pre-registered kernels for specific (m, n, k) triples.
-// With B=4, T=1024 → n=4096, any OC > C (e.g. 2304=3*C for qkv_w/ffn_dim)
-// causes the heuristic to return 0 algorithms → program exit.
+// cuBLASLt's kernel registry on this system has zero coverage for n=B*T=4096
+// (B=4, T=1024) — both OC=C=768 and OC=2304 return "No algorithm".
+// cublasSgemm with FP32 also fails (execution_failed).  Therefore SFNet uses
+// self-contained tiled CUDA kernels for every forward and backward matmul.
 //
-// Strategy:
-//  • OC == C  → cuBLASLt (canonical width, always works).
-//  • OC  > C  → sfnet_wide_gemm: self-contained CUDA kernel, BF16 I/O with
-//    FP32 accumulation.  No cuBLAS dependency at all.  Works on any sm_80+ GPU.
-//  • Backward: all backward slices have m=C, so cuBLASLt handles them.
-//  • LM-head: Vp is canonical; cuBLASLt with backward=true skips Q1.15 clamp.
+// All three kernels:
+//   • 16×16 tiled, BF16 storage, FP32 accumulation
+//   • +1 column padding in shared memory to eliminate bank conflicts
+//   • Coalesced loads (consecutive tx → consecutive memory words)
+//   • Work for any (M, N, K) — including non-multiples of 16 (with bounds
+//     checks).  All SFNet dims happen to be multiples of 16.
 // ============================================================================
-
-// 16×16 tiled GEMM: out[N, OC] = inp[N, C] @ weight[OC, C]^T
-// BF16 input/output, FP32 accumulation, Q1.15 clamp fused into the write-back.
-// Default dimensions (N=4096, OC=2304, C=768) are all multiples of 16.
 #define SFNET_TILE 16
-__global__ void sfnet_wide_gemm(floatX * __restrict__ out,
-                                const floatX * __restrict__ inp,
-                                const floatX * __restrict__ weight,
-                                int N, int C, int OC) {
-    __shared__ float sinp[SFNET_TILE][SFNET_TILE + 1]; // +1 eliminates bank conflicts
-    __shared__ float swei[SFNET_TILE][SFNET_TILE + 1];
 
-    int tx  = threadIdx.x,  ty  = threadIdx.y;
-    int row = blockIdx.y * SFNET_TILE + ty;   // position in N (token) dimension
-    int col = blockIdx.x * SFNET_TILE + tx;   // position in OC dimension
+// Forward: out[N, OC] = inp[N, C] @ W[OC, C]^T
+// apply_q115=true clamps each output to Q1.15 in [-0.999969, +0.999969].
+// LM-head logits pass apply_q115=false so softmax can discriminate.
+__global__ void sfnet_fwd_gemm(floatX * __restrict__ out,
+                               const floatX * __restrict__ inp,
+                               const floatX * __restrict__ weight,
+                               int N, int C, int OC,
+                               int apply_q115) {
+    __shared__ float sI[SFNET_TILE][SFNET_TILE + 1];
+    __shared__ float sW[SFNET_TILE][SFNET_TILE + 1];
+
+    int tx = threadIdx.x, ty = threadIdx.y;
+    int row = blockIdx.y * SFNET_TILE + ty;   // N (token)
+    int col = blockIdx.x * SFNET_TILE + tx;   // OC
 
     float acc = 0.0f;
     for (int t = 0; t < C; t += SFNET_TILE) {
-        // Coalesced loads: consecutive tx → consecutive memory words
-        sinp[ty][tx] = (row < N  && t + tx < C)  ? (float)inp[row * C + t + tx]    : 0.0f;
-        swei[ty][tx] = (col < OC && t + tx < C)  ? (float)weight[col * C + t + tx] : 0.0f;
+        sI[ty][tx] = (row < N  && t + tx < C) ? (float)inp[row * C + t + tx]    : 0.0f;
+        sW[ty][tx] = (col < OC && t + tx < C) ? (float)weight[col * C + t + tx] : 0.0f;
         __syncthreads();
-        // sinp[ty][k] = inp[row, t+k]  |  swei[tx][k] = weight[col, t+k]
-        for (int k = 0; k < SFNET_TILE; k++)
-            acc += sinp[ty][k] * swei[tx][k];
+        #pragma unroll
+        for (int k = 0; k < SFNET_TILE; k++) {
+            acc += sI[ty][k] * sW[tx][k];
+        }
         __syncthreads();
     }
     if (row < N && col < OC) {
 #if defined(ENABLE_Q115)
-        acc = simulate_q115(acc);
+        if (apply_q115) acc = simulate_q115(acc);
 #endif
         out[row * OC + col] = (floatX)acc;
     }
 }
 
-// Launch sfnet_wide_gemm for any wide forward projection.
-static inline void sfnet_wide_forward(floatX *out,
-                                      const floatX *inp, const floatX *weight,
-                                      int B, int T, int C, int OC,
-                                      cudaStream_t stream) {
-    int N = B * T;
-    dim3 threads(SFNET_TILE, SFNET_TILE);
-    dim3 blocks((OC + SFNET_TILE - 1) / SFNET_TILE,
-                (N  + SFNET_TILE - 1) / SFNET_TILE);
-    sfnet_wide_gemm<<<blocks, threads, 0, stream>>>(out, inp, weight, N, C, OC);
-    cudaCheck(cudaGetLastError());
+// Backward to input: dinp[N, C] = dout[N, OC] @ W[OC, C]   (or += if accumulate)
+__global__ void sfnet_bwd_dinp_gemm(floatX * __restrict__ dinp,
+                                    const floatX * __restrict__ dout,
+                                    const floatX * __restrict__ weight,
+                                    int N, int C, int OC,
+                                    int accumulate) {
+    __shared__ float sDO[SFNET_TILE][SFNET_TILE + 1];
+    __shared__ float sW [SFNET_TILE][SFNET_TILE + 1];
+
+    int tx = threadIdx.x, ty = threadIdx.y;
+    int row = blockIdx.y * SFNET_TILE + ty;   // N
+    int col = blockIdx.x * SFNET_TILE + tx;   // C
+
+    float acc = 0.0f;
+    for (int t = 0; t < OC; t += SFNET_TILE) {
+        // sDO[ty][k] = dout[row, t+k]
+        sDO[ty][tx] = (row < N  && t + tx < OC) ? (float)dout[row * OC + t + tx]   : 0.0f;
+        // sW[k][tx]  = weight[t+k, col]
+        sW[ty][tx]  = (t + ty < OC && col < C) ? (float)weight[(t + ty) * C + col] : 0.0f;
+        __syncthreads();
+        #pragma unroll
+        for (int k = 0; k < SFNET_TILE; k++) {
+            acc += sDO[ty][k] * sW[k][tx];
+        }
+        __syncthreads();
+    }
+    if (row < N && col < C) {
+        size_t idx = (size_t)row * C + col;
+        float prev = accumulate ? (float)dinp[idx] : 0.0f;
+        dinp[idx] = (floatX)(prev + acc);
+    }
 }
 
-// sfnet_matmul_forward: routes based on OC.
+// Backward to weight: dweight[OC, C] += dout[N, OC]^T @ inp[N, C]   (always +=)
+__global__ void sfnet_bwd_dweight_gemm(floatX * __restrict__ dweight,
+                                       const floatX * __restrict__ inp,
+                                       const floatX * __restrict__ dout,
+                                       int N, int C, int OC) {
+    __shared__ float sDO[SFNET_TILE][SFNET_TILE + 1];
+    __shared__ float sI [SFNET_TILE][SFNET_TILE + 1];
+
+    int tx = threadIdx.x, ty = threadIdx.y;
+    int oc = blockIdx.y * SFNET_TILE + ty;   // OC
+    int c  = blockIdx.x * SFNET_TILE + tx;   // C
+
+    float acc = 0.0f;
+    for (int t = 0; t < N; t += SFNET_TILE) {
+        // sDO[k][ty] = dout[t+k, oc]  ← stored as sDO[k][i] so reduction is on first index
+        int n_idx = t + ty;
+        sDO[ty][tx] = (n_idx < N && (blockIdx.y * SFNET_TILE + tx) < OC)
+                      ? (float)dout[n_idx * OC + (blockIdx.y * SFNET_TILE + tx)] : 0.0f;
+        sI[ty][tx]  = (n_idx < N && c < C)
+                      ? (float)inp[n_idx * C + c] : 0.0f;
+        __syncthreads();
+        #pragma unroll
+        for (int k = 0; k < SFNET_TILE; k++) {
+            // sDO[k][ty] = dout[t+k, oc],  sI[k][tx] = inp[t+k, c]
+            acc += sDO[k][ty] * sI[k][tx];
+        }
+        __syncthreads();
+    }
+    if (oc < OC && c < C) {
+        size_t idx = (size_t)oc * C + c;
+        dweight[idx] = (floatX)((float)dweight[idx] + acc);  // always accumulate
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Host wrappers
+// ----------------------------------------------------------------------------
 static void sfnet_matmul_forward(floatX *out,
                                  const floatX *inp, const floatX *weight,
                                  int B, int T, int C, int OC,
                                  cudaStream_t stream) {
-    if (OC <= C) {
-        // OC=C=768: cuBLASLt has BF16 kernels for this width.
-        matmul_forward_cublaslt(out, (floatX *)inp, (floatX *)weight,
-                                /*bias=*/nullptr, B, T, C, OC, stream);
-    } else {
-        // OC=2304/ffn_dim: custom kernel — no cuBLAS involved.
-        sfnet_wide_forward(out, inp, weight, B, T, C, OC, stream);
-    }
+    int N = B * T;
+    dim3 threads(SFNET_TILE, SFNET_TILE);
+    dim3 blocks((OC + SFNET_TILE - 1) / SFNET_TILE,
+                (N  + SFNET_TILE - 1) / SFNET_TILE);
+    sfnet_fwd_gemm<<<blocks, threads, 0, stream>>>(out, inp, weight, N, C, OC,
+                                                   /*apply_q115=*/1);
+    cudaCheck(cudaGetLastError());
 }
 
-// LM-head variant: backward=true in matmul_cublaslt disables q115_simulate_kernel
-// so logits are unconstrained and softmax can discriminate between classes.
-// Vp=50304 is a canonical dim that cuBLASLt always handles.
-static inline void sfnet_logits_forward(floatX *out,
-                                        const floatX *inp, const floatX *weight,
-                                        int B, int T, int C, int OC,
-                                        cudaStream_t stream) {
-    matmul_cublaslt(out, (floatX *)weight, (floatX *)inp,
-                    /*bias=*/nullptr, OC, B * T, C, stream,
-                    /*transA=*/true, /*transB=*/false,
-                    0, 0, 0, 0, /*accumulate=*/false, /*pre_gelu=*/nullptr,
-                    /*backward=*/true);
+// LM-head: same kernel but skips the Q1.15 clamp so logits are unconstrained.
+// Clamping logits to ±1 would saturate softmax and lock loss at ln(V).
+static void sfnet_logits_forward(floatX *out,
+                                 const floatX *inp, const floatX *weight,
+                                 int B, int T, int C, int OC,
+                                 cudaStream_t stream) {
+    int N = B * T;
+    dim3 threads(SFNET_TILE, SFNET_TILE);
+    dim3 blocks((OC + SFNET_TILE - 1) / SFNET_TILE,
+                (N  + SFNET_TILE - 1) / SFNET_TILE);
+    sfnet_fwd_gemm<<<blocks, threads, 0, stream>>>(out, inp, weight, N, C, OC,
+                                                   /*apply_q115=*/0);
+    cudaCheck(cudaGetLastError());
 }
 
-// Backward matmul: all slices have m=C=768 which cuBLASLt always supports.
-// backward=true skips q115_simulate_kernel (gradients stay in BF16).
-static inline void sfnet_matmul_backward(floatX *dinp, floatX *dweight,
-                                         floatX *dout,  floatX *inp, floatX *weight,
-                                         int B, int T, int C, int OC,
-                                         bool accumulate_dinp, cudaStream_t stream) {
+static void sfnet_matmul_backward(floatX *dinp, floatX *dweight,
+                                  floatX *dout, floatX *inp, floatX *weight,
+                                  int B, int T, int C, int OC,
+                                  bool accumulate_dinp, cudaStream_t stream) {
+    int N = B * T;
+    dim3 threads(SFNET_TILE, SFNET_TILE);
     if (dinp) {
-        matmul_cublaslt(dinp, weight, dout, /*bias=*/nullptr,
-                        C, B * T, OC, stream,
-                        /*transA=*/false, /*transB=*/false,
-                        0, 0, 0, 0, accumulate_dinp, nullptr, /*backward=*/true);
+        dim3 blocks((C + SFNET_TILE - 1) / SFNET_TILE,
+                    (N + SFNET_TILE - 1) / SFNET_TILE);
+        sfnet_bwd_dinp_gemm<<<blocks, threads, 0, stream>>>(
+            dinp, dout, weight, N, C, OC, accumulate_dinp ? 1 : 0);
+        cudaCheck(cudaGetLastError());
     }
     if (dweight) {
-        matmul_cublaslt(dweight, inp, dout, /*bias=*/nullptr,
-                        C, OC, B * T, stream,
-                        /*transA=*/false, /*transB=*/true,
-                        0, 0, 0, 0, /*accumulate=*/true, nullptr, /*backward=*/true);
+        dim3 blocks((C  + SFNET_TILE - 1) / SFNET_TILE,
+                    (OC + SFNET_TILE - 1) / SFNET_TILE);
+        sfnet_bwd_dweight_gemm<<<blocks, threads, 0, stream>>>(
+            dweight, inp, dout, N, C, OC);
+        cudaCheck(cudaGetLastError());
     }
 }
 
