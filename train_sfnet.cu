@@ -818,9 +818,17 @@ void sfnet_random_init(SFNet *model, const char *model_str) {
     model->d_freqs_cis = precompute_freqs_cis(
         model->config.max_seq_len, model->config.head_dim, model->config.rope_theta);
 
-    float init_scale = 0.02f;
+    // Weight init scale.  For SF16 we need linear outputs to stay (mostly) within
+    // [-0.999969..., +0.999969...] BEFORE the Q1.15 clamp.  A linear out = W @ x
+    // with x of unit RMS has std(out) = sqrt(fan_in) * std(W).  Setting
+    // std(W) = init_scale / sqrt(fan_in) gives std(out) = init_scale ≈ 0.5,
+    // i.e. 95% of pre-clamp values lie in (-1, 1) and the clamp is essentially a
+    // no-op at init.  We apply the per-tensor fan-in scaling below.
+    float init_scale = 0.02f;            // baseline GPT-2 std; further scaled per-tensor below
+    bool use_fan_in_scaling = false;
 #if defined(ENABLE_Q115)
-    init_scale = 0.1f;
+    init_scale = 0.5f;                   // target std of pre-clamp linear output at init
+    use_fan_in_scaling = true;
 #endif
     mt19937_state rng;
     manual_seed(&rng, 42);
@@ -848,9 +856,27 @@ void sfnet_random_init(SFNet *model, const char *model_str) {
             for (size_t j = 0; j < n; j++) cpu[offsets[t] + j] = (floatX)model->config.alpha_init;
             continue;
         }
-        // Linear-projection weights
+        // Linear-projection weights.
+        // SF16 mode uses fan-in-aware scaling so std(W) = init_scale/sqrt(fan_in)
+        // ⇒ std(W @ x) = init_scale for unit-RMS x.  Picked init_scale=0.5 so 95%
+        // of pre-clamp linear outputs fall inside (-1, 1); the Q1.15 clamp is
+        // then a no-op at init and the network actually has signal to learn from.
+        // BF16 mode keeps the GPT-2 standard std(W)=0.02 directly.
         float scale = init_scale;
-        if (t == 5 || t == 8) scale *= residual_scale;  // attn_ow, down_w
+        if (use_fan_in_scaling) {
+            size_t fan_in;
+            switch (t) {
+                case 0: fan_in = (size_t)model->config.dim;      break;   // wte (used as LM head; fan_in=C)
+                case 2: fan_in = (size_t)model->config.dim;      break;   // qkvw  (qkv_w, C)
+                case 5: fan_in = (size_t)model->config.dim;      break;   // attn_ow (C, NH*HD)=(C, C)
+                case 6: fan_in = (size_t)model->config.dim;      break;   // gate_w (FFN, C)
+                case 7: fan_in = (size_t)model->config.dim;      break;   // up_w   (FFN, C)
+                case 8: fan_in = (size_t)model->config.ffn_dim;  break;   // down_w (C, FFN)
+                default: fan_in = (size_t)model->config.dim;     break;
+            }
+            scale = init_scale / sqrtf((float)fan_in);
+        }
+        if (t == 5 || t == 8) scale *= residual_scale;  // attn_ow, down_w: residual-depth scaling
         float *buf = (float *)mallocCheck(n * sizeof(float));
         normal_(buf, n, 0.0f, scale, &rng);
         for (size_t j = 0; j < n; j++) {
