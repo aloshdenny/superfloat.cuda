@@ -491,20 +491,22 @@ static void rmsnorm_backward(floatX *dinp, floatX *dw, float *scratchF,
 // ============================================================================
 // Simple single-pass causal attention kernel (no flash; B*T*NH*T ≤ 2^22
 // for B=8, T=512, NH=4 → 8M entries in BF16 = 16MB, fits L2).
-__global__ void attn_fwd_kernel(floatX *out,          // (B, T, C)
-                                  floatX *att_buf,    // (B, NH, T, T) scratch
-                                  const floatX *qkv,  // (B, T, 3*C)
+
+__global__ void attn_fwd_kernel(floatX *out,
+                                  floatX *att_buf,
+                                  const floatX *qkv,
                                   int B, int T, int NH, int HD) {
-    int b = blockIdx.z;
-    int h = blockIdx.y;
+    extern __shared__ float scores[];   // T floats per block
+
+    int b   = blockIdx.z;
+    int h   = blockIdx.y;
     int t_q = blockIdx.x * blockDim.x + threadIdx.x;
     if (t_q >= T) return;
 
-    const floatX *Q = qkv + (size_t)b * T * 3 * NH * HD + (size_t)t_q * 3 * NH * HD + h * HD;
+    const floatX *Q = qkv + (size_t)b * T * 3 * NH * HD
+                          + (size_t)t_q * 3 * NH * HD + h * HD;
     float scale = rsqrtf((float)HD);
 
-    // Compute attention scores for query t_q over all keys t_k <= t_q
-    float scores[512];  // T ≤ 512; statically allocated in registers
     float maxval = -1e30f;
     for (int t_k = 0; t_k <= t_q; t_k++) {
         const floatX *K = qkv + (size_t)b * T * 3 * NH * HD
@@ -513,32 +515,32 @@ __global__ void attn_fwd_kernel(floatX *out,          // (B, T, C)
         for (int d = 0; d < HD; d++)
             dot += floatX_to_float(Q[d]) * floatX_to_float(K[d]);
         dot *= scale;
-        scores[t_k] = dot;
+        scores[threadIdx.x * T + t_k] = dot;
         if (dot > maxval) maxval = dot;
     }
-    // Softmax
     float sumexp = 0.f;
     for (int t_k = 0; t_k <= t_q; t_k++) {
-        scores[t_k] = expf(scores[t_k] - maxval);
-        sumexp += scores[t_k];
+        float e = expf(scores[threadIdx.x * T + t_k] - maxval);
+        scores[threadIdx.x * T + t_k] = e;
+        sumexp += e;
     }
-    for (int t_k = 0; t_k <= t_q; t_k++) scores[t_k] /= sumexp;
+    for (int t_k = 0; t_k <= t_q; t_k++)
+        scores[threadIdx.x * T + t_k] /= sumexp;
 
-    // Store attention weights
     floatX *att_row = att_buf + ((size_t)b * NH + h) * T * T + (size_t)t_q * T;
     for (int t_k = 0; t_k <= t_q; t_k++)
-        att_row[t_k] = float_to_floatX(scores[t_k]);
+        att_row[t_k] = float_to_floatX(scores[threadIdx.x * T + t_k]);
     for (int t_k = t_q + 1; t_k < T; t_k++)
         att_row[t_k] = float_to_floatX(0.f);
 
-    // Weighted sum of values
-    floatX *out_row = out + (size_t)b * T * NH * HD + (size_t)t_q * NH * HD + h * HD;
+    floatX *out_row = out + (size_t)b * T * NH * HD
+                         + (size_t)t_q * NH * HD + h * HD;
     for (int d = 0; d < HD; d++) {
         float acc = 0.f;
         for (int t_k = 0; t_k <= t_q; t_k++) {
             const floatX *V = qkv + (size_t)b * T * 3 * NH * HD
                                   + (size_t)t_k * 3 * NH * HD + 2 * NH * HD + h * HD;
-            acc += scores[t_k] * floatX_to_float(V[d]);
+            acc += scores[threadIdx.x * T + t_k] * floatX_to_float(V[d]);
         }
         out_row[d] = float_to_floatX(sfnet_mini_q_fwd(acc));
     }
@@ -547,11 +549,11 @@ __global__ void attn_fwd_kernel(floatX *out,          // (B, T, C)
 static void attention_forward(floatX *out, floatX *att_buf,
                                const floatX *qkv,
                                int B, int T, int NH, int HD, cudaStream_t s) {
-    // One thread per (b, h, t_q) — fine for small T=512
-    // Grid: (T, NH, B) each thread handles one query position
-    dim3 bl(1);
+    int threads_per_block = 1;   // one thread per t_q, keep grid shape
+    size_t smem = threads_per_block * T * sizeof(float);
     dim3 gr(T, NH, B);
-    attn_fwd_kernel<<<gr, bl, 0, s>>>(out, att_buf, qkv, B, T, NH, HD);
+    attn_fwd_kernel<<<gr, threads_per_block, smem, s>>>(
+        out, att_buf, qkv, B, T, NH, HD);
     cudaCheckErr(cudaGetLastError());
 }
 
@@ -1477,6 +1479,19 @@ int main(int argc, char *argv[]) {
     memset(&model, 0, sizeof(model));
     model.rng_state = 13371337ULL;
     model.init_state = true;
+
+    // model config
+    model.cfg.C          = 256;
+    model.cfg.L          = 2;
+    model.cfg.NH         = 4;
+    model.cfg.HD         = 64;   // C / NH
+    model.cfg.FFN        = 512;
+    model.cfg.V          = 65536;
+    model.cfg.Vp         = 65536; // already multiple of 128
+    model.cfg.T          = sequence_length;
+    model.cfg.norm_eps   = 1e-5f;
+    model.cfg.alpha_init = 0.05f;
+
     sf_mini_alloc_params(&model);
     sf_mini_random_init(&model, stream);
 
