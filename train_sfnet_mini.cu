@@ -1446,20 +1446,20 @@ int main(int argc, char *argv[]) {
 #define PS(f,v) if(!strcmp(argv[i],f)){v=argv[++i];continue;}
 #define PI(f,v) if(!strcmp(argv[i],f)){v=atoi(argv[++i]);continue;}
 #define PF(f,v) if(!strcmp(argv[i],f)){v=(float)atof(argv[++i]);continue;}
-        PS("-i", input_bin)     PS("--input_bin", input_bin)
-        PS("-j", input_val_bin) PS("--input_val_bin", input_val_bin)
-        PS("-o", output_dir)    PS("--output_dir", output_dir)
-        PI("-b", batch_size)    PI("--batch_size", batch_size)
-        PI("-t", sequence_length) PI("--sequence_length", sequence_length)
-        PI("-x", num_iterations)  PI("--num_iterations", num_iterations)
-        PF("-l", learning_rate)   PF("--learning_rate", learning_rate)
-        PI("-u", warmup_iters)    PI("--warmup_iters", warmup_iters)
-        PF("--grad_clip", grad_clip)
-        PF("-c", weight_decay)    PF("--weight_decay", weight_decay)
-        PI("-v", val_loss_every)  PI("--val_loss_every", val_loss_every)
-        PI("-w", val_max_steps)   PI("--val_max_steps", val_max_steps)
-        PI("--overfit_single_batch", overfit_single_batch)
-        fprintf(stderr, "Unknown arg: %s\n", argv[i]); return 1;
+        PS("-i", input_bin)       else PS("--input_bin", input_bin)
+        else PS("-j", input_val_bin) else PS("--input_val_bin", input_val_bin)
+        else PS("-o", output_dir)    else PS("--output_dir", output_dir)
+        else PI("-b", batch_size)    else PI("--batch_size", batch_size)
+        else PI("-t", sequence_length) else PI("--sequence_length", sequence_length)
+        else PI("-x", num_iterations)  else PI("--num_iterations", num_iterations)
+        else PF("-l", learning_rate)   else PF("--learning_rate", learning_rate)
+        else PI("-u", warmup_iters)    else PI("--warmup_iters", warmup_iters)
+        else PF("--grad_clip", grad_clip)
+        else PF("-c", weight_decay)    else PF("--weight_decay", weight_decay)
+        else PI("-v", val_loss_every)  else PI("--val_loss_every", val_loss_every)
+        else PI("-w", val_max_steps)   else PI("--val_max_steps", val_max_steps)
+        else PI("--overfit_single_batch", overfit_single_batch)
+        else { fprintf(stderr, "Unknown arg: %s\n", argv[i]); return 1; }
     }
 
     cudaDeviceProp dp;
