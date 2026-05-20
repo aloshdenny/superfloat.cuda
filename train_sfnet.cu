@@ -175,24 +175,20 @@ __global__ void sfnet_fwd_gemm(floatX * __restrict__ out,
     __shared__ float sW[SFNET_TILE][SFNET_TILE + 1];
 
     int tx = threadIdx.x, ty = threadIdx.y;
-    int row     = blockIdx.y * SFNET_TILE + ty;   // N  (token)
-    int col     = blockIdx.x * SFNET_TILE + tx;   // OC (this thread's output column)
-    int w_row_s = blockIdx.x * SFNET_TILE + ty;   // OC row of W loaded by this thread
+    int row = blockIdx.y * SFNET_TILE + ty;   // N  (token)
+    int col = blockIdx.x * SFNET_TILE + tx;   // OC (output column owned by tx)
 
     float acc = 0.0f;
     for (int t = 0; t < C; t += SFNET_TILE) {
-        // inp tile: sI[ty][tx] = inp[row, t + tx]   (coalesced row-major load)
-        sI[ty][tx] = (row     < N  && t + tx < C)
-                     ? (float)inp[row * C + t + tx]            : 0.0f;
-        // W tile: sW[ty][tx] = W[block.x*16 + ty, t + tx].  The storage row
-        // depends on `ty`, NOT `tx`, so that sW[tx][k] in the reduction below
-        // reads W[col_of_this_thread, t + k] (where col = block.x*16 + tx).
-        sW[ty][tx] = (w_row_s < OC && t + tx < C)
-                     ? (float)weight[w_row_s * C + t + tx]     : 0.0f;
+        // sI[ty][k] = inp[row, t+k]
+        sI[ty][tx] = (row < N && t + tx < C)
+                     ? (float)inp[(size_t)row * C + t + tx] : 0.0f;
+        // sW[tx][k] = W[col, t+k]  — store as sW[tx][ty], read as sW[tx][k]
+        sW[tx][ty] = (col < OC && t + ty < C)
+                     ? (float)weight[(size_t)col * C + t + ty] : 0.0f;
         __syncthreads();
         #pragma unroll
         for (int k = 0; k < SFNET_TILE; k++) {
-            // sI[ty][k] = inp[row, t+k];  sW[tx][k] = W[col, t+k]
             acc += sI[ty][k] * sW[tx][k];
         }
         __syncthreads();
@@ -364,7 +360,7 @@ static void sfnet_sparsify_activation(floatX *x, size_t n, cudaStream_t stream) 
 // Temperature for LM softmax only (not applied inside transformer blocks).
 // Moderate T sharpens softmax without huge classifier gradients.
 #ifndef SFNET_LOGIT_TEMPERATURE
-#define SFNET_LOGIT_TEMPERATURE 4.0f
+#define SFNET_LOGIT_TEMPERATURE 1.0f
 #endif
 
 // Structured sparsity at init: most linear weights start at exact zero so
@@ -1499,7 +1495,7 @@ __global__ void sanitize_nonfinite_kernel(floatX *grad, size_t n, unsigned int *
     size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     for (; idx < n; idx += (size_t)blockDim.x * gridDim.x) {
         float g = (float)grad[idx];
-        if (!isfinite(g) || fabsf(g) > 1.0e6f) {
+        if (!isfinite(g) || fabsf(g) > 1.0e4f) {
             grad[idx] = (floatX)0;
             atomicAdd(bad_count, 1u);
         }
