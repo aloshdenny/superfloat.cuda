@@ -1578,7 +1578,7 @@ int main(int argc, char *argv[]) {
     int batch_size           = 4;
     int sequence_length      = 1024;
     int total_batch_size     = 0;
-    int num_iterations       = 50;
+    int num_iterations       = 5000;
     int inference_only       = 0;  // currently parsed but not used; reserved
     float learning_rate      = 3e-4f;
     int warmup_iters         = 0;
