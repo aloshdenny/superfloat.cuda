@@ -366,7 +366,7 @@ static void sfnet_sparsify_activation(floatX *x, size_t n, cudaStream_t stream) 
 // Structured sparsity at init: most linear weights start at exact zero so
 // matmul fan-in is smaller → less pre-quant magnitude, fewer ±1 saturations.
 #ifndef SFNET_WEIGHT_SPARSITY
-#define SFNET_WEIGHT_SPARSITY 0.875f
+#define SFNET_WEIGHT_SPARSITY 0.5f
 #endif
 
 // FP32 softmax prep — logits read as stored BF16, scaled by T, no simulate_q115.
