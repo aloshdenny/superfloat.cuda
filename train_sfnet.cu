@@ -247,28 +247,29 @@ __global__ void sfnet_bwd_dweight_gemm(floatX * __restrict__ dweight,
     __shared__ float sI [SFNET_TILE][SFNET_TILE + 1];
 
     int tx = threadIdx.x, ty = threadIdx.y;
-    int oc = blockIdx.y * SFNET_TILE + ty;   // OC
-    int c  = blockIdx.x * SFNET_TILE + tx;   // C
+    int oc = blockIdx.y * SFNET_TILE + ty;   // OC (owned by ty)
+    int c  = blockIdx.x * SFNET_TILE + tx;   // C  (owned by tx)
 
     float acc = 0.0f;
     for (int t = 0; t < N; t += SFNET_TILE) {
-        // sDO[k][ty] = dout[t+k, oc]  ← stored as sDO[k][i] so reduction is on first index
-        int n_idx = t + ty;
-        sDO[ty][tx] = (n_idx < N && (blockIdx.y * SFNET_TILE + tx) < OC)
-                      ? (float)dout[n_idx * OC + (blockIdx.y * SFNET_TILE + tx)] : 0.0f;
-        sI[ty][tx]  = (n_idx < N && c < C)
-                      ? (float)inp[n_idx * C + c] : 0.0f;
+        // sDO[k][ty] = dout[t+k, oc]  — oc comes from ty, not tx (was swapped before)
+        int n_idx = t + tx;
+        sDO[tx][ty] = (n_idx < N && oc < OC)
+                      ? (float)dout[(size_t)n_idx * OC + oc] : 0.0f;
+        // sI[k][tx] = inp[t+k, c]
+        n_idx = t + ty;
+        sI[ty][tx] = (n_idx < N && c < C)
+                     ? (float)inp[(size_t)n_idx * C + c] : 0.0f;
         __syncthreads();
         #pragma unroll
         for (int k = 0; k < SFNET_TILE; k++) {
-            // sDO[k][ty] = dout[t+k, oc],  sI[k][tx] = inp[t+k, c]
             acc += sDO[k][ty] * sI[k][tx];
         }
         __syncthreads();
     }
     if (oc < OC && c < C) {
         size_t idx = (size_t)oc * C + c;
-        dweight[idx] = (floatX)((float)dweight[idx] + acc);  // always accumulate
+        dweight[idx] = (floatX)((float)dweight[idx] + acc);
     }
 }
 
@@ -328,87 +329,112 @@ static void sfnet_matmul_backward(floatX *dinp, floatX *dweight,
 // ============================================================================
 // SFNet softmax + cross-entropy (replaces fused_classifier for SFNet only)
 // ----------------------------------------------------------------------------
-// llmc/fused_classifier.cuh's Q1.15 kernel applies simulate_q115 to BOTH the
-// logits (clamping them to [-1, 1]) AND the stored dlogits (rounding everything
-// below ±1/32768 ≈ 3e-5 to zero).  For Vp ≈ 50k, the per-non-target gradient is
-// ~prob·dloss ≈ (1/Vp)·(1/(B·T)) ≈ 5e-9 — far below the Q1.15 quant step — so
-// the classifier zeros out the gradient for every non-target vocab row, leaving
-// only the target rows with a learning signal.  Combined with logit clamping
-// (which caps useful softmax dynamic range at ~exp(2)≈7×), the LM head simply
-// cannot learn to anti-correlate non-target rows.  Net effect: the loss locks
-// near ln(V).
+// Problems with llmc/fused_classifier under SF16_TRUE_FORWARD:
+//   1) simulate_q115 on logits caps softmax range to [-1, 1]
+//   2) simulate_q115 on dlogits zeros non-target rows (~5e-9 < Q1.15 step)
 //
-// This SFNet-only kernel runs the full softmax+CE in FP32 with no Q1.15
-// clamping anywhere — BF16 storage of dlogits preserves the small ~5e-9
-// non-target values via its 8-bit exponent (BF16 mantissa precision is fine
-// because magnitude information is what matters here).
+// SFNet policy:
+//   - No Q1.15 on logits or dlogits (BF16 storage, FP32 math)
+//   - Logit temperature T > 1 sharpens softmax without clamping activations
+//   - Same reverse block order + prepare_softmax_blockwide3 pattern as GPT-2
 // ============================================================================
-__global__ void __launch_bounds__(1024, 1) sfnet_softmax_ce_kernel(
-    floatX * __restrict__ logits,                // (B*T, P) in/out
-    float  * __restrict__ losses,                // (B*T) out
-    const int * __restrict__ targets,            // (B*T) in
-    float dloss, int V, int P, int write_dlogits)
-{
-    int64_t idx = blockIdx.x;                    // one block per (b,t) row
+
+// Temperature for LM softmax only (not applied inside transformer blocks).
+// Unclamped logits at init have std ~0.5; T≈8 gives usable peak/trough contrast.
+#ifndef SFNET_LOGIT_TEMPERATURE
+#define SFNET_LOGIT_TEMPERATURE 8.0f
+#endif
+
+// FP32 softmax prep — logits read as stored BF16, scaled by T, no simulate_q115.
+__device__ SoftmaxParams sfnet_prepare_softmax(int64_t idx, const floatX *inp,
+                                               int V, int P, float temperature) {
+    const floatX *x = inp + idx * P;
+    float thread_maxval = -INFINITY;
+    float thread_sumval = 0.0f;
+    int i = (V + x128::size - 1) / x128::size + threadIdx.x - blockDim.x;
+
+    while ((i + 1) * x128::size > V) {
+        for (int k = 0; k < x128::size; ++k) {
+            if (i * x128::size + k >= V) break;
+            float v = (float)x[i * x128::size + k] * temperature;
+            float old_maxval = thread_maxval;
+            thread_maxval = fmaxf(thread_maxval, v);
+            thread_sumval *= expf(old_maxval - thread_maxval);
+            thread_sumval += expf(v - thread_maxval);
+        }
+        i -= blockDim.x;
+    }
+    for (; i >= 0; i -= blockDim.x) {
+        x128 packed_x = load128(x + i * x128::size);
+        for (int k = 0; k < x128::size; ++k) {
+            float v = (float)packed_x[k] * temperature;
+            float old_maxval = thread_maxval;
+            thread_maxval = fmaxf(thread_maxval, v);
+            thread_sumval *= expf(old_maxval - thread_maxval);
+            thread_sumval += expf(v - thread_maxval);
+        }
+    }
+    float block_maxval =
+        blockReduce<warpReduceMax>(thread_maxval, false, -INFINITY);
+    thread_sumval *= expf(thread_maxval - block_maxval);
+    float block_sumval = blockReduce<warpReduceSum>(thread_sumval);
+    return SoftmaxParams{1.f / block_sumval, block_maxval};
+}
+
+__global__ void __launch_bounds__(1024, MAX_1024_THREADS_BLOCKS)
+    sfnet_softmax_ce_kernel(floatX * __restrict__ logits,
+                            float * __restrict__ losses,
+                            const int * __restrict__ targets,
+                            float dloss, int V, int P,
+                            float temperature, int write_dlogits) {
+    int64_t idx = (int64_t)gridDim.x - ((int64_t)blockIdx.x + 1);
     int target_ix = targets[idx];
-    floatX *row = logits + idx * P;
+    const float T = temperature;
 
-    // pass 1: thread-local max over V
-    float tmax = -INFINITY;
-    for (int i = threadIdx.x; i < V; i += blockDim.x) {
-        float v = (float)row[i];
-        tmax = fmaxf(tmax, v);
-    }
-    __shared__ float s_max;
-    float block_max = blockReduce<warpReduceMax>(tmax, false, -INFINITY);
-    if (threadIdx.x == 0) s_max = block_max;
-    __syncthreads();
-    float mx = s_max;
+    SoftmaxParams sp = sfnet_prepare_softmax(idx, logits, V, P, T);
 
-    // pass 2: thread-local sum of exp(v - mx)
-    float tsum = 0.0f;
-    for (int i = threadIdx.x; i < V; i += blockDim.x) {
-        tsum += expf((float)row[i] - mx);
-    }
-    __shared__ float s_sum;
-    float block_sum = blockReduce<warpReduceSum>(tsum);
-    if (threadIdx.x == 0) s_sum = block_sum;
-    __syncthreads();
-    float inv_sum = 1.0f / s_sum;
-
-    // loss: -log(prob_target) = mx + log(sum) - logits[target]
     if (threadIdx.x == 0) {
-        float t_logit = (float)row[target_ix];
-        float log_prob = t_logit - mx - logf(s_sum);
-        losses[idx] += -log_prob;
+        float t_logit = (float)logits[idx * P + target_ix] * T;
+        float prob = expf(t_logit - sp.Offset) * sp.Scale;
+        losses[idx] += -logf(prob);
     }
-
     if (!write_dlogits) return;
+
     __syncthreads();
 
-    // pass 3: write dlogits = (prob - indicator) * dloss
-    // No Q1.15 clamping — BF16 storage preserves the magnitude of every entry
-    // (including the ~5e-9 non-target values that Q1.15 would round to zero).
-    for (int i = threadIdx.x; i < V; i += blockDim.x) {
-        float prob = expf((float)row[i] - mx) * inv_sum;
-        float indicator = (i == target_ix) ? 1.0f : 0.0f;
-        float g = (prob - indicator) * dloss;
-        row[i] = (floatX)g;
+    floatX *row = logits + idx * P;
+    const floatX *row_cs = row;
+    for (int i = threadIdx.x; i < V / x128::size; i += blockDim.x) {
+        x128 packed_logits_vec = load128(row_cs + i * x128::size);
+        x128 packed_grad;
+        for (int k = 0; k < x128::size; ++k) {
+            int element = i * x128::size + k;
+            float logit = (float)packed_logits_vec[k] * T;
+            float prob = expf(logit - sp.Offset) * sp.Scale;
+            float indicator = (element == target_ix) ? 1.0f : 0.0f;
+            packed_grad[k] = (floatX)((prob - indicator) * dloss * T);
+        }
+        store128cs(row + i * x128::size, packed_grad);
     }
-    // zero the padding tail [V, P)
+    int unaligned_start = V & ~(x128::size - 1);
+    for (int i = threadIdx.x + unaligned_start; i < V; i += blockDim.x) {
+        float logit = (float)row[i] * T;
+        float prob = expf(logit - sp.Offset) * sp.Scale;
+        float indicator = (i == target_ix) ? 1.0f : 0.0f;
+        __stcs(row + i, (floatX)((prob - indicator) * dloss * T));
+    }
     for (int i = V + threadIdx.x; i < P; i += blockDim.x) {
         row[i] = (floatX)0.0f;
     }
 }
 
-// Host wrapper.  Same call signature shape as fused_classifier() so the
-// existing SFNet code paths can swap straight in.
 static void sfnet_softmax_ce(floatX *logits, float *losses, float dloss,
                              const int *targets, int B, int T, int V, int P,
                              bool write_dlogits, cudaStream_t stream) {
-    int N = B * T;
-    sfnet_softmax_ce_kernel<<<N, 1024, 0, stream>>>(
-        logits, losses, targets, dloss, V, P, write_dlogits ? 1 : 0);
+    const int grid_size = B * T;
+    sfnet_softmax_ce_kernel<<<grid_size, 1024, 0, stream>>>(
+        logits, losses, targets, dloss, V, P, SFNET_LOGIT_TEMPERATURE,
+        write_dlogits ? 1 : 0);
     cudaCheck(cudaGetLastError());
 }
 
@@ -845,7 +871,10 @@ void sfnet_set_hyperparameters(SFNetConfig *cfg, const char *model_str) {
             if (L > 0) cfg->n_layers = L;
         }
     }
-    cfg->alpha_init = 1.0f / sqrtf(2.0f * (float)cfg->n_layers);
+    // Branch scale α = 1/√L (Post-Norm style).  Using √L not √(2L) gives ~40%
+    // stronger gradients into attention/MLP at each layer so depth-12 blocks
+    // actually move weights during early training.
+    cfg->alpha_init = 1.0f / sqrtf((float)cfg->n_layers);
 }
 
 void sfnet_allocate_weights(SFNet *model) {
