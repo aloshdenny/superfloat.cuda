@@ -504,7 +504,8 @@ void fill_in_activation_sizes(const ActivationTensors *data,
     tensors[i++] = TENSOR_SPEC(data->scratch_btc,   B * T * C);
     tensors[i++] = TENSOR_SPEC(data->scratch_btc2,  B * T * C);
     tensors[i++] = TENSOR_SPEC(data->scratch_qkv3c, B * T * 3 * C);
-    // wpe_zeros is T*C zeros; never written, used so encoder_forward doesn't deref nullptr.
+    // wpe_zeros: forward reads it as a zero positional offset; backward
+    // writes unused wpe gradients into it (reset to zero each forward pass).
     tensors[i++] = TENSOR_SPEC(data->wpe_zeros,     T * C);
     assert(i == NUM_ACTIVATION_TENSORS);
 }
@@ -942,8 +943,12 @@ void sfnet_forward(SFNet *model, const int *inputs, size_t B, size_t T) {
 
     // 1. Token embedding (no positional table — RoPE inside attention handles position)
     // SFNet uses RoPE — no learned positional table.  encoder_forward_kernel3
-    // unconditionally reads wpe, so we supply a permanently-zero buffer instead
-    // of nullptr (which would cause an illegal memory access on the GPU).
+    // unconditionally reads wpe, so we supply a zero-filled buffer instead of
+    // nullptr (which would cause an illegal memory access on the GPU).
+    // Zeroed here because encoder_backward writes (unused) wpe gradients into
+    // the same buffer during the backward pass; resetting it ensures each
+    // forward pass sees a clean zero positional offset.
+    cudaCheck(cudaMemsetAsync(acts.wpe_zeros, 0, T * C * sizeof(floatX), main_stream));
     encoder_forward(acts.encoded, model->inputs, params.wte, acts.wpe_zeros,
                     B, T, C, main_stream);
 
@@ -1271,7 +1276,7 @@ void sfnet_backward_and_reduce(SFNet *model, int *inputs, const int *targets,
     }
 
     // ---- Backward through token embedding ----
-    encoder_backward(grads.wte, nullptr, (floatX *)acts.output,
+    encoder_backward(grads.wte, acts.wpe_zeros, (floatX *)acts.output,
                      model->workload_indices, model->bucket_info,
                      dresidual, model->inputs, inputs, B, T, C,
                      random_u32(&model->rng_state), main_stream);
