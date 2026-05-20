@@ -130,9 +130,9 @@ SF16FLAGS  = -DENABLE_BF16 -DENABLE_Q115 -DSF16_TRUE_FORWARD=1
 # Phony targets
 # ===============================
 .PHONY: all clean libsyms \
-        train_gpt2 train_gpt3 train_sfnet train_llama32_1B train_llama32_3B
+        train_gpt2 train_gpt3 train_sfnet train_sfnet_mini train_llama32_1B train_llama32_3B
 
-all: train_gpt2 train_gpt3 train_sfnet train_llama32_1B train_llama32_3B
+all: train_gpt2 train_gpt3 train_sfnet train_sfnet_mini train_llama32_1B train_llama32_3B
 
 # ===============================
 # Linux library symlinks (no-op on Windows)
@@ -177,6 +177,9 @@ train_gpt3: train_gpt3.cu libsyms $(NVCC_CUDNN)
 train_sfnet: train_sfnet.cu libsyms
 	$(NVCC) $(NVCC_FLAGS) $(SF16FLAGS) $(NVCC_INCLUDES) $< $(NVCC_LDFLAGS) $(NVCC_LDLIBS) $(CUDA_OUTPUT_FILE)
 
+train_sfnet_mini: train_sfnet_mini.cu libsyms
+	$(NVCC) $(NVCC_FLAGS) $(SF16FLAGS) $(NVCC_INCLUDES) $< $(NVCC_LDFLAGS) $(NVCC_LDLIBS) $(CUDA_OUTPUT_FILE)
+
 train_llama32_1B: train_llama32_1B.cu libsyms
 	$(NVCC) $(NVCC_FLAGS) $(BF16FLAGS) $(NVCC_INCLUDES) $< $(NVCC_LDFLAGS) $(NVCC_LDLIBS) $(CUDA_OUTPUT_FILE)
 
@@ -187,7 +190,7 @@ train_llama32_3B: train_llama32_3B.cu libsyms
 # Clean
 # ===============================
 clean:
-	$(REMOVE_FILES) train_gpt2 train_gpt3 train_sfnet train_llama32_1B train_llama32_3B \
+	$(REMOVE_FILES) train_gpt2 train_gpt3 train_sfnet train_sfnet_mini train_llama32_1B train_llama32_3B \
 	                libcublas.so libcublas.so.12 libcublasLt.so libcublasLt.so.12 \
 	                libnvml.so libnvml.so.1 *.o
 	$(REMOVE_BUILD_OBJECT_FILES)
