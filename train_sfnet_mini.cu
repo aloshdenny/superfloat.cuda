@@ -1035,6 +1035,7 @@ static void sf_mini_alloc_acts(SF_MiniNet *m, int B, int T) {
     size_t C   = c.C;
     size_t L   = c.L;
     size_t NH  = c.NH;
+    size_t HD = c.HD;
     size_t FFN = c.FFN;
     size_t Vp  = c.Vp;
 
@@ -1082,7 +1083,7 @@ static void sf_mini_alloc_acts(SF_MiniNet *m, int B, int T) {
     for (int l = 0; l < (int)L; l++) m->rms1[l]  = alloc_bf16(B * T * C);
     for (int l = 0; l < (int)L; l++) m->qkv[l]   = alloc_bf16(B * T * 3 * C);
     for (int l = 0; l < (int)L; l++) m->att[l]   = alloc_bf16(B * NH * T * T);
-    for (int l = 0; l < (int)L; l++) m->atty[l]  = alloc_bf16(B * T * NH * HD_PLACEHOLDER(c));
+    for (int l = 0; l < (int)L; l++) m->atty[l]  = alloc_bf16(B * T * C);
     for (int l = 0; l < (int)L; l++) m->gate[l]  = alloc_bf16(B * T * FFN);
     for (int l = 0; l < (int)L; l++) m->up[l]    = alloc_bf16(B * T * FFN);
     for (int l = 0; l < (int)L; l++) m->glu[l]   = alloc_bf16(B * T * FFN);
