@@ -326,6 +326,93 @@ static void sfnet_matmul_backward(floatX *dinp, floatX *dweight,
 }
 
 // ============================================================================
+// SFNet softmax + cross-entropy (replaces fused_classifier for SFNet only)
+// ----------------------------------------------------------------------------
+// llmc/fused_classifier.cuh's Q1.15 kernel applies simulate_q115 to BOTH the
+// logits (clamping them to [-1, 1]) AND the stored dlogits (rounding everything
+// below ±1/32768 ≈ 3e-5 to zero).  For Vp ≈ 50k, the per-non-target gradient is
+// ~prob·dloss ≈ (1/Vp)·(1/(B·T)) ≈ 5e-9 — far below the Q1.15 quant step — so
+// the classifier zeros out the gradient for every non-target vocab row, leaving
+// only the target rows with a learning signal.  Combined with logit clamping
+// (which caps useful softmax dynamic range at ~exp(2)≈7×), the LM head simply
+// cannot learn to anti-correlate non-target rows.  Net effect: the loss locks
+// near ln(V).
+//
+// This SFNet-only kernel runs the full softmax+CE in FP32 with no Q1.15
+// clamping anywhere — BF16 storage of dlogits preserves the small ~5e-9
+// non-target values via its 8-bit exponent (BF16 mantissa precision is fine
+// because magnitude information is what matters here).
+// ============================================================================
+__global__ void __launch_bounds__(1024, 1) sfnet_softmax_ce_kernel(
+    floatX * __restrict__ logits,                // (B*T, P) in/out
+    float  * __restrict__ losses,                // (B*T) out
+    const int * __restrict__ targets,            // (B*T) in
+    float dloss, int V, int P, int write_dlogits)
+{
+    int64_t idx = blockIdx.x;                    // one block per (b,t) row
+    int target_ix = targets[idx];
+    floatX *row = logits + idx * P;
+
+    // pass 1: thread-local max over V
+    float tmax = -INFINITY;
+    for (int i = threadIdx.x; i < V; i += blockDim.x) {
+        float v = (float)row[i];
+        tmax = fmaxf(tmax, v);
+    }
+    __shared__ float s_max;
+    float block_max = blockReduce<warpReduceMax>(tmax, false, -INFINITY);
+    if (threadIdx.x == 0) s_max = block_max;
+    __syncthreads();
+    float mx = s_max;
+
+    // pass 2: thread-local sum of exp(v - mx)
+    float tsum = 0.0f;
+    for (int i = threadIdx.x; i < V; i += blockDim.x) {
+        tsum += expf((float)row[i] - mx);
+    }
+    __shared__ float s_sum;
+    float block_sum = blockReduce<warpReduceSum>(tsum);
+    if (threadIdx.x == 0) s_sum = block_sum;
+    __syncthreads();
+    float inv_sum = 1.0f / s_sum;
+
+    // loss: -log(prob_target) = mx + log(sum) - logits[target]
+    if (threadIdx.x == 0) {
+        float t_logit = (float)row[target_ix];
+        float log_prob = t_logit - mx - logf(s_sum);
+        losses[idx] += -log_prob;
+    }
+
+    if (!write_dlogits) return;
+    __syncthreads();
+
+    // pass 3: write dlogits = (prob - indicator) * dloss
+    // No Q1.15 clamping — BF16 storage preserves the magnitude of every entry
+    // (including the ~5e-9 non-target values that Q1.15 would round to zero).
+    for (int i = threadIdx.x; i < V; i += blockDim.x) {
+        float prob = expf((float)row[i] - mx) * inv_sum;
+        float indicator = (i == target_ix) ? 1.0f : 0.0f;
+        float g = (prob - indicator) * dloss;
+        row[i] = (floatX)g;
+    }
+    // zero the padding tail [V, P)
+    for (int i = V + threadIdx.x; i < P; i += blockDim.x) {
+        row[i] = (floatX)0.0f;
+    }
+}
+
+// Host wrapper.  Same call signature shape as fused_classifier() so the
+// existing SFNet code paths can swap straight in.
+static void sfnet_softmax_ce(floatX *logits, float *losses, float dloss,
+                             const int *targets, int B, int T, int V, int P,
+                             bool write_dlogits, cudaStream_t stream) {
+    int N = B * T;
+    sfnet_softmax_ce_kernel<<<N, 1024, 0, stream>>>(
+        logits, losses, targets, dloss, V, P, write_dlogits ? 1 : 0);
+    cudaCheck(cudaGetLastError());
+}
+
+// ============================================================================
 // Config
 // ============================================================================
 typedef struct {
@@ -1091,8 +1178,8 @@ float sfnet_validate(SFNet *model, const int *inputs, const int *targets,
     cudaCheck(cudaMemset(acts.losses, 0, B * T * sizeof(float)));
     cudaCheck(cudaMemcpy(model->targets, targets, B * T * sizeof(int), cudaMemcpyHostToDevice));
     tokenCheck(targets, B * T, V);
-    fused_classifier(acts.output, acts.losses, dloss, model->targets,
-                     B, T, V, Vp, False, main_stream);
+    sfnet_softmax_ce(acts.output, acts.losses, dloss, model->targets,
+                     B, T, V, Vp, /*write_dlogits=*/false, main_stream);
     cudaCheck(cudaMemcpy(model->cpu_losses, acts.losses, B * T * sizeof(float),
                          cudaMemcpyDeviceToHost));
     float mean_loss = 0.0f;
@@ -1140,8 +1227,8 @@ void sfnet_backward_and_reduce(SFNet *model, int *inputs, const int *targets,
     const float dloss = 1.0f / (float)(B * T * grad_accum_steps);
     cudaCheck(cudaMemcpy(model->targets, targets, B * T * sizeof(int), cudaMemcpyHostToDevice));
     tokenCheck(targets, B * T, V);
-    fused_classifier(acts.output, acts.losses, dloss, model->targets,
-                     B, T, V, Vp, True, main_stream);
+    sfnet_softmax_ce(acts.output, acts.losses, dloss, model->targets,
+                     B, T, V, Vp, /*write_dlogits=*/true, main_stream);
 
     // 1. Backward through LM head (tied: accumulates into grads.wte)
     //    scratch_btc  → dresidual (residual-stream gradient accumulator)
