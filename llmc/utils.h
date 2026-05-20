@@ -109,7 +109,7 @@ extern inline void sclose_check(int sockfd, const char *file, int line) {
 #endif
 
 extern inline void fseek_check(FILE *fp, long off, int whence, const char *file, int line) {
-    if (fseek(fp, off, whence) != 0) {
+    if (fseeko(fp, (off_t)(off), whence) != 0) {
         fprintf(stderr, "Error: Failed to seek in file at %s:%d\n", file, line);
         fprintf(stderr, "Error details:\n");
         fprintf(stderr, "  Offset: %ld\n", off);
