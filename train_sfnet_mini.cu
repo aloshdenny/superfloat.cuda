@@ -563,6 +563,7 @@ __global__ void attn_bwd_kernel(floatX *dqkv,          // (B, T, 3*C)  +=
                                   const floatX *qkv,   // (B, T, 3*NH*HD)
                                   const floatX *att,   // (B, NH, T, T)
                                   int B, int T, int NH, int HD) {
+    extern __shared__ float datt[];
     int b = blockIdx.z;
     int h = blockIdx.y;
     int t_q = blockIdx.x;
@@ -586,7 +587,6 @@ __global__ void attn_bwd_kernel(floatX *dqkv,          // (B, T, 3*C)  +=
     __syncthreads();
 
     // datt[t_q, t_k] = dout[t_q] · V[t_k]
-    float datt[512];
     for (int t_k = 0; t_k <= t_q; t_k++) {
         const floatX *V = qkv + (size_t)b * T * 3 * NH * HD
                               + (size_t)t_k * 3 * NH * HD + 2 * NH * HD + h * HD;
@@ -627,9 +627,10 @@ __global__ void attn_bwd_kernel(floatX *dqkv,          // (B, T, 3*C)  +=
 static void attention_backward(floatX *dqkv, const floatX *dout,
                                 const floatX *qkv, const floatX *att,
                                 int B, int T, int NH, int HD, cudaStream_t s) {
-    int threads = min(HD, 64);  // small HD=64, one warp
+    int threads = min(HD, 64);
+    size_t smem = T * sizeof(float);   // ADD THIS
     dim3 gr(T, NH, B);
-    attn_bwd_kernel<<<gr, threads, 0, s>>>(dqkv, dout, qkv, att, B, T, NH, HD);
+    attn_bwd_kernel<<<gr, threads, smem, s>>>(dqkv, dout, qkv, att, B, T, NH, HD);
     cudaCheckErr(cudaGetLastError());
 }
 
@@ -1523,6 +1524,12 @@ int main(int argc, char *argv[]) {
     // tokens 50257-65535 will be unused embeddings.
     DataLoader train_loader, val_loader;
     dataloader_init(&train_loader, input_bin, B, T, 0, 1, 1);
+    if (train_loader.num_tokens == 0) {
+        fprintf(stderr, "ERROR: no training data found at '%s'\n"
+                        "  Pass -i <path/to/train.bin> or a glob that matches files.\n",
+                input_bin);
+        return 1;
+    }
     bool has_val = (strlen(input_val_bin) > 0);
     if (has_val) dataloader_init(&val_loader, input_val_bin, B, T, 0, 1, 0);
 
