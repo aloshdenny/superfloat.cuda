@@ -1043,11 +1043,11 @@ static void sf_mini_alloc_acts(SF_MiniNet *m, int B, int T) {
 
     // Compute total bytes
     size_t n_bf16 =
-        (size_t)B * T * C                               // encoded
+        (size_t)B * T * C                                // encoded
         + L * B * T * C                                  // res[L]
         + L * B * T * C                                  // rms1[L]
         + L * B * T * 3 * C                              // qkv[L]
-        + L * B * T * NH * T   // att[L] — NOTE: NH*T*T
+        + L * B * NH * T * T                             // att[L]
         + L * B * T * C                                  // atty[L]
         + L * B * T * FFN                                // gate[L]
         + L * B * T * FFN                                // up[L]
@@ -1227,6 +1227,8 @@ static void sf_mini_backward(SF_MiniNet *model, const int *targets,
     }
     zero_bf16(model->g_rms_fw, C);
 
+
+
     // 1. Loss + logit grads
     float dloss = 1.f / (float)BT;
     softmax_ce_fwd_bwd<<<BT, 256, 0, s>>>(
@@ -1253,7 +1255,6 @@ static void sf_mini_backward(SF_MiniNet *model, const int *targets,
     // LM head backward: drms_f = dlogits @ wte ; g_wte_f32 += dlogits^T @ rms_f
     matmul_bwd(drms_f, nullptr, model->logits, model->rms_f, model->wte,
                B, T, C, Vp, false, s);
-    embedding_backward(model->g_wte_f32, model->logits, model->d_inputs, B, T, C, s);
     // Note: wte grad from LM head should use rms_f, not d_inputs embedding idx.
     // Correct LM-head dw: g_wte[v] += drms_f row mapped back through tied weight.
     // This is handled by matmul_bwd dw path using rms_f as inp and logits as dout.
@@ -1263,7 +1264,8 @@ static void sf_mini_backward(SF_MiniNet *model, const int *targets,
 
     // 3. Final RMSNorm backward
     floatX *x_final = model->res[L - 1];
-    float *scratchF = model->rstd_f;   // reuse rstd_f as scratch
+    float *scratchF;
+    cudaCheckErr(cudaMalloc(&scratchF, B * T * sizeof(float)));
     rmsnorm_backward(dresidual, model->g_rms_fw, scratchF,
                      drms_f, x_final, model->rms_fw, model->rstd_f,
                      B, T, C, s);
@@ -1312,7 +1314,7 @@ static void sf_mini_backward(SF_MiniNet *model, const int *targets,
         matmul_bwd(d_atty, model->g_attn_ow[l], d_attn_o, model->atty[l],
                    model->attn_ow[l], B, T, C, C, false, s);
 
-        floatX *d_qkv = model->gate[l];  // (B, T, 3C) scratch — big enough
+        floatX *d_qkv = model->qkv[l];   // (B, T, 3*C) — correct size, already consumed
         cudaCheckErr(cudaMemsetAsync(d_qkv, 0, BT * 3 * C * sizeof(floatX), s));
         attention_backward(d_qkv, d_atty, model->qkv[l], model->att[l],
                            B, T, NH, HD, s);
@@ -1329,6 +1331,7 @@ static void sf_mini_backward(SF_MiniNet *model, const int *targets,
 
     // 5. Embedding backward (from dresidual)
     embedding_backward(model->g_wte_f32, dresidual, model->d_inputs, B, T, C, s);
+    cudaCheckErr(cudaFree(scratchF));
 }
 
 // ============================================================================
