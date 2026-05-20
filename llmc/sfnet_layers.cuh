@@ -55,15 +55,29 @@ existing project convention; see quantize_sf_backward in matmul.cuh).
 #endif
 
 // ---------------------------------------------------------------------------
-// SF16-aware forward quantizer (forward only; backward stays BF16/FP).
-// Centralises the policy: simulate Q1.31 register precision then collapse to
-// Q1.15 storage boundary when SF16_TRUE_FORWARD is enabled.
+// SF16 forward quantizer (forward only; backward stays BF16/FP).
+// Sparsify + soft-limit before Q1.15 to reduce saturation overflow:
+//   • deadband: |x| < 1/32 → exact zero (clears quant noise floor)
+//   • soft knee: compress |x| > 0.75 inward before hard Q1.15 clip
 // ---------------------------------------------------------------------------
+#ifndef SFNET_ACT_DEADBAND
+#define SFNET_ACT_DEADBAND (1.0f / 32.0f)
+#endif
+#ifndef SFNET_ACT_SOFT_LIMIT
+#define SFNET_ACT_SOFT_LIMIT 0.75f
+#endif
+
 __device__ __forceinline__ float sfnet_q_fwd(float x) {
 #if defined(ENABLE_Q115)
-#if defined(SF16_TRUE_FORWARD)
-    x = simulate_q131(x);
-#endif
+    if (fabsf(x) < SFNET_ACT_DEADBAND) {
+        return 0.0f;
+    }
+    const float lim = SFNET_ACT_SOFT_LIMIT;
+    if (x > lim) {
+        x = lim + (x - lim) * 0.15f;
+    } else if (x < -lim) {
+        x = -lim + (x + lim) * 0.15f;
+    }
     return simulate_q115(x);
 #else
     return x;

@@ -199,7 +199,7 @@ __global__ void sfnet_fwd_gemm(floatX * __restrict__ out,
     }
     if (row < N && col < OC) {
 #if defined(ENABLE_Q115)
-        if (apply_q115) acc = simulate_q115(acc);
+        if (apply_q115) acc = sfnet_q_fwd(acc);
 #endif
         out[row * OC + col] = (floatX)acc;
     }
@@ -326,6 +326,28 @@ static void sfnet_matmul_backward(floatX *dinp, floatX *dweight,
     }
 }
 
+// Zero tiny activations after embedding (encoder uses shared simulate_q115).
+#if defined(ENABLE_Q115)
+__global__ void sfnet_sparsify_kernel(floatX *x, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        float v = (float)x[i];
+        if (fabsf(v) < SFNET_ACT_DEADBAND) {
+            x[i] = (floatX)0.0f;
+        }
+    }
+}
+
+static void sfnet_sparsify_activation(floatX *x, size_t n, cudaStream_t stream) {
+    const int block = 256;
+    int grid = (int)CEIL_DIV(n, block);
+    if (grid > 65535) grid = 65535;
+    if (grid < 1) grid = 1;
+    sfnet_sparsify_kernel<<<grid, block, 0, stream>>>(x, (int)n);
+    cudaCheck(cudaGetLastError());
+}
+#endif
+
 // ============================================================================
 // SFNet softmax + cross-entropy (replaces fused_classifier for SFNet only)
 // ----------------------------------------------------------------------------
@@ -340,9 +362,15 @@ static void sfnet_matmul_backward(floatX *dinp, floatX *dweight,
 // ============================================================================
 
 // Temperature for LM softmax only (not applied inside transformer blocks).
-// Unclamped logits at init have std ~0.5; T≈8 gives usable peak/trough contrast.
+// Moderate T sharpens softmax without huge classifier gradients.
 #ifndef SFNET_LOGIT_TEMPERATURE
-#define SFNET_LOGIT_TEMPERATURE 8.0f
+#define SFNET_LOGIT_TEMPERATURE 4.0f
+#endif
+
+// Structured sparsity at init: most linear weights start at exact zero so
+// matmul fan-in is smaller → less pre-quant magnitude, fewer ±1 saturations.
+#ifndef SFNET_WEIGHT_SPARSITY
+#define SFNET_WEIGHT_SPARSITY 0.875f
 #endif
 
 // FP32 softmax prep — logits read as stored BF16, scaled by T, no simulate_q115.
@@ -871,10 +899,8 @@ void sfnet_set_hyperparameters(SFNetConfig *cfg, const char *model_str) {
             if (L > 0) cfg->n_layers = L;
         }
     }
-    // Branch scale α = 1/√L (Post-Norm style).  Using √L not √(2L) gives ~40%
-    // stronger gradients into attention/MLP at each layer so depth-12 blocks
-    // actually move weights during early training.
-    cfg->alpha_init = 1.0f / sqrtf((float)cfg->n_layers);
+    // Smaller α keeps parallel-branch sums inside Q1.15 before residual quant.
+    cfg->alpha_init = 0.125f;
 }
 
 void sfnet_allocate_weights(SFNet *model) {
@@ -943,7 +969,7 @@ void sfnet_random_init(SFNet *model, const char *model_str) {
     float init_scale = 0.02f;            // baseline GPT-2 std; further scaled per-tensor below
     bool use_fan_in_scaling = false;
 #if defined(ENABLE_Q115)
-    init_scale = 0.5f;                   // target std of pre-clamp linear output at init
+    init_scale = 0.3f;                   // lower pre-quant std → less Q1.15 saturation
     use_fan_in_scaling = true;
 #endif
     mt19937_state rng;
@@ -953,7 +979,7 @@ void sfnet_random_init(SFNet *model, const char *model_str) {
     memset(cpu, 0, model->num_parameters_bytes);
 
     size_t L = (size_t)model->config.n_layers;
-    float residual_scale = 1.0f / sqrtf(2.0f * (float)L);
+    (void)L;
 
     size_t offsets[NUM_PARAMETER_TENSORS + 1];
     offsets[0] = 0;
@@ -992,13 +1018,26 @@ void sfnet_random_init(SFNet *model, const char *model_str) {
             }
             scale = init_scale / sqrtf((float)fan_in);
         }
-        if (t == 5 || t == 8) scale *= residual_scale;  // attn_ow, down_w: residual-depth scaling
+        // Internal linear layers (not wte / norms / alpha): structured sparse init.
+        const bool sparse_linear =
+            use_fan_in_scaling && (t == 2 || t == 5 || t == 6 || t == 7 || t == 8);
+        const float sparsity = SFNET_WEIGHT_SPARSITY;
+        const float dense_scale =
+            sparse_linear ? (scale / sqrtf(fmaxf(1e-6f, 1.0f - sparsity))) : scale;
+
         float *buf = (float *)mallocCheck(n * sizeof(float));
-        normal_(buf, n, 0.0f, scale, &rng);
+        normal_(buf, n, 0.0f, dense_scale, &rng);
         for (size_t j = 0; j < n; j++) {
             float v = buf[j];
 #if defined(ENABLE_Q115)
-            v = fmaxf(-0.999969482421875f, fminf(0.999969482421875f, v));
+            if (sparse_linear && randfloat32(&rng) < sparsity) {
+                v = 0.0f;
+            } else {
+                v = fmaxf(-0.999969482421875f, fminf(0.999969482421875f, v));
+            }
+#else
+            (void)sparse_linear;
+            (void)sparsity;
 #endif
             cpu[offsets[t] + j] = (floatX)v;
         }
@@ -1101,6 +1140,9 @@ void sfnet_forward(SFNet *model, const int *inputs, size_t B, size_t T) {
     cudaCheck(cudaMemsetAsync(acts.wpe_zeros, 0, T * C * sizeof(floatX), main_stream));
     encoder_forward(acts.encoded, model->inputs, params.wte, acts.wpe_zeros,
                     B, T, C, main_stream);
+#if defined(ENABLE_Q115)
+    sfnet_sparsify_activation(acts.encoded, B * T * C, main_stream);
+#endif
 
     // 2. Transformer blocks
     for (int l = 0; l < (int)L; l++) {
