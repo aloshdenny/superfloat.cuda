@@ -175,16 +175,24 @@ __global__ void sfnet_fwd_gemm(floatX * __restrict__ out,
     __shared__ float sW[SFNET_TILE][SFNET_TILE + 1];
 
     int tx = threadIdx.x, ty = threadIdx.y;
-    int row = blockIdx.y * SFNET_TILE + ty;   // N (token)
-    int col = blockIdx.x * SFNET_TILE + tx;   // OC
+    int row     = blockIdx.y * SFNET_TILE + ty;   // N  (token)
+    int col     = blockIdx.x * SFNET_TILE + tx;   // OC (this thread's output column)
+    int w_row_s = blockIdx.x * SFNET_TILE + ty;   // OC row of W loaded by this thread
 
     float acc = 0.0f;
     for (int t = 0; t < C; t += SFNET_TILE) {
-        sI[ty][tx] = (row < N  && t + tx < C) ? (float)inp[row * C + t + tx]    : 0.0f;
-        sW[ty][tx] = (col < OC && t + tx < C) ? (float)weight[col * C + t + tx] : 0.0f;
+        // inp tile: sI[ty][tx] = inp[row, t + tx]   (coalesced row-major load)
+        sI[ty][tx] = (row     < N  && t + tx < C)
+                     ? (float)inp[row * C + t + tx]            : 0.0f;
+        // W tile: sW[ty][tx] = W[block.x*16 + ty, t + tx].  The storage row
+        // depends on `ty`, NOT `tx`, so that sW[tx][k] in the reduction below
+        // reads W[col_of_this_thread, t + k] (where col = block.x*16 + tx).
+        sW[ty][tx] = (w_row_s < OC && t + tx < C)
+                     ? (float)weight[w_row_s * C + t + tx]     : 0.0f;
         __syncthreads();
         #pragma unroll
         for (int k = 0; k < SFNET_TILE; k++) {
+            // sI[ty][k] = inp[row, t+k];  sW[tx][k] = W[col, t+k]
             acc += sI[ty][k] * sW[tx][k];
         }
         __syncthreads();
